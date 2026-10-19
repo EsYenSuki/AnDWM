@@ -120,6 +120,7 @@ static const Rule rules[] = {
     { "wired",    NULL,       NULL,       0,            0,           1,           10,       -1 },
     { "highlight-pointer",    NULL,       NULL,       0,            0,           1,           99,       -1 },
     { "mpv",      NULL,       NULL,       0,            1,           1,           1,        -1 },
+    { "MainKt",      NULL,       NULL,       1,            1,           1,           1,        -1 }
 
 };
 
