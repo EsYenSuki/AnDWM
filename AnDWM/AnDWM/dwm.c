@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <errno.h>
 #include <limits.h>
 #include <locale.h>
@@ -45,7 +46,12 @@
 #include <time.h>
 #include <poll.h>
 #include <unistd.h>
+#include <net/if.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 #ifdef XINERAMA
 #include <X11/extensions/Xinerama.h>
 #endif /* XINERAMA */
@@ -537,6 +543,558 @@ static void updatepreview(void);
 static void updateclientlist(void);
 static void updateclock(void);
 static void updateclockbar(void);
+static void status_start(void);
+static void status_stop(void);
+static void status_consume(void);
+static int update_mpris_scroll(void);
+static int drag_next_event(XEvent *ev);
+
+#define STATUS_SLOTS 3
+#define STATUS_SIZE 1024
+#define MPRIS_WIDTH 240
+#define MPRIS_SCROLL_GAP 32
+#define MPRIS_SCROLL_PAD 8
+#define MPRIS_SCROLL_INTERVAL_NS 33333333ULL
+#define MPRIS_COMPLETE_THRESHOLD 0.995
+enum status_slot_state { STATUS_FREE, STATUS_WRITING, STATUS_PUBLISHED,
+                         STATUS_READING };
+typedef struct {
+	_Atomic int state;
+	char text[STATUS_SIZE];
+	char mpris[768];
+	double mpris_progress;
+} StatusSlot;
+static StatusSlot status_slots[STATUS_SLOTS];
+static pthread_t status_thread;
+static _Atomic int status_running;
+static int status_event_fd = -1;
+static char stext[1024];
+static char mpris_text[768];
+static int mpris_scroll_px;
+static struct timespec mpris_scroll_last;
+static uint64_t mpris_scroll_accum_ns;
+static int mpris_scroll_clock_valid;
+static int mpris_active;
+static unsigned int mpris_scroll_text_width;
+static double mpris_progress = -1.0;
+static Clr mpris_scroll_bg_clr;
+static Clr mpris_progress_clr;
+static int bar_dirty;
+
+static int status_read_int(const char *path, int fallback) {
+	FILE *f = fopen(path, "r");
+	int value;
+	if (!f) return fallback;
+	if (fscanf(f, "%d", &value) != 1) value = fallback;
+	fclose(f);
+	return value;
+}
+
+static int status_read_cpu(unsigned long long *total, unsigned long long *active) {
+	FILE *f = fopen("/proc/stat", "r");
+	unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+	char cpu[8];
+	int ok = 0;
+	if (f && fscanf(f, "%7s %llu %llu %llu %llu %llu %llu %llu %llu", cpu,
+	                &user, &nice, &system, &idle, &iowait, &irq, &softirq,
+	                &steal) == 9) {
+		*total = user + nice + system + idle + iowait + irq + softirq + steal;
+		*active = *total - idle - iowait;
+		ok = 1;
+	}
+	if (f) fclose(f);
+	return ok;
+}
+
+static void status_read_memory(unsigned long long *used, unsigned long long *total,
+                               int *percent) {
+	FILE *f = fopen("/proc/meminfo", "r");
+	char key[32], unit[16];
+	unsigned long long value, available = 0;
+	*used = *total = 0;
+	if (f) {
+		while (fscanf(f, "%31s %llu %15s", key, &value, unit) == 3) {
+			if (!strcmp(key, "MemTotal:")) *total = value;
+			else if (!strcmp(key, "MemAvailable:")) available = value;
+		}
+		fclose(f);
+	}
+	*used = (*total > available) ? *total - available : 0;
+	*percent = *total ? (int)((*used * 100 + *total / 2) / *total) : 0;
+}
+
+static int status_read_line(const char *path, char *out, size_t outlen) {
+	FILE *f = fopen(path, "r");
+	if (!f) return 0;
+	if (!fgets(out, outlen, f)) { fclose(f); return 0; }
+	fclose(f);
+	out[strcspn(out, "\r\n")] = '\0';
+	return 1;
+}
+
+static int status_wifi(char *name, size_t namelen, int *strength) {
+	FILE *f = fopen("/proc/net/wireless", "r");
+	char line[256];
+	char iface[IFNAMSIZ];
+	int level;
+	*strength = 0;
+	name[0] = '\0';
+	if (!f) return 0;
+	while (fgets(line, sizeof line, f)) {
+		char *colon = strchr(line, ':');
+		if (!colon) continue;
+		*colon = '\0';
+		if (sscanf(line, " %15s", iface) != 1 ||
+		    sscanf(colon + 1, "%d", &level) != 1)
+			continue;
+		*strength = level < 0 ? (level + 100) * 2 : level;
+		if (*strength < 0) *strength = 0;
+		if (*strength > 100) *strength = 100;
+		{
+			char path[PATH_MAX], state[16];
+			snprintf(path, sizeof path, "/sys/class/net/%s/operstate", iface);
+			if (!status_read_line(path, state, sizeof state) || strcmp(state, "up"))
+				continue;
+		}
+		/* NetworkManager keeps the current SSID in the kernel wireless ioctl;
+		 * use iwgetid when available, without touching Xlib. */
+		{
+			char command[64], ssid[128];
+			snprintf(command, sizeof command, "iwgetid %s -r 2>/dev/null", iface);
+			FILE *p = popen(command, "r");
+			if (p && fgets(ssid, sizeof ssid, p)) {
+				ssid[strcspn(ssid, "\r\n")] = '\0';
+				if (*ssid) snprintf(name, namelen, "%s", ssid);
+			}
+			if (p) pclose(p);
+		}
+		if (!*name)
+			snprintf(name, namelen, "%s", iface);
+		fclose(f);
+		return 1;
+	}
+	fclose(f);
+	return 0;
+}
+
+static DBusMessage *status_dbus_call(DBusConnection *connection, const char *service,
+                                     const char *path, const char *interface,
+                                     const char *method) {
+	DBusMessage *message, *reply;
+	DBusError error;
+	message = dbus_message_new_method_call(service, path, interface, method);
+	if (!message) return NULL;
+	dbus_error_init(&error);
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, &error);
+	dbus_message_unref(message);
+	dbus_error_free(&error);
+	return reply;
+}
+
+static int status_dbus_property_string(DBusConnection *connection, const char *service,
+                                       const char *property, char *out, size_t outlen) {
+	DBusMessage *message, *reply;
+	DBusMessageIter iter, variant;
+	const char *interface = "org.mpris.MediaPlayer2.Player";
+	const char *value;
+	message = dbus_message_new_method_call(service, "/org/mpris/MediaPlayer2",
+	        "org.freedesktop.DBus.Properties", "Get");
+	if (!message) return 0;
+	dbus_message_append_args(message, DBUS_TYPE_STRING, &interface,
+	                         DBUS_TYPE_STRING, &property, DBUS_TYPE_INVALID);
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	if (!reply) return 0;
+	if (!dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_STRING) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&variant, &value);
+	snprintf(out, outlen, "%s", value ? value : "");
+	dbus_message_unref(reply);
+	return 1;
+}
+
+static int status_dbus_property_int64(DBusConnection *connection, const char *service,
+                                      const char *property, int64_t *out) {
+	DBusMessage *message, *reply;
+	DBusMessageIter iter, variant;
+	const char *interface = "org.mpris.MediaPlayer2.Player";
+	int64_t value;
+	uint64_t unsigned_value;
+	message = dbus_message_new_method_call(service, "/org/mpris/MediaPlayer2",
+	        "org.freedesktop.DBus.Properties", "Get");
+	if (!message) return 0;
+	dbus_message_append_args(message, DBUS_TYPE_STRING, &interface,
+	                         DBUS_TYPE_STRING, &property, DBUS_TYPE_INVALID);
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	if (!reply || !dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		if (reply) dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_INT64) {
+		dbus_message_iter_get_basic(&variant, &value);
+	} else if (dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_UINT64) {
+		dbus_message_iter_get_basic(&variant, &unsigned_value);
+		if (unsigned_value > INT64_MAX) {
+			dbus_message_unref(reply);
+			return 0;
+		}
+		value = (int64_t)unsigned_value;
+	} else {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	*out = value;
+	dbus_message_unref(reply);
+	return 1;
+}
+
+static int status_mpris_metadata(DBusConnection *connection, const char *service,
+                                 char *artist, size_t artistlen,
+                                 char *title, size_t titlelen,
+                                 int64_t *length_us) {
+	DBusMessage *message, *reply;
+	DBusMessageIter iter, variant, dict;
+	const char *interface = "org.mpris.MediaPlayer2.Player";
+	const char *property = "Metadata";
+	artist[0] = title[0] = '\0';
+	*length_us = 0;
+	message = dbus_message_new_method_call(service, "/org/mpris/MediaPlayer2",
+	        "org.freedesktop.DBus.Properties", "Get");
+	if (!message) return 0;
+	dbus_message_append_args(message, DBUS_TYPE_STRING, &interface,
+	                         DBUS_TYPE_STRING, &property, DBUS_TYPE_INVALID);
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	if (!reply || !dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		if (reply) dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_ARRAY) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&variant, &dict);
+	while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
+		DBusMessageIter entry, value;
+		const char *key;
+		dbus_message_iter_recurse(&dict, &entry);
+		if (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_STRING) goto next;
+		dbus_message_iter_get_basic(&entry, &key);
+		if (!dbus_message_iter_next(&entry) ||
+		    dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_VARIANT) goto next;
+		dbus_message_iter_recurse(&entry, &value);
+		if (!strcmp(key, "xesam:title") &&
+		    dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_STRING) {
+			const char *s;
+			dbus_message_iter_get_basic(&value, &s);
+			snprintf(title, titlelen, "%s", s ? s : "");
+		} else if (!strcmp(key, "xesam:artist") &&
+		           dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_ARRAY) {
+			DBusMessageIter artists;
+			dbus_message_iter_recurse(&value, &artists);
+			if (dbus_message_iter_get_arg_type(&artists) == DBUS_TYPE_STRING) {
+				const char *s;
+				dbus_message_iter_get_basic(&artists, &s);
+				snprintf(artist, artistlen, "%s", s ? s : "");
+			}
+		} else if (!strcmp(key, "mpris:length")) {
+			int type = dbus_message_iter_get_arg_type(&value);
+			if (type == DBUS_TYPE_INT64) {
+				dbus_message_iter_get_basic(&value, length_us);
+			} else if (type == DBUS_TYPE_UINT64) {
+				uint64_t unsigned_length;
+				dbus_message_iter_get_basic(&value, &unsigned_length);
+				if (unsigned_length <= INT64_MAX)
+					*length_us = (int64_t)unsigned_length;
+			}
+		}
+next:
+		dbus_message_iter_next(&dict);
+	}
+	dbus_message_unref(reply);
+	return *title != '\0';
+}
+
+static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
+                        double *progress) {
+	DBusConnection *connection;
+	DBusMessage *reply;
+	DBusMessageIter iter, names;
+	char artist[192], title[384], state[32];
+	int64_t position_us = 0, length_us = 0;
+	char service[128] = "";
+	*progress = -1.0;
+	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
+	if (!connection) return 0;
+	reply = status_dbus_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+	                         "org.freedesktop.DBus", "ListNames");
+	if (!reply || !dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY) {
+		if (reply) dbus_message_unref(reply);
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &names);
+	while (dbus_message_iter_get_arg_type(&names) == DBUS_TYPE_STRING) {
+		const char *name;
+		dbus_message_iter_get_basic(&names, &name);
+		if (name && !strncmp(name, "org.mpris.MediaPlayer2.", 23)) {
+			snprintf(state, sizeof state, "Stopped");
+			if (status_dbus_property_string(connection, name, "PlaybackStatus",
+			                               state, sizeof state) && !strcmp(state, "Playing")) {
+				snprintf(service, sizeof service, "%s", name);
+				break;
+			}
+		}
+		dbus_message_iter_next(&names);
+	}
+	dbus_message_unref(reply);
+	if (!service[0] || !status_mpris_metadata(connection, service, artist, sizeof artist,
+	                                       title, sizeof title, &length_us)) {
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	if (length_us > 0 && status_dbus_property_int64(connection, service,
+	                                                  "Position", &position_us)) {
+		if (position_us < 0) position_us = 0;
+		if (position_us > length_us) position_us = length_us;
+		*progress = (double)position_us / (double)length_us;
+		if (*progress >= MPRIS_COMPLETE_THRESHOLD)
+			*progress = 1.0;
+	}
+	for (char *s = artist; *s; s++) *s = (char)toupper((unsigned char)*s);
+	if (strlen(artist) >= 8 && !strcmp(artist + strlen(artist) - 8, " - TOPIC"))
+		artist[strlen(artist) - 8] = '\0';
+	/* Keep the same wrapper and spacing as bar.cpp::player_info().  The
+	 * position bar is intentionally generated only after metadata succeeds;
+	 * malformed players fall back to the normal status branch. */
+	if (raw && rawlen)
+		snprintf(raw, rawlen, "[%s]  %s", artist[0] ? artist : "UNKNOWN ARTIST", title);
+	snprintf(out, outlen,
+	         "^c#1E1D2D^ ^b#B8E9B4^ 󰎆^c#1E1D2D^ ^m^%s^M^^d^^c#96CDFB^",
+	         raw && rawlen ? raw : "");
+	dbus_connection_unref(connection);
+	return 1;
+}
+
+static int status_temperature(void) {
+	static const char *paths[] = {
+		"/sys/class/thermal/thermal_zone0/temp",
+		"/sys/class/thermal/thermal_zone1/temp",
+		"/sys/class/hwmon/hwmon0/temp1_input",
+		"/sys/class/hwmon/hwmon1/temp1_input",
+		"/sys/class/hwmon/hwmon2/temp1_input",
+		"/sys/class/hwmon/hwmon3/temp1_input"
+	};
+	int max = -1;
+	for (size_t i = 0; i < LENGTH(paths); i++) {
+		int value = status_read_int(paths[i], -1);
+		if (value > 1000) value /= 1000;
+		if (value > max) max = value;
+	}
+	return max;
+}
+
+static int status_fan(char *icon, size_t iconlen) {
+	glob_t matches;
+	char value[16];
+	int enabled = 0;
+	icon[0] = '\0';
+	if (glob("/sys/devices/platform/asus-nb-wmi/hwmon/*/pwm1_enable", 0, NULL,
+	         &matches) != 0)
+		return 0;
+	if (matches.gl_pathc) {
+		if (status_read_line(matches.gl_pathv[0], value, sizeof value) &&
+		    strcmp(value, "2")) {
+			snprintf(icon, iconlen, "");
+			enabled = 1;
+		}
+	}
+	globfree(&matches);
+	return enabled;
+}
+
+static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_len,
+                        double *mpris_progress_out,
+                        unsigned long long *last_total, unsigned long long *last_active) {
+	unsigned long long total = 0, active = 0, used, memtotal;
+	int mempercent, cpu = 0, cap, charging, strength, temp;
+	char memtext[32], ssid[128], player[768], fan[16], sav_icon[64], governor[32], tlp[32];
+	const char *icon, *wicon, *bicon, *memcolor;
+	static int fan_st;
+	int wifi = status_wifi(ssid, sizeof ssid, &strength);
+	int has_player;
+	ssid[sizeof ssid - 1] = '\0';
+	if (status_read_cpu(&total, &active) && *last_total && total > *last_total) {
+		unsigned long long td = total - *last_total;
+		unsigned long long ad = active - *last_active;
+		cpu = (int)((ad * 1000 + td / 2) / td);
+	}
+	*last_total = total;
+	*last_active = active;
+	status_read_memory(&used, &memtotal, &mempercent);
+	if (used >= 1024ULL * 1024ULL) snprintf(memtext, sizeof memtext, "%.1fGi", used / (1024.0 * 1024.0));
+	else if (used >= 1024ULL) snprintf(memtext, sizeof memtext, "%.1fMi", used / 1024.0);
+	else snprintf(memtext, sizeof memtext, "%.1fkB", (double)used);
+	cap = status_read_int("/sys/class/power_supply/BAT0/capacity", 0);
+	charging = status_read_int("/sys/class/power_supply/AC0/online", 0);
+	icon = mempercent < 40 ? "󰾆" : (mempercent < 80 ? "󰾅" : "󰓅");
+	memcolor = mempercent < 80 ? "#1E1D2D" : "#ed8796";
+	if (!wifi) wicon = "󰤭";
+	else if (strength > 60) wicon = "󰤨";
+	else if (strength > 45) wicon = "󰤥";
+	else if (strength > 35) wicon = "󰤢";
+	else wicon = "󰤟";
+	bicon = charging ? "󰂄" : (cap >= 90 ? "󰁹" : (cap >= 50 ? "󰁿" :
+	        (cap >= 20 ? "󰁼" : "󰁺")));
+	temp = status_temperature();
+	status_read_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+	                 governor, sizeof governor);
+	status_read_line("/run/tlp/last_pwr", tlp, sizeof tlp);
+	status_fan(fan, sizeof fan);
+	if (!strcmp(tlp, "0 0") && !strcmp(governor, "ondemand") && temp > 79 && !fan_st) {
+		/* Same fan policy as bar.cpp, but the worker writes only sysfs. */
+		glob_t matches;
+		if (glob("/sys/devices/platform/asus-nb-wmi/hwmon/*/pwm1_enable", 0, NULL, &matches) == 0) {
+			if (matches.gl_pathc) { FILE *f = fopen(matches.gl_pathv[0], "w"); if (f) { fputs("0", f); fclose(f); } }
+			globfree(&matches);
+		}
+		fan_st = 1;
+	} else if ((strcmp(tlp, "0 0") || (!strcmp(governor, "ondemand") && temp <= 72)) && fan_st) {
+		glob_t matches;
+		if (glob("/sys/devices/platform/asus-nb-wmi/hwmon/*/pwm1_enable", 0, NULL, &matches) == 0) {
+			if (matches.gl_pathc) { FILE *f = fopen(matches.gl_pathv[0], "w"); if (f) { fputs("2", f); fclose(f); } }
+			globfree(&matches);
+		}
+		fan_st = 0;
+	}
+	if (!fan_st) fan[0] = '\0';
+	if (mpris_out && mpris_len) mpris_out[0] = '\0';
+	if (mpris_progress_out) *mpris_progress_out = -1.0;
+	has_player = status_mpris(player, sizeof player, mpris_out, mpris_len,
+	                          mpris_progress_out);
+	sav_icon[0] = '\0';
+	if (fan[0] || !strcmp(governor, "performance")) {
+		snprintf(sav_icon, sizeof sav_icon, "  %s%s%s", fan,
+		         fan[0] && !strcmp(governor, "performance") ? " " : "",
+		         !strcmp(governor, "performance") ? "" : "");
+	}
+	if (has_player) {
+			snprintf(out, outlen,
+			"^c#a6e3a1^%s %s^c%s^ ^b#96CDFB^ %s ^d^"
+			"^c#1E1D2D^ ^b#96CDFB^ %s ^d^"
+			"^c#96CDFB^ %s^b#1E1D2D^ ",
+				sav_icon, player, memcolor, icon, wicon, bicon);
+	} else {
+		snprintf(out, outlen,
+			"^c#a6e3a1^%s  ^c#96CDFB^%s %d%%^c#1E1D2D^ ^b#a6e3a1^ "
+			"^c#D9E0EE^ ^b#282737^ %4.1f%% ^d^"
+			"^c%s^ ^b#a6e3a1^ %s^c#D9E0EE^ ^b#282737^ %s ^d^"
+			"^c#1E1D2D^ ^b#96CDFB^ %s^c#D9E0EE^ ^b#282737^ %s ^d^^b#1E1D2D^ ",
+			sav_icon, bicon, cap, cpu / 10.0, memcolor, icon, memtext,
+			wicon, wifi ? ssid : "Disconnected");
+	}
+}
+
+static void *status_worker(void *arg) {
+	char local[STATUS_SIZE], local_mpris[768];
+	char last_mpris[768] = "";
+	double local_mpris_progress;
+	double last_mpris_progress = -1.0;
+	unsigned long long last_total = 0, last_active = 0;
+	(void)arg;
+	while (atomic_load_explicit(&status_running, memory_order_acquire)) {
+		struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+		status_make(local, sizeof local, local_mpris, sizeof local_mpris,
+		            &local_mpris_progress,
+		            &last_total, &last_active);
+		/* Some browser players briefly omit Position while refreshing their
+		 * metadata. Keep the last known value for the same track instead of
+		 * making the progress layer blink off for one status interval. */
+		if (local_mpris_progress < 0.0 && local_mpris[0] &&
+		    !strcmp(local_mpris, last_mpris))
+			local_mpris_progress = last_mpris_progress;
+		if (local_mpris_progress >= 0.0) {
+			last_mpris_progress = local_mpris_progress;
+			snprintf(last_mpris, sizeof last_mpris, "%s", local_mpris);
+		} else if (!local_mpris[0]) {
+			last_mpris[0] = '\0';
+			last_mpris_progress = -1.0;
+		}
+		for (int i = 0; i < STATUS_SLOTS; i++) {
+			int expected = STATUS_FREE;
+			if (atomic_compare_exchange_strong_explicit(&status_slots[i].state, &expected,
+				STATUS_WRITING, memory_order_acquire, memory_order_relaxed)) {
+				memcpy(status_slots[i].text, local, sizeof local);
+				memcpy(status_slots[i].mpris, local_mpris, sizeof local_mpris);
+				status_slots[i].mpris_progress = local_mpris_progress;
+				atomic_store_explicit(&status_slots[i].state, STATUS_PUBLISHED, memory_order_release);
+				if (status_event_fd >= 0) { uint64_t one = 1; (void)write(status_event_fd, &one, sizeof one); }
+				break;
+			}
+		}
+		nanosleep(&ts, NULL);
+	}
+	return NULL;
+}
+
+static void status_start(void) {
+	for (int i = 0; i < STATUS_SLOTS; i++) atomic_init(&status_slots[i].state, STATUS_FREE);
+	atomic_init(&status_running, 1);
+#ifdef __linux__
+	status_event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#endif
+	if (pthread_create(&status_thread, NULL, status_worker, NULL) != 0) {
+		atomic_store(&status_running, 0);
+		if (status_event_fd >= 0) { close(status_event_fd); status_event_fd = -1; }
+	}
+}
+
+static void status_stop(void) {
+	if (!atomic_exchange(&status_running, 0)) return;
+	if (status_event_fd >= 0) { uint64_t one = 1; (void)write(status_event_fd, &one, sizeof one); }
+	pthread_join(status_thread, NULL);
+	if (status_event_fd >= 0) { close(status_event_fd); status_event_fd = -1; }
+}
+
+static void status_consume(void) {
+	uint64_t value;
+	if (status_event_fd >= 0) while (read(status_event_fd, &value, sizeof value) == sizeof value) ;
+	for (int i = 0; i < STATUS_SLOTS; i++) {
+		int expected = STATUS_PUBLISHED;
+		if (atomic_compare_exchange_strong_explicit(&status_slots[i].state, &expected,
+			STATUS_READING, memory_order_acquire, memory_order_relaxed)) {
+			memcpy(stext, status_slots[i].text, sizeof stext);
+			stext[sizeof stext - 1] = '\0';
+			if (strcmp(mpris_text, status_slots[i].mpris)) {
+				mpris_scroll_px = 0;
+				mpris_scroll_accum_ns = 0;
+				mpris_scroll_clock_valid = 0;
+				memcpy(mpris_text, status_slots[i].mpris, sizeof mpris_text);
+				mpris_text[sizeof mpris_text - 1] = '\0';
+				mpris_active = mpris_text[0] != '\0';
+			}
+			mpris_progress = status_slots[i].mpris_progress;
+			atomic_store_explicit(&status_slots[i].state, STATUS_FREE, memory_order_release);
+			bar_dirty = 1;
+			break;
+		}
+	}
+}
+
 static void notification_init(void);
 static void notification_shutdown(void);
 static void notification_dispatch(void);
@@ -586,7 +1144,6 @@ static void alttab(const Arg *arg);
 /* variables */
 static Systray *systray = NULL;
 static const char broken[] = "broken";
-static char stext[1024];
 static char clockstr[8] = "00:00";
 static char kbstr[16] = "us";
 static int screen;
@@ -632,6 +1189,81 @@ static Display *dpy;
 static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
+
+static int update_mpris_scroll(void) {
+	struct timespec now_mono;
+	unsigned int textw;
+	unsigned int cycle;
+	uint64_t elapsed_ns = 0;
+	uint64_t steps;
+
+	if (!mpris_active) {
+		mpris_scroll_clock_valid = 0;
+		mpris_scroll_accum_ns = 0;
+		return 0;
+	}
+
+	textw = mpris_scroll_text_width ? mpris_scroll_text_width : TEXTW(mpris_text);
+	cycle = textw + MPRIS_SCROLL_GAP;
+	clock_gettime(CLOCK_MONOTONIC, &now_mono);
+	if (mpris_scroll_clock_valid) {
+		elapsed_ns = (uint64_t)(now_mono.tv_sec - mpris_scroll_last.tv_sec) * 1000000000ULL;
+		if (now_mono.tv_nsec >= mpris_scroll_last.tv_nsec)
+			elapsed_ns += (uint64_t)(now_mono.tv_nsec - mpris_scroll_last.tv_nsec);
+		else
+			elapsed_ns -= (uint64_t)(mpris_scroll_last.tv_nsec - now_mono.tv_nsec);
+		/* Do not jump several seconds after a suspend or a blocked loop. */
+		if (elapsed_ns > 250000000ULL)
+			elapsed_ns = 250000000ULL;
+		mpris_scroll_accum_ns += elapsed_ns;
+	} else {
+		mpris_scroll_clock_valid = 1;
+	}
+	mpris_scroll_last = now_mono;
+	steps = mpris_scroll_accum_ns / MPRIS_SCROLL_INTERVAL_NS;
+	mpris_scroll_accum_ns %= MPRIS_SCROLL_INTERVAL_NS;
+	if (textw > MPRIS_WIDTH && cycle && steps) {
+		mpris_scroll_px = (mpris_scroll_px + steps) % cycle;
+		return 1;
+	} else if (textw <= MPRIS_WIDTH) {
+		if (mpris_scroll_px == 0)
+			return 0;
+		mpris_scroll_px = 0;
+		return 1;
+	}
+	return 0;
+}
+
+static int drag_next_event(XEvent *ev) {
+	struct pollfd pfd[2] = {
+		{ .fd = ConnectionNumber(dpy), .events = POLLIN },
+		{ .fd = status_event_fd, .events = POLLIN }
+	};
+	int ready;
+	int redraw;
+
+	do {
+		ready = poll(pfd, LENGTH(pfd), XPending(dpy) ? 0 : 1000 / DRAW_FPS);
+	} while (ready < 0 && errno == EINTR);
+	if (ready < 0)
+		return 0;
+	if (status_event_fd >= 0 && (pfd[1].revents & POLLIN))
+		status_consume();
+	updateclockbar();
+	redraw = bar_dirty;
+	bar_dirty = 0;
+	if (update_mpris_scroll())
+		redraw = 1;
+	if (redraw)
+		drawbars();
+	if (!XPending(dpy) && !(pfd[0].revents & POLLIN))
+		return 0;
+	XNextEvent(dpy, ev);
+	if (ev->type == MotionNotify)
+		while (XCheckTypedEvent(dpy, MotionNotify, ev))
+			;
+	return 1;
+}
 
 #define hiddenWinStackMax 100
 static int hiddenWinStackTop = -1;
@@ -1032,6 +1664,7 @@ void cleanup(void) {
   Monitor *m;
   size_t i;
 
+  status_stop();
   if (CLOCK_ANIMATE)
     sound_monitor_stop();
   notification_shutdown();
@@ -1396,6 +2029,7 @@ unsigned int statuswidth(char *stext) {
   short isCode = 0;
   char *text;
   char *p;
+  short isScroll = 0;
   size_t len = strlen(stext) + 1;
 
   if (!(text = (char *)malloc(sizeof(char) * len)))
@@ -1411,9 +2045,13 @@ unsigned int statuswidth(char *stext) {
       if (!isCode) {
         isCode = 1;
         text[i] = '\0';
-        w += TEXTW(text) - lrpad;
+        w += isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
         text[i] = '^';
-        if (text[++i] == 'f')
+        if (text[++i] == 'm')
+          isScroll = 1;
+        else if (text[i] == 'M')
+          isScroll = 0;
+        else if (text[i] == 'f')
           w += atoi(text + ++i);
       } else {
         isCode = 0;
@@ -1423,7 +2061,7 @@ unsigned int statuswidth(char *stext) {
     }
   }
   if (!isCode)
-    w += TEXTW(text) - lrpad;
+    w += isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
   else
     isCode = 0;
   free(p);
@@ -1434,6 +2072,7 @@ unsigned int statuswidth(char *stext) {
 int drawstatusbar(Monitor *m, int bh, char *stext) {
   int i, w, x, len;
   short isCode = 0;
+  short isScroll = 0;
   char *text;
   char *p;
 
@@ -1461,9 +2100,25 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
       isCode = 1;
 
       text[i] = '\0';
-      w = TEXTW(text) - lrpad;
-      drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text,
-               0);
+       w = isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
+        if (isScroll) {
+          double progress = mpris_progress;
+          unsigned int progressw = 0;
+          if (progress >= 0.0) {
+            if (progress > 1.0) progress = 1.0;
+            if (progress >= MPRIS_COMPLETE_THRESHOLD) progress = 1.0;
+            progressw = (unsigned int)(progress * w + 0.5);
+          }
+          mpris_scroll_text_width = drw_text_scroll_progress(
+              drw, x, borderpx + vertpadbar / 2, w,
+              bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
+              MPRIS_SCROLL_GAP, 0, &mpris_scroll_bg_clr,
+              progress >= 0.0 ? &mpris_progress_clr : NULL,
+              progressw);
+        }
+       else
+         drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text,
+                  0);
 
       x += w;
 
@@ -1499,6 +2154,10 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
           drw_rect(drw, rx + x, ry + borderpx + vertpadbar / 2, rw, rh, 1, 0);
         } else if (text[i] == 'f') {
           x += atoi(text + ++i);
+        } else if (text[i] == 'm') {
+          isScroll = 1;
+        } else if (text[i] == 'M') {
+          isScroll = 0;
         }
       }
 
@@ -1509,8 +2168,24 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
   }
 
   if (!isCode) {
-    w = TEXTW(text) - lrpad;
-    drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text, 0);
+    w = isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
+    if (isScroll) {
+      double progress = mpris_progress;
+      unsigned int progressw = 0;
+      if (progress >= 0.0) {
+        if (progress > 1.0) progress = 1.0;
+        if (progress >= MPRIS_COMPLETE_THRESHOLD) progress = 1.0;
+        progressw = (unsigned int)(progress * w + 0.5);
+      }
+      mpris_scroll_text_width = drw_text_scroll_progress(
+          drw, x, borderpx + vertpadbar / 2, w,
+          bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
+          MPRIS_SCROLL_GAP, 0, &mpris_scroll_bg_clr,
+          progress >= 0.0 ? &mpris_progress_clr : NULL,
+          progressw);
+    }
+    else
+      drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text, 0);
   }
 
   drw_setscheme(drw, scheme[SchemeNorm]);
@@ -3317,7 +3992,7 @@ void drawbar(Monitor *m) {
            kbstr, 0);
   drw_map(drw, m->barkbwin, 0, 0, kw, bh);
 
-  /* right bar: xsetroot status text */
+  /* right bar: status produced by the lock-free worker */
   drawstatusbar(m, bh_n, stext);
   drw_map(drw, m->barrightwin, 0, 0, rw, bh);
 }
@@ -4895,10 +5570,9 @@ static void updateclockbar(void) {
   if (!width || width == last_width)
     return;
 
-  /* Redraw through drawbar(), not just resize the window.  Resizing alone
-   * exposes pixels that have never been copied from drw->drawable, which is
-   * the blank gap visible between animation frames. */
-  drawbar(selmon);
+  /* Request one coordinated redraw after the animation and status updates
+   * for this frame.  Resizing alone exposes stale pixels in the bar. */
+  bar_dirty = 1;
   last_width = width;
 }
 
@@ -5047,8 +5721,10 @@ void movemouse(const Arg *arg) {
   resize(c, nx, ny, c->w, c->h, 1);
   XFlush(dpy);
   do {
-    XNextEvent(dpy, &ev);
-    updateclockbar();
+	    if (!drag_next_event(&ev)) {
+	      ev.type = -1;
+	      continue;
+	    }
     switch (ev.type) {
     case KeyPress:
       keypress(&ev);
@@ -5170,8 +5846,10 @@ void placemouse(const Arg *arg) {
 
   XFlush(dpy);
   do {
-    XNextEvent(dpy, &ev);
-    updateclockbar();
+	    if (!drag_next_event(&ev)) {
+	      ev.type = -1;
+	      continue;
+	    }
     switch (ev.type) {
     case KeyPress:
       keypress(&ev);
@@ -5302,10 +5980,8 @@ void propertynotify(XEvent *e) {
     resizebarwin(selmon);
     updatesystray();
   }
-  if ((ev->window == root) && (ev->atom == XA_WM_NAME))
-    updatestatus();
-  else if (ev->state == PropertyDelete &&
-           ev->atom != netatom[NetWMBypassCompositor])
+  if (ev->state == PropertyDelete &&
+            ev->atom != netatom[NetWMBypassCompositor])
     return; /* ignore */
   else if ((c = wintoclient(ev->window))) {
     switch (ev->atom) {
@@ -5430,12 +6106,22 @@ void resizebarwin(Monitor *m) {
     return;
   }
 
-  barwidths(m, &tw, &tlw, &cw, &kw, &rw);
-  {
-     unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
-                                    : ((clockbar_dynw && !fullscreen_st && m == selmon)
-                                            ? clockbar_dynw : cw);
-     unsigned int fcw = (notification_center_active() && m == selmon) ? notify_width : clockbar_cw;
+	barwidths(m, &tw, &tlw, &cw, &kw, &rw);
+	/* X rejects zero width/height ConfigureWindow requests.  A narrow monitor
+	 * or a long status string can otherwise collapse one of the bar sections
+	 * to zero while the section is still being resized. */
+	if (!tw) tw = 1;
+	if (!tlw) tlw = 1;
+	if (!cw) cw = 1;
+	if (!kw) kw = 1;
+	if (!rw) rw = 1;
+	{
+	   unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
+                                     : ((clockbar_dynw && !fullscreen_st && m == selmon)
+                                             ? clockbar_dynw : cw);
+	   unsigned int fcw = (notification_center_active() && m == selmon) ? notify_width : clockbar_cw;
+	   if (!dcw) dcw = 1;
+	   if (!fcw) fcw = 1;
 
     lx = floatbar ? m->wx + m->gappov : m->wx;
     rx = lx + (int)(floatbar ? m->ww - 2 * m->gappov : m->ww) - (int)stw -
@@ -5576,9 +6262,11 @@ void resizemouse(const Arg *arg) {
 
   XFlush(dpy);
   do {
-    XNextEvent(dpy, &ev);
-    updateclockbar();
-    switch (ev.type) {
+	    if (!drag_next_event(&ev)) {
+	      ev.type = -1;
+	      continue;
+	    }
+     switch (ev.type) {
     case ConfigureRequest:
     case Expose:
     case MapRequest:
@@ -5785,7 +6473,8 @@ void run(void) {
   int timeout;
   const int clockbar_timeout = 1000 / DRAW_FPS;
   time_t next_clock_update = 0;
-  struct pollfd pfd[2] = {{.fd = xfd, .events = POLLIN},
+  struct pollfd pfd[3] = {{.fd = xfd, .events = POLLIN},
+                          {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN}};
 
   /* main event loop */
@@ -5808,12 +6497,29 @@ void run(void) {
         notify_history_scroll != notify_history_scroll_target &&
         timeout > clockbar_timeout)
       timeout = clockbar_timeout;
+    if (mpris_active && timeout > clockbar_timeout)
+      timeout = clockbar_timeout;
     pfd[1].fd = notify_fd;
-    poll(pfd, notify_fd >= 0 ? 2 : 1, timeout);
+    pfd[2].fd = status_event_fd;
+    poll(pfd, status_event_fd >= 0 ? 3 : (notify_fd >= 0 ? 2 : 1), timeout);
     if (notify_fd >= 0 && (pfd[1].revents & POLLIN))
       notification_dispatch();
+    if (status_event_fd >= 0 && (pfd[2].revents & POLLIN))
+      status_consume();
     if (CLOCK_ANIMATE)
       updateclockbar();
+    {
+      int redraw = bar_dirty;
+      bar_dirty = 0;
+      if (update_mpris_scroll())
+        redraw = 1;
+      if (redraw)
+      drawbars();
+	    }
+	    if (!mpris_active) {
+			mpris_scroll_clock_valid = 0;
+			mpris_scroll_accum_ns = 0;
+		}
     while (XPending(dpy)) {
       XNextEvent(dpy, &ev);
 
@@ -6620,6 +7326,8 @@ void setup(void) {
   for (i = 0; i < LENGTH(colors); i++)
     scheme[i] = drw_scm_create(drw, colors[i], 3);
   drw_clr_create(drw, &clrborder, col_borderbar);
+  drw_clr_create(drw, &mpris_scroll_bg_clr, "#a6da95");
+  drw_clr_create(drw, &mpris_progress_clr, "#B8E9B4");
   drw_clr_create(drw, &notify_bg, "#1E1D2D");
   drw_clr_create(drw, &notify_fg, "#FFFFFF");
   drw_clr_create(drw, &notify_body, "#CDD6F4");
@@ -7456,8 +8164,7 @@ void updatesizehints(Client *c) {
 }
 
 void updatestatus(void) {
-  if (!gettextprop(root, XA_WM_NAME, stext, sizeof(stext)))
-    strcpy(stext, "dwm-" VERSION);
+  strcpy(stext, "dwm-" VERSION);
   drawbars();
   updatesystray();
 }
@@ -7764,17 +8471,12 @@ int main(int argc, char *argv[]) {
   XInitThreads();
   if (argc == 2 && !strcmp("-v", argv[1]))
     die("dwm-" VERSION);
-  else if (argc != 1 && strcmp("-s", argv[1]))
+  else if (argc != 1)
     die("usage: dwm [-v]");
   if (!setlocale(LC_CTYPE, "") || !XSupportsLocale())
     fputs("warning: no locale support\n", stderr);
   if (!(dpy = XOpenDisplay(NULL)))
     die("dwm: cannot open display");
-  if (argc > 1 && !strcmp("-s", argv[1])) {
-    XStoreName(dpy, RootWindow(dpy, DefaultScreen(dpy)), argv[2]);
-    XCloseDisplay(dpy);
-    return 0;
-  }
   checkotherwm();
   setup();
 #ifdef __OpenBSD__
@@ -7782,6 +8484,7 @@ int main(int argc, char *argv[]) {
     die("pledge");
 #endif /* __OpenBSD__ */
   scan();
+  status_start();
   if (CLOCK_ANIMATE)
     sound_monitor_start();
   run();

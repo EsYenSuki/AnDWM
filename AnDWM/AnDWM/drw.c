@@ -462,6 +462,88 @@ no_match:
 	return x + (render ? w : 0);
 }
 
+int
+drw_text_scroll(Drw *drw, int x, int y, unsigned int w, unsigned int h,
+                unsigned int lpad, const char *text, int offset,
+                unsigned int gap, int invert)
+{
+	return drw_text_scroll_progress(drw, x, y, w, h, lpad, text, offset, gap,
+	                                invert, NULL, NULL, 0);
+}
+
+int
+drw_text_scroll_progress(Drw *drw, int x, int y, unsigned int w,
+                         unsigned int h, unsigned int lpad, const char *text,
+                         int offset, unsigned int gap, int invert,
+                         const Clr *background, const Clr *progress,
+                         unsigned int progressw)
+{
+	XftDraw *d;
+	const char *p;
+	int pos, textw = 0;
+	if (!drw || !drw->scheme || !drw->fonts || !text || !w || !h)
+		return 0;
+	XSetForeground(drw->dpy, drw->gc,
+	               (background ? background : &drw->scheme[invert ? ColFg : ColBg])->pixel);
+	XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, y, w, h);
+	if (progress && progressw) {
+		if (progressw > w) progressw = w;
+		XSetForeground(drw->dpy, drw->gc, progress->pixel);
+		XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, y, progressw, h);
+	}
+	d = XftDrawCreate(drw->dpy, drw->drawable, DefaultVisual(drw->dpy, drw->screen),
+	                  DefaultColormap(drw->dpy, drw->screen));
+	if (!d)
+		return 0;
+	XftDrawSetClipRectangles(d, 0, 0, &(XRectangle){ .x = x + lpad, .y = y,
+		.width = w > 2 * lpad ? w - 2 * lpad : 0, .height = h }, 1);
+	/* Measure the complete string so the second copy can follow the first
+	 * without a visible jump when the first copy leaves the clipped field. */
+	for (p = text; *p;) {
+		long codepoint;
+		int len = utf8decode(p, &codepoint, UTF_SIZ);
+		Fnt *font;
+		unsigned int cw = 0;
+		if (len <= 0) break;
+		for (font = drw->fonts; font; font = font->next)
+			if (XftCharExists(drw->dpy, font->xfont, codepoint)) {
+				drw_font_getexts(font, p, len, &cw, NULL);
+				break;
+			}
+		if (!font) { font = drw->fonts; drw_font_getexts(font, p, len, &cw, NULL); }
+		textw += cw;
+		p += len;
+	}
+	/* Keep a copy on both sides of the viewport.  At the wrap point this
+	 * avoids a frame where the next copy has not been drawn yet. */
+	for (int copy = -1; copy <= 1; copy++) {
+		pos = (int)lpad - offset + copy * (textw + (int)gap);
+		for (p = text; *p;) {
+			long codepoint;
+			int len = utf8decode(p, &codepoint, UTF_SIZ);
+			Fnt *font;
+			unsigned int cw = 0;
+			if (len <= 0) break;
+			for (font = drw->fonts; font; font = font->next)
+				if (XftCharExists(drw->dpy, font->xfont, codepoint)) {
+					drw_font_getexts(font, p, len, &cw, NULL);
+					break;
+				}
+			if (!font) { font = drw->fonts; drw_font_getexts(font, p, len, &cw, NULL); }
+			if (pos + (int)cw > (int)lpad && pos < (int)(w - lpad))
+			{
+				int ty = y + (h - font->h) / 2 + font->xfont->ascent;
+				XftDrawStringUtf8(d, &drw->scheme[invert ? ColBg : ColFg], font->xfont,
+				                   x + pos, ty, (const XftChar8 *)p, len);
+			}
+			pos += cw;
+			p += len;
+		}
+	}
+	XftDrawDestroy(d);
+	return textw;
+}
+
 void
 drw_pic(Drw *drw, int x, int y, unsigned int w, unsigned int h, Picture pic)
 {

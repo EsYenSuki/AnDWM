@@ -68,6 +68,15 @@ void drw_rect(Drw *drw, int x, int y, unsigned int w, unsigned int h,
               int filled, int invert);
 int drw_text(Drw *drw, int x, int y, unsigned int w, unsigned int h,
              unsigned int lpad, const char *text, int invert);
+int drw_text_scroll(Drw *drw, int x, int y, unsigned int w, unsigned int h,
+                    unsigned int lpad, const char *text, int offset,
+                    unsigned int gap, int invert);
+int drw_text_scroll_progress(Drw *drw, int x, int y, unsigned int w,
+                             unsigned int h, unsigned int lpad,
+                             const char *text, int offset, unsigned int gap,
+                             int invert, const Clr *background,
+                             const Clr *progress,
+                             unsigned int progressw);
 void drw_pic(Drw *drw, int x, int y, unsigned int w, unsigned int h,
              Picture pic);
 
