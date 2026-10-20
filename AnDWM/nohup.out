@@ -1,6 +1,0 @@
-terminate called after throwing an instance of 'X11Exception'
-  what():  Connection to X server refused.
-X connection to :0 broken (explicit kill or server shutdown).
-X connection to :0 broken (explicit kill or server shutdown).
-terminate called after throwing an instance of 'std::system_error'
-  what():  Resource deadlock avoided
