@@ -27,10 +27,6 @@ feh --bg-fill ~/.config/AnDWM/Wallpaper/Miku_plant.png
 
 xset r rate 200 20 &
 
-# Notification Daemon
-taskset -c 0 wired &
-#bar
-taskset -c 0 ~/.config/AnDWM/scripts/bin/bar &
 # Compositor
 picom --config ~/.config/AnDWM/scripts/picom.conf &
 

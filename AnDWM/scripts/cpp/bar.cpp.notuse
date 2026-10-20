@@ -1239,8 +1239,8 @@ string handle() {
   int temp           = f_temp.get();
   auto bat_fan       = f_bat_fan.get();
 
-  bool performance_hot  = governor == "performance" && temp > 79;
-  bool performance_cool = governor == "performance" && temp <= 72;
+  bool performance_hot  = governor == "ondemand" && temp > 79;
+  bool performance_cool = governor == "ondemand" && temp <= 72;
   // cout << "TEMP : " << temp << endl;
   // cout << "pwmPath : " << pwmPath << endl;
   
@@ -1339,7 +1339,7 @@ int main() {
       // going to call XStoreName - do it in-process instead.
       XStoreName(dpy, DefaultRootWindow(dpy), bar_output.c_str());
       XFlush(dpy);
-      usleep(700000);
+      usleep(1000000);
     } else {
       usleep(5000000);
     }
