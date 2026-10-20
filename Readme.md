@@ -165,6 +165,22 @@ Useful files:
 * Wallpapers: `~/.config/AnDWM/Wallpaper`
 * Bar themes: `~/.config/AnDWM/scripts/bar_themes`
 
+## Notification History
+
+AnDWM includes notification history in the center clock bar. Notifications are
+kept in newest-first order, with up to ten entries retained and five entries
+visible at a time. Use the mouse wheel over the history to scroll through older
+notifications; scrolling uses a smooth 500 ms eased animation.
+
+Active notifications retain their normal timeout and interaction behavior:
+
+* Left-click notification content to activate its first action
+* Right-click notification content to dismiss the current notification
+* Middle-click notification content to clear active and queued notifications
+  while keeping them in history
+
+Action buttons and input fields are excluded from these content-click actions.
+
 ## Uninstall
 
 Remove the installed binaries:

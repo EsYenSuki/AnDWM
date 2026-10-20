@@ -103,6 +103,7 @@ sendn(const char *msg)
 #define NOTIFY_HISTORY_MAX     10
 #define NOTIFY_HISTORY_ENTRY_H 70
 #define NOTIFY_HISTORY_MAX_H   (NOTIFY_HISTORY_ENTRY_H * 5)
+#define NOTIFY_HISTORY_SCROLL_MS 500
 
 static volatile int clockanim_running = 0;
 static volatile unsigned int clockbar_dynw = 0; /* 0 = use fixed clockwidth() */
@@ -146,6 +147,10 @@ static unsigned int notify_width, notify_height;
 static unsigned int notify_count;
 static unsigned int notify_history_count;
 static int notify_history_scroll;
+static int notify_history_scroll_target;
+static int notify_history_scroll_start;
+static int notify_history_scroll_end;
+static struct timespec notify_history_scroll_started;
 static Clr notify_bg, notify_fg, notify_body;
 static Clr notify_summary_scheme[3], notify_body_scheme[3];
 static Clr notify_control_scheme[3], notify_control_hover_scheme[3];
@@ -553,6 +558,7 @@ static void notification_history_show(void);
 static void notification_history_hide(void);
 static int notification_center_active(void);
 static int notification_history_buttonpress(XButtonPressedEvent *ev);
+static int notification_history_tick(void);
 static void leavenotify(XEvent *e);
 static int updategeom(void);
 static void updatenumlockmask(void);
@@ -2101,16 +2107,20 @@ static unsigned int notification_text_width(const char *text) {
 
 static void notification_history_layout(void) {
   unsigned int content_h;
+  int max_scroll;
 
   /* Keep history stable while entries are added or removed. */
   notify_width = NOTIFY_MAX_W;
   content_h = notify_history_count * NOTIFY_HISTORY_ENTRY_H;
   notify_height = MIN(MAX(content_h, bh), (unsigned int)NOTIFY_HISTORY_MAX_H);
-  if (content_h > notify_height)
-    notify_history_scroll = MAX(0, MIN(notify_history_scroll,
-                                       (int)(content_h - notify_height)));
-  else
+  max_scroll = content_h > notify_height ? (int)(content_h - notify_height) : 0;
+  notify_history_scroll = MAX(0, MIN(notify_history_scroll, max_scroll));
+  notify_history_scroll_target = MAX(0, MIN(notify_history_scroll_target,
+                                             max_scroll));
+  if (!max_scroll)
     notify_history_scroll = 0;
+  if (!max_scroll)
+    notify_history_scroll_target = 0;
 }
 
 static void notification_history_show(void) {
@@ -2127,6 +2137,9 @@ static void notification_history_hide(void) {
     return;
   notify_history_active = 0;
   notify_history_scroll = 0;
+  notify_history_scroll_target = 0;
+  notify_history_scroll_start = 0;
+  notify_history_scroll_end = 0;
   drawbars();
   resizebarwin(selmon);
 }
@@ -2815,19 +2828,64 @@ static void notification_motion(XMotionEvent *ev) {
 }
 
 static int notification_history_buttonpress(XButtonPressedEvent *ev) {
-  int old_scroll;
+  int old_target;
 
   if (!notify_history_active ||
       (ev->button != Button4 && ev->button != Button5))
     return 0;
-  old_scroll = notify_history_scroll;
+  old_target = notify_history_scroll_target;
   if (ev->button == Button4)
-    notify_history_scroll -= NOTIFY_HISTORY_ENTRY_H;
+    notify_history_scroll_target -= NOTIFY_HISTORY_ENTRY_H;
   else
-    notify_history_scroll += NOTIFY_HISTORY_ENTRY_H;
+    notify_history_scroll_target += NOTIFY_HISTORY_ENTRY_H;
   notification_history_layout();
-  if (notify_history_scroll != old_scroll)
+  if (notify_history_scroll_target != old_target) {
+    /* Start a new transition at the currently displayed pixel position so
+     * repeated wheel input remains continuous. */
+    notify_history_scroll_start = notify_history_scroll;
+    notify_history_scroll_end = notify_history_scroll_target;
+    clock_gettime(CLOCK_MONOTONIC, &notify_history_scroll_started);
     drawbars();
+  }
+  return 1;
+}
+
+static int notification_history_tick(void) {
+  struct timespec now;
+  double elapsed, progress, u, lo, hi, x;
+  int i;
+
+  if (!notify_history_active ||
+      notify_history_scroll == notify_history_scroll_target)
+    return 0;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  elapsed = (double)(now.tv_sec - notify_history_scroll_started.tv_sec) * 1000.0 +
+            (double)(now.tv_nsec - notify_history_scroll_started.tv_nsec) /
+            1000000.0;
+  progress = MIN(1.0, MAX(0.0, elapsed / NOTIFY_HISTORY_SCROLL_MS));
+
+  /* cubic-bezier(0, .6, .4, 1). Solve the X component for the
+   * parametric position, then evaluate the Y component. */
+  lo = 0.0;
+  hi = 1.0;
+  for (i = 0; i < 16; i++) {
+    u = (lo + hi) / 2.0;
+    x = 3.0 * (1.0 - u) * u * u * 0.4 + u * u * u;
+    if (x < progress)
+      lo = u;
+    else
+      hi = u;
+  }
+  u = (lo + hi) / 2.0;
+  progress = 3.0 * (1.0 - u) * (1.0 - u) * u * 0.6 +
+             3.0 * (1.0 - u) * u * u + u * u * u;
+  notify_history_scroll = notify_history_scroll_start +
+                          (int)((notify_history_scroll_end -
+                                 notify_history_scroll_start) * progress);
+  if (elapsed >= NOTIFY_HISTORY_SCROLL_MS)
+    notify_history_scroll = notify_history_scroll_target;
+  drawbars();
   return 1;
 }
 
@@ -5746,6 +5804,10 @@ void run(void) {
       timeout = clockbar_timeout;
     if (notify_current && timeout > 100)
       timeout = 100;
+    if (notify_history_active &&
+        notify_history_scroll != notify_history_scroll_target &&
+        timeout > clockbar_timeout)
+      timeout = clockbar_timeout;
     pfd[1].fd = notify_fd;
     poll(pfd, notify_fd >= 0 ? 2 : 1, timeout);
     if (notify_fd >= 0 && (pfd[1].revents & POLLIN))
@@ -5786,6 +5848,7 @@ void run(void) {
 
     now = time(NULL);
     notification_tick();
+    notification_history_tick();
     if (minimize_deadline && now >= minimize_deadline)
       checkminimize();
     if (now >= next_clock_update) {
