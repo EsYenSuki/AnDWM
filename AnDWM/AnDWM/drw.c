@@ -256,6 +256,8 @@ drw_picture_create_resized(Drw *drw, char *src, unsigned int srcw, unsigned int 
 
 		pic = XRenderCreatePicture(drw->dpy, pm, XRenderFindStandardFormat(drw->dpy, PictStandardARGB32), 0, NULL);
 		XFreePixmap(drw->dpy, pm);
+		if (!pic)
+			return None;
 
 		XRenderSetPictureFilter(drw->dpy, pic, FilterBilinear, NULL, 0);
 		XTransform xf;
@@ -269,7 +271,8 @@ drw_picture_create_resized(Drw *drw, char *src, unsigned int srcw, unsigned int 
 		imlib_context_set_image(origin);
 		imlib_image_set_has_alpha(1);
 		Imlib_Image scaled = imlib_create_cropped_scaled_image(0, 0, srcw, srch, dstw, dsth);
-		imlib_free_image_and_decache();
+        if (imlib_context_get_image())
+            imlib_free_image_and_decache();
 		if (!scaled) return None;
 		imlib_context_set_image(scaled);
 		imlib_image_set_has_alpha(1);
@@ -285,11 +288,14 @@ drw_picture_create_resized(Drw *drw, char *src, unsigned int srcw, unsigned int 
 		pm = XCreatePixmap(drw->dpy, drw->root, dstw, dsth, 32);
 		gc = XCreateGC(drw->dpy, pm, 0, NULL);
 		XPutImage(drw->dpy, pm, gc, &img, 0, 0, 0, 0, dstw, dsth);
-		imlib_free_image_and_decache();
+        if (imlib_context_get_image())
+            imlib_free_image_and_decache();
 		XFreeGC(drw->dpy, gc);
 
 		pic = XRenderCreatePicture(drw->dpy, pm, XRenderFindStandardFormat(drw->dpy, PictStandardARGB32), 0, NULL);
 		XFreePixmap(drw->dpy, pm);
+		if (!pic)
+			return None;
 	}
 
 	return pic;
@@ -459,7 +465,7 @@ no_match:
 void
 drw_pic(Drw *drw, int x, int y, unsigned int w, unsigned int h, Picture pic)
 {
-	if (!drw)
+	if (!drw || !pic)
 		return;
 	XRenderComposite(drw->dpy, PictOpOver, pic, None, drw->picture, 0, 0, 0, 0, x, y, w, h);
 }
