@@ -95,6 +95,7 @@ sendn(const char *msg)
 #define DRAW_FPS         50     /* visualizer update rate */
 #define NOTIFY_MAX       5
 #define NOTIFY_TIMEOUT   5
+#define NOTIFY_TRANSITION_MS 500
 #define NOTIFY_TWO_CONTENT_H 70
 #define NOTIFY_MAX_W     300
 #define NOTIFY_IMAGE_RADIUS 8
@@ -104,6 +105,7 @@ sendn(const char *msg)
 #define NOTIFY_BUTTON_H (NOTIFY_ACTION_H - 6)
 #define NOTIFY_BUTTON_ROW_H NOTIFY_ACTION_H
 #define NOTIFY_ACTION_X  12
+#define NOTIFY_TEXT_TOP_OFFSET 3
 #define NOTIFY_TEXT_BOTTOM_GAP 0
 #define NOTIFY_IMAGE_BUTTON_GAP 2
 #define NOTIFY_HISTORY_MAX     10
@@ -147,6 +149,8 @@ static unsigned int notify_next_id = 1;
 static Notification *notify_head, *notify_tail, *notify_current;
 static Notification *notify_history_head, *notify_history_tail;
 static int notify_active;
+static int notify_transition_pending;
+static struct timespec notify_transition_started;
 static int notify_history_active;
 static int notify_clock_hovered;
 static unsigned int notify_width, notify_height;
@@ -160,11 +164,16 @@ static struct timespec notify_history_scroll_started;
 static Clr notify_bg, notify_fg, notify_body;
 static Clr notify_summary_scheme[3], notify_body_scheme[3];
 static Clr notify_control_scheme[3], notify_control_hover_scheme[3];
+static Clr notify_action_scheme[3], notify_action_hover_scheme[3];
 static int notify_action_x[16], notify_action_w[16];
 static int notify_input_x, notify_input_y, notify_input_w, notify_input_h;
 static int notify_input_focus;
+static Notification *notify_history_input;
 static int notify_hovered;
 static int notify_hover = -1;
+static Notification *notify_history_hover_entry;
+static int notify_history_hover_action = -1;
+static struct timespec notify_hover_started;
 
 static struct pw_thread_loop *sound_loop = NULL;
 static struct pw_context *sound_context = NULL;
@@ -632,49 +641,183 @@ static int status_read_line(const char *path, char *out, size_t outlen) {
 	return 1;
 }
 
+static DBusMessage *status_nm_property(DBusConnection *connection,
+                                        const char *path, const char *interface,
+                                        const char *property) {
+	DBusMessage *message, *reply;
+
+	message = dbus_message_new_method_call(
+		"org.freedesktop.NetworkManager", path,
+		"org.freedesktop.DBus.Properties", "Get");
+	if (!message)
+		return NULL;
+	dbus_message_append_args(message, DBUS_TYPE_STRING, &interface,
+	                         DBUS_TYPE_STRING, &property, DBUS_TYPE_INVALID);
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	return reply;
+}
+
 static int status_wifi(char *name, size_t namelen, int *strength) {
-	FILE *f = fopen("/proc/net/wireless", "r");
-	char line[256];
-	char iface[IFNAMSIZ];
-	int level;
-	*strength = 0;
+	static DBusConnection *connection;
+	DBusMessage *reply;
+	DBusMessageIter iter, variant, value;
+	const char *path;
+	const char *device_path = NULL;
+	const char *ap_path = NULL;
+	uint32_t device_type;
+	unsigned char signal_strength;
+
 	name[0] = '\0';
-	if (!f) return 0;
-	while (fgets(line, sizeof line, f)) {
-		char *colon = strchr(line, ':');
-		if (!colon) continue;
-		*colon = '\0';
-		if (sscanf(line, " %15s", iface) != 1 ||
-		    sscanf(colon + 1, "%d", &level) != 1)
-			continue;
-		*strength = level < 0 ? (level + 100) * 2 : level;
-		if (*strength < 0) *strength = 0;
-		if (*strength > 100) *strength = 100;
-		{
-			char path[PATH_MAX], state[16];
-			snprintf(path, sizeof path, "/sys/class/net/%s/operstate", iface);
-			if (!status_read_line(path, state, sizeof state) || strcmp(state, "up"))
-				continue;
-		}
-		/* NetworkManager keeps the current SSID in the kernel wireless ioctl;
-		 * use iwgetid when available, without touching Xlib. */
-		{
-			char command[64], ssid[128];
-			snprintf(command, sizeof command, "iwgetid %s -r 2>/dev/null", iface);
-			FILE *p = popen(command, "r");
-			if (p && fgets(ssid, sizeof ssid, p)) {
-				ssid[strcspn(ssid, "\r\n")] = '\0';
-				if (*ssid) snprintf(name, namelen, "%s", ssid);
-			}
-			if (p) pclose(p);
-		}
-		if (!*name)
-			snprintf(name, namelen, "%s", iface);
-		fclose(f);
-		return 1;
+	*strength = 0;
+	if (!connection)
+		connection = dbus_bus_get(DBUS_BUS_SYSTEM, NULL);
+	if (!connection)
+		return 0;
+
+	/* Follow NetworkManager's PrimaryConnection, just like bar.cpp. */
+	reply = status_nm_property(connection, "/org/freedesktop/NetworkManager",
+	                           "org.freedesktop.NetworkManager", "PrimaryConnection");
+	if (!reply)
+		return 0;
+	if (!dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		dbus_message_unref(reply);
+		return 0;
 	}
-	fclose(f);
-	return 0;
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_OBJECT_PATH) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&variant, &path);
+	if (!path || !strcmp(path, "/")) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	char connection_path[PATH_MAX];
+	snprintf(connection_path, sizeof connection_path, "%s", path);
+	dbus_message_unref(reply);
+
+	reply = status_nm_property(connection, connection_path,
+	                           "org.freedesktop.NetworkManager.Connection.Active",
+	                           "Devices");
+	if (!reply)
+		return 0;
+	if (!dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_ARRAY) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&variant, &value);
+	if (dbus_message_iter_get_arg_type(&value) != DBUS_TYPE_OBJECT_PATH) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&value, &device_path);
+	char device_path_copy[PATH_MAX];
+	snprintf(device_path_copy, sizeof device_path_copy, "%s", device_path);
+	dbus_message_unref(reply);
+
+	reply = status_nm_property(connection, device_path_copy,
+	                           "org.freedesktop.NetworkManager.Device", "DeviceType");
+	if (!reply)
+		return 0;
+	if (!dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_UINT32) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&variant, &device_type);
+	dbus_message_unref(reply);
+	if (device_type != 2)
+		return 0;
+
+	reply = status_nm_property(connection, device_path_copy,
+	                           "org.freedesktop.NetworkManager.Device.Wireless",
+	                           "ActiveAccessPoint");
+	if (!reply)
+		return 0;
+	if (!dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_OBJECT_PATH) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&variant, &ap_path);
+	char ap_path_copy[PATH_MAX];
+	snprintf(ap_path_copy, sizeof ap_path_copy, "%s", ap_path);
+	dbus_message_unref(reply);
+	if (!strcmp(ap_path_copy, "/"))
+		return 0;
+
+	reply = status_nm_property(connection, ap_path_copy,
+	                           "org.freedesktop.NetworkManager.AccessPoint", "Ssid");
+	if (!reply)
+		return 0;
+	if (!dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_ARRAY) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&variant, &value);
+	if (dbus_message_iter_get_arg_type(&value) != DBUS_TYPE_BYTE) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	{
+		size_t n = 0;
+		while (dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_BYTE) {
+			unsigned char byte;
+			dbus_message_iter_get_basic(&value, &byte);
+			if (n + 1 < namelen)
+				name[n] = (char)byte;
+			n++;
+			if (!dbus_message_iter_next(&value))
+				break;
+		}
+		if (namelen)
+			name[n < namelen ? n : namelen - 1] = '\0';
+	}
+	dbus_message_unref(reply);
+
+	reply = status_nm_property(connection, ap_path_copy,
+	                           "org.freedesktop.NetworkManager.AccessPoint", "Strength");
+	if (!reply)
+		return 0;
+	if (!dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_BYTE) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&variant, &signal_strength);
+	*strength = signal_strength;
+	dbus_message_unref(reply);
+	return name[0] != '\0';
 }
 
 static DBusMessage *status_dbus_call(DBusConnection *connection, const char *service,
@@ -1081,6 +1224,8 @@ static void status_consume(void) {
 			stext[sizeof stext - 1] = '\0';
 			if (strcmp(mpris_text, status_slots[i].mpris)) {
 				mpris_scroll_px = 0;
+				/* The cached width belongs to the previous title. */
+				mpris_scroll_text_width = 0;
 				mpris_scroll_accum_ns = 0;
 				mpris_scroll_clock_valid = 0;
 				memcpy(mpris_text, status_slots[i].mpris, sizeof mpris_text);
@@ -1109,6 +1254,7 @@ static int notification_buttonpress(XButtonPressedEvent *ev);
 static int notification_input_keypress(XKeyEvent *ev);
 static void notification_update_layout(Notification *n);
 static void notification_motion(XMotionEvent *ev);
+static void notification_history_motion(XMotionEvent *ev);
 static void notification_history_draw(void);
 static void notification_history_layout(void);
 static void notification_history_add(Notification *n);
@@ -1222,16 +1368,26 @@ static int update_mpris_scroll(void) {
 	mpris_scroll_last = now_mono;
 	steps = mpris_scroll_accum_ns / MPRIS_SCROLL_INTERVAL_NS;
 	mpris_scroll_accum_ns %= MPRIS_SCROLL_INTERVAL_NS;
-	if (textw > MPRIS_WIDTH && cycle && steps) {
+	if (textw + 2 * MPRIS_SCROLL_PAD > MPRIS_WIDTH && cycle && steps) {
 		mpris_scroll_px = (mpris_scroll_px + steps) % cycle;
 		return 1;
-	} else if (textw <= MPRIS_WIDTH) {
+	} else if (textw + 2 * MPRIS_SCROLL_PAD <= MPRIS_WIDTH) {
 		if (mpris_scroll_px == 0)
 			return 0;
 		mpris_scroll_px = 0;
 		return 1;
 	}
 	return 0;
+}
+
+/* Keep short MPRIS fields close to their content while retaining the fixed
+ * maximum viewport for long titles.  The padding is part of the field, not
+ * part of the scrolling text. */
+static unsigned int mpris_field_width(const char *text) {
+	unsigned int textw = TEXTW(text) - lrpad;
+	unsigned int width = textw + 2 * MPRIS_SCROLL_PAD;
+
+	return MIN(MPRIS_WIDTH, MAX(1U, width));
 }
 
 static int drag_next_event(XEvent *ev) {
@@ -2045,7 +2201,7 @@ unsigned int statuswidth(char *stext) {
       if (!isCode) {
         isCode = 1;
         text[i] = '\0';
-        w += isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
+			w += isScroll ? mpris_field_width(text) : TEXTW(text) - lrpad;
         text[i] = '^';
         if (text[++i] == 'm')
           isScroll = 1;
@@ -2061,7 +2217,7 @@ unsigned int statuswidth(char *stext) {
     }
   }
   if (!isCode)
-    w += isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
+		w += isScroll ? mpris_field_width(text) : TEXTW(text) - lrpad;
   else
     isCode = 0;
   free(p);
@@ -2100,7 +2256,7 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
       isCode = 1;
 
       text[i] = '\0';
-       w = isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
+       w = isScroll ? mpris_field_width(text) : TEXTW(text) - lrpad;
         if (isScroll) {
           double progress = mpris_progress;
           unsigned int progressw = 0;
@@ -2168,7 +2324,7 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
   }
 
   if (!isCode) {
-    w = isScroll ? MPRIS_WIDTH : TEXTW(text) - lrpad;
+    w = isScroll ? mpris_field_width(text) : TEXTW(text) - lrpad;
     if (isScroll) {
       double progress = mpris_progress;
       unsigned int progressw = 0;
@@ -2575,8 +2731,38 @@ static void notification_free_contents(Notification *n) {
   n->image_hint = 0;
 }
 
+static void notification_history_clear_controls(Notification *n) {
+  unsigned int i;
+
+  if (!n)
+    return;
+  for (i = 0; i < n->action_count; i++)
+    free(n->actions[i]);
+  free(n->actions);
+  free(n->input_action);
+  free(n->input_placeholder);
+  free(n->input_text);
+  n->actions = NULL;
+  n->action_count = 0;
+  n->input_action = n->input_placeholder = n->input_text = NULL;
+  n->input_enabled = 0;
+}
+
 static int notification_center_active(void) {
   return notify_active || notify_history_active;
+}
+
+/* The audio visualizer may make barcenterwin wider than the clock.  Only the
+ * fixed clock-sized portion should act as the history hover target while the
+ * center is in its normal clock state. */
+static int notification_clock_hit(int x, unsigned int width) {
+  unsigned int hover_width = clockbar_cw;
+  int left;
+
+  if (!hover_width || hover_width >= width)
+    return 1;
+  left = ((int)width - (int)hover_width) / 2;
+  return x >= left && x < left + (int)hover_width;
 }
 
 static void notification_history_add(Notification *n) {
@@ -2780,13 +2966,34 @@ static unsigned int notification_text_width(const char *text) {
   return width;
 }
 
+static unsigned int notification_history_entry_height(Notification *n) {
+  unsigned int height;
+  int has_summary, has_body, has_two_content;
+
+  if (!n)
+    return NOTIFY_HISTORY_ENTRY_H;
+  has_summary = n->summary && *n->summary;
+  has_body = n->body && *n->body;
+  has_two_content = (has_summary && has_body) ||
+                    (n->image && (has_summary || has_body));
+  height = (!has_two_content && !n->image) ? bh : NOTIFY_HISTORY_ENTRY_H;
+  if (n->input_enabled)
+    height += NOTIFY_INPUT_ROW_H;
+  if (n->action_count >= 2)
+    height += NOTIFY_BUTTON_ROW_H;
+  return height;
+}
+
 static void notification_history_layout(void) {
+  Notification *n;
   unsigned int content_h;
   int max_scroll;
 
   /* Keep history stable while entries are added or removed. */
   notify_width = NOTIFY_MAX_W;
-  content_h = notify_history_count * NOTIFY_HISTORY_ENTRY_H;
+  content_h = 0;
+  for (n = notify_history_head; n; n = n->next)
+    content_h += notification_history_entry_height(n);
   notify_height = MIN(MAX(content_h, bh), (unsigned int)NOTIFY_HISTORY_MAX_H);
   max_scroll = content_h > notify_height ? (int)(content_h - notify_height) : 0;
   notify_history_scroll = MAX(0, MIN(notify_history_scroll, max_scroll));
@@ -2811,6 +3018,10 @@ static void notification_history_hide(void) {
   if (!notify_history_active)
     return;
   notify_history_active = 0;
+  notify_history_input = NULL;
+  notify_input_focus = 0;
+  notify_history_hover_entry = NULL;
+  notify_history_hover_action = -1;
   notify_history_scroll = 0;
   notify_history_scroll_target = 0;
   notify_history_scroll_start = 0;
@@ -2854,20 +3065,43 @@ static void notification_update_layout(Notification *n) {
   if (has_two_content)
     notify_height = NOTIFY_TWO_CONTENT_H;
   if (n->input_enabled || (notify_hovered && n->action_count >= 2)) {
+    unsigned int content_height = has_two_content ? NOTIFY_TWO_CONTENT_H : bh;
     unsigned int controls = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
                             (notify_hovered && n->action_count >= 2
                                  ? NOTIFY_BUTTON_ROW_H
                                  : 0);
     if (notify_hovered && n->image && n->action_count >= 2)
       controls += NOTIFY_IMAGE_BUTTON_GAP + 6;
-    notify_height = MAX(notify_height, NOTIFY_TWO_CONTENT_H + controls);
+    notify_height = MAX(notify_height, content_height + controls);
   }
 }
 
 static void notification_set_hovered(int hovered) {
+  struct timespec now;
+  time_t paused_sec;
+  long paused_nsec;
+
   hovered = !!hovered;
   if (notify_hovered == hovered)
     return;
+
+  if (hovered) {
+    clock_gettime(CLOCK_MONOTONIC, &notify_hover_started);
+  } else if (notify_current) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    paused_sec = now.tv_sec - notify_hover_started.tv_sec;
+    paused_nsec = now.tv_nsec - notify_hover_started.tv_nsec;
+    if (paused_nsec < 0) {
+      paused_sec--;
+      paused_nsec += 1000000000L;
+    }
+    notify_current->shown_at.tv_sec += paused_sec;
+    notify_current->shown_at.tv_nsec += paused_nsec;
+    if (notify_current->shown_at.tv_nsec >= 1000000000L) {
+      notify_current->shown_at.tv_sec++;
+      notify_current->shown_at.tv_nsec -= 1000000000L;
+    }
+  }
   notify_hovered = hovered;
   notification_update_layout(notify_current);
   drawbars();
@@ -2984,7 +3218,7 @@ static void notification_queue(Notification *n) {
     notify_head = n;
   notify_tail = n;
   notify_count++;
-  if (!notify_current) {
+  if (!notify_current && !notify_transition_pending) {
     notify_current = notify_head;
     notify_head = notify_current->next;
     if (!notify_head)
@@ -3008,23 +3242,14 @@ static void notification_advance(void) {
   notify_input_focus = 0;
   notify_hovered = 0;
   notify_hover = -1;
-  notify_current = notify_head;
-  notify_head = notify_current ? notify_current->next : NULL;
-  if (!notify_head)
-    notify_tail = NULL;
-  if (notify_current) {
-    notify_current->next = NULL;
-    clock_gettime(CLOCK_MONOTONIC, &notify_current->shown_at);
-    notification_update_layout(notify_current);
-  } else {
-    notify_active = 0;
-    clockbar_dynw = 0;
-  }
+  notify_current = NULL;
+  notify_active = 0;
+  clockbar_dynw = 0;
   if (notify_count)
     notify_count--;
   notification_history_add(old);
-  if (!notify_current && notify_clock_hovered)
-    notification_history_show();
+  notify_transition_pending = 1;
+  clock_gettime(CLOCK_MONOTONIC, &notify_transition_started);
   drawbars();
   resizebarwin(selmon);
 }
@@ -3032,15 +3257,14 @@ static void notification_advance(void) {
 static void notification_clear_queue(void) {
   Notification *n, *next;
 
+  notify_transition_pending = 0;
   if (notify_current) {
-    notification_emit_closed(notify_current, 2);
     notification_history_add(notify_current);
     notify_current = NULL;
   }
   for (n = notify_head; n; n = next) {
     next = n->next;
     n->next = NULL;
-    notification_emit_closed(n, 2);
     notification_history_add(n);
   }
   notify_head = notify_tail = NULL;
@@ -3050,12 +3274,10 @@ static void notification_clear_queue(void) {
   notify_hovered = 0;
   notify_hover = -1;
   clockbar_dynw = 0;
-  if (notify_clock_hovered)
-    notification_history_show();
-  else {
-    drawbars();
-    resizebarwin(selmon);
-  }
+  notify_transition_pending = 1;
+  clock_gettime(CLOCK_MONOTONIC, &notify_transition_started);
+  drawbars();
+  resizebarwin(selmon);
 }
 
 static char *notification_variant_string(DBusMessageIter *variant) {
@@ -3369,10 +3591,10 @@ static void notification_draw(void) {
     text_w = notify_width - text_x - 8;
   }
   if (has_body && has_summary) {
-    summary_y = 8;
-    body_y = 36;
+    summary_y = 7 + NOTIFY_TEXT_TOP_OFFSET;
+    body_y = 32 + NOTIFY_TEXT_TOP_OFFSET;
   } else {
-    summary_y = body_y = MAX(4, (content_h - drw->fonts->h) / 2);
+    summary_y = body_y = MAX(0, (content_h - (drw->fonts->h + 8)) / 2);
   }
   drw_setscheme(drw, notify_summary_scheme);
   if (has_summary)
@@ -3386,10 +3608,10 @@ static void notification_draw(void) {
   memset(notify_action_w, 0, sizeof(notify_action_w));
   if (n->input_enabled) {
     notify_input_x = 8;
-    notify_input_y = notify_height - NOTIFY_INPUT_ROW_H - 6 -
+    notify_input_y = notify_height - NOTIFY_INPUT_ROW_H -
                      (notify_hovered && n->action_count >= 2
-                          ? NOTIFY_BUTTON_ROW_H
-                          : 0);
+                           ? NOTIFY_BUTTON_ROW_H
+                           : 0);
     notify_input_w = notify_width - 16;
     notify_input_h = NOTIFY_ACTION_H - 6;
     drw_setscheme(drw, notify_hover == -2 ? notify_control_hover_scheme
@@ -3404,7 +3626,7 @@ static void notification_draw(void) {
   }
   if (n->action_count >= 2) {
     unsigned int i, x = NOTIFY_ACTION_X, button = 0;
-    int y = notify_height - NOTIFY_ACTION_H - 6;
+    int y = notify_height - NOTIFY_ACTION_H;
     for (i = 0; i + 1 < n->action_count && button < LENGTH(notify_action_x);
          i += 2, button++) {
       unsigned int w = notification_text_width(n->actions[i + 1]) + 24;
@@ -3414,9 +3636,8 @@ static void notification_draw(void) {
       notify_action_w[button] = w;
       if (notify_hovered) {
         drw_setscheme(drw, notify_hover == (int)button
-                                ? notify_control_hover_scheme
-                                : notify_control_scheme);
-        drw_rect(drw, x, y, w, NOTIFY_BUTTON_H, 1, 1);
+                                ? notify_action_hover_scheme
+                                : notify_action_scheme);
         drw_text(drw, x, y, w, NOTIFY_BUTTON_H, 12, n->actions[i + 1], 0);
       }
       x += w + 6;
@@ -3428,7 +3649,9 @@ static void notification_history_draw(void) {
   Notification *n;
   Notification *entries[NOTIFY_HISTORY_MAX];
   unsigned int count = 0, index;
-  int y, text_x, text_w, entry_bottom;
+  int y, text_x, text_w, entry_bottom, body_bottom;
+  int action_y, input_y;
+  unsigned int entry_h;
 
   notification_history_layout();
   for (n = notify_history_head; n && count < LENGTH(entries); n = n->next)
@@ -3439,9 +3662,20 @@ static void notification_history_draw(void) {
   for (index = 0; index < count; index++) {
     /* The newest notification is shown at the top. */
     n = entries[count - 1 - index];
-    unsigned int image_w, image_h;
-    y = (int)(index * NOTIFY_HISTORY_ENTRY_H) - notify_history_scroll;
-    entry_bottom = y + NOTIFY_HISTORY_ENTRY_H;
+    unsigned int image_w, image_h, content_h;
+    int has_summary, has_body, has_two_content, controls_h, text_y;
+    entry_h = notification_history_entry_height(n);
+    y = -notify_history_scroll;
+    for (unsigned int previous = 0; previous < index; previous++)
+      y += notification_history_entry_height(entries[count - 1 - previous]);
+    entry_bottom = y + entry_h;
+    has_summary = n->summary && *n->summary;
+    has_body = n->body && *n->body;
+    has_two_content = (has_summary && has_body) ||
+                      (n->image && (has_summary || has_body));
+    controls_h = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
+                 (n->action_count >= 2 ? NOTIFY_BUTTON_ROW_H : 0);
+    content_h = entry_h - controls_h;
     if (entry_bottom <= 0 || y >= (int)notify_height)
       continue;
     text_x = 12;
@@ -3455,16 +3689,64 @@ static void notification_history_draw(void) {
       image_h = n->image_h;
       text_x = 12 + image_w + 8;
       text_w = notify_width - text_x - 12;
-      drw_pic(drw, 12, y + (NOTIFY_HISTORY_ENTRY_H - image_h) / 2,
+      drw_pic(drw, 12, y + ((int)content_h - image_h) / 2,
               image_w, image_h, n->image);
     }
     drw_setscheme(drw, notify_summary_scheme);
-    if (n->summary && *n->summary)
-      drw_text(drw, text_x, y + 7, text_w, drw->fonts->h + 6, 8,
+    text_y = has_two_content ? y + 7 + NOTIFY_TEXT_TOP_OFFSET
+                             : y + MAX(0, ((int)content_h -
+                                           (drw->fonts->h + 8)) / 2);
+    if (has_summary)
+      drw_text(drw, text_x, text_y, text_w,
+               drw->fonts->h + 6, 8,
                n->summary, 0);
     drw_setscheme(drw, notify_body_scheme);
-    notification_draw_text(text_x, y + 32, text_w,
-                           MIN(entry_bottom - 6, (int)notify_height), n->body);
+    action_y = entry_bottom - NOTIFY_ACTION_H;
+    input_y = n->action_count >= 2
+                  ? action_y - NOTIFY_INPUT_ROW_H
+                  : entry_bottom - NOTIFY_INPUT_ROW_H;
+    body_bottom = entry_bottom - 6;
+    if (n->action_count >= 2)
+      body_bottom = MIN(body_bottom, action_y - 4);
+    if (n->input_enabled)
+      body_bottom = MIN(body_bottom, input_y - 4);
+    notification_draw_text(text_x, has_two_content
+                                      ? y + 32 + NOTIFY_TEXT_TOP_OFFSET
+                                      : text_y,
+                           text_w,
+                           MIN(body_bottom, (int)notify_height), n->body);
+    if (n->input_enabled) {
+      notify_input_x = 8;
+      notify_input_y = input_y;
+      notify_input_w = notify_width - 16;
+      notify_input_h = NOTIFY_ACTION_H - 6;
+      drw_setscheme(drw, notify_history_hover_entry == n &&
+                            notify_history_hover_action == -2
+                            ? notify_control_hover_scheme
+                            : notify_control_scheme);
+      drw_rect(drw, notify_input_x, notify_input_y, notify_input_w,
+               notify_input_h, 1, 1);
+      drw_text(drw, notify_input_x + 6, notify_input_y,
+               notify_input_w - 12, notify_input_h, 6,
+               n->input_text && *n->input_text ? n->input_text
+                                                : n->input_placeholder,
+               0);
+    }
+    if (n->action_count >= 2) {
+      unsigned int i, x = NOTIFY_ACTION_X;
+      for (i = 1; i < n->action_count; i += 2) {
+        unsigned int w = notification_text_width(n->actions[i]) + 24;
+        if (x + w > notify_width - 8)
+          break;
+        drw_setscheme(drw, notify_history_hover_entry == n &&
+                              notify_history_hover_action == (int)(i / 2)
+                              ? notify_action_hover_scheme
+                              : notify_action_scheme);
+        drw_text(drw, x, action_y, w, NOTIFY_BUTTON_H, 12,
+                 n->actions[i], 0);
+        x += w + 6;
+      }
+    }
     if (index + 1 < count) {
       XSetForeground(drw->dpy, drw->gc, notify_body.pixel);
       XDrawLine(drw->dpy, drw->drawable, drw->gc, 8, entry_bottom - 1,
@@ -3490,8 +3772,8 @@ static void notification_motion(XMotionEvent *ev) {
     for (i = 0; i < LENGTH(notify_action_x); i++)
       if (notify_action_w[i] && ev->x >= notify_action_x[i] &&
           ev->x < notify_action_x[i] + notify_action_w[i] &&
-           ev->y >= notify_height - NOTIFY_ACTION_H - 6 &&
-           ev->y < notify_height - 6) {
+           ev->y >= notify_height - NOTIFY_ACTION_H &&
+           ev->y < notify_height) {
         hover = (int)i;
         break;
       }
@@ -3502,12 +3784,144 @@ static void notification_motion(XMotionEvent *ev) {
   }
 }
 
+static void notification_history_motion(XMotionEvent *ev) {
+  Notification *n;
+  Notification *entries[NOTIFY_HISTORY_MAX];
+  unsigned int count = 0, index, action;
+  unsigned int entry_h, action_w;
+  int content_y, y = 0, entry_bottom, action_y, input_y, action_x;
+  int hover_action = -1;
+  int hover_input = 0;
+
+  for (n = notify_history_head; n && count < LENGTH(entries); n = n->next)
+    entries[count++] = n;
+  content_y = ev->y + notify_history_scroll;
+  for (index = 0; index < count; index++) {
+    n = entries[count - index - 1];
+    entry_h = notification_history_entry_height(n);
+    if (content_y >= y && content_y < y + (int)entry_h)
+      break;
+    y += entry_h;
+  }
+  if (index < count) {
+    n = entries[count - index - 1];
+    y -= notify_history_scroll;
+    entry_bottom = y + entry_h;
+    action_y = entry_bottom - NOTIFY_ACTION_H;
+    input_y = n->action_count >= 2
+                  ? action_y - NOTIFY_INPUT_ROW_H
+                  : entry_bottom - NOTIFY_INPUT_ROW_H;
+    if (n->input_enabled && ev->x >= 8 && ev->x < (int)notify_width - 8 &&
+        ev->y >= input_y && ev->y < input_y + NOTIFY_INPUT_ROW_H)
+      hover_input = 1;
+    if (n->action_count >= 2 && ev->y >= action_y &&
+        ev->y < action_y + NOTIFY_ACTION_H) {
+      action_x = NOTIFY_ACTION_X;
+      for (action = 1; action < n->action_count; action += 2) {
+        action_w = notification_text_width(n->actions[action]) + 24;
+        if (action_x + (int)action_w > (int)notify_width - 8)
+          break;
+        if (ev->x >= action_x && ev->x < action_x + (int)action_w) {
+          hover_action = (int)(action / 2);
+          break;
+        }
+        action_x += action_w + 6;
+      }
+    }
+    if (hover_input)
+      hover_action = -2;
+  } else {
+    n = NULL;
+  }
+  if (notify_history_hover_entry != n ||
+      notify_history_hover_action != hover_action) {
+    notify_history_hover_entry = n;
+    notify_history_hover_action = hover_action;
+    drawbars();
+  }
+}
+
 static int notification_history_buttonpress(XButtonPressedEvent *ev) {
+  Notification *n;
+  Notification *entries[NOTIFY_HISTORY_MAX];
+  unsigned int count = 0, index;
+  unsigned int entry_h;
+  int y, entry_bottom, action_y, input_y, content_y;
+  int action_x, action_w;
   int old_target;
 
-  if (!notify_history_active ||
-      (ev->button != Button4 && ev->button != Button5))
+  if (!notify_history_active)
     return 0;
+  /* Middle and right clicks must not alter history.  Left clicks are handled
+   * below only when they land on an action button or input field. */
+  if (ev->button == Button2 || ev->button == Button3)
+    return 1;
+  if (ev->button != Button4 && ev->button != Button5) {
+    if (ev->button != Button1)
+      return 1;
+    for (n = notify_history_head; n && count < NOTIFY_HISTORY_MAX;
+         n = n->next)
+      entries[count++] = n;
+    if (ev->y < 0 || ev->y >= (int)notify_height)
+      return 1;
+    content_y = (int)ev->y + notify_history_scroll;
+    y = 0;
+    for (index = 0; index < count; index++) {
+      n = entries[count - index - 1];
+      entry_h = notification_history_entry_height(n);
+      if (content_y >= y && content_y < y + (int)entry_h)
+        break;
+      y += entry_h;
+    }
+    if (index >= count)
+      return 1;
+    n = entries[count - index - 1];
+    y -= notify_history_scroll;
+    entry_bottom = y + entry_h;
+    action_y = entry_bottom - NOTIFY_ACTION_H;
+    input_y = n->action_count >= 2
+                  ? action_y - NOTIFY_INPUT_ROW_H
+                  : entry_bottom - NOTIFY_INPUT_ROW_H;
+    if (n->input_enabled && ev->y >= input_y && ev->y < input_y +
+        NOTIFY_INPUT_ROW_H && ev->x >= 8 && ev->x < (int)notify_width - 8) {
+      if (ev->button == Button1) {
+        notify_history_input = n;
+        notify_input_focus = 1;
+        XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent,
+                       CurrentTime);
+        XFlush(dpy);
+      }
+      return 1;
+    }
+    if (n->action_count >= 2 && ev->y >= action_y &&
+        ev->y < action_y + NOTIFY_ACTION_H) {
+      action_x = NOTIFY_ACTION_X;
+      for (unsigned int action = 1; action < n->action_count; action += 2) {
+        action_w = notification_text_width(n->actions[action]) + 24;
+        if (action_x + action_w > (int)notify_width - 8)
+          break;
+        if (ev->x >= action_x && ev->x < action_x + action_w) {
+          if (ev->button == Button1) {
+            notification_emit_action(n, n->actions[action - 1]);
+            /* Match active-notification behavior: the application receives
+             * both the action and the close notification for this ID. */
+            notification_emit_closed(n, 2);
+            notification_history_clear_controls(n);
+            if (notify_history_input == n) {
+              notify_history_input = NULL;
+              notify_input_focus = 0;
+            }
+            notification_history_layout();
+            drawbars();
+          }
+          return 1;
+        }
+        action_x += action_w + 6;
+      }
+    }
+    /* A click on the notification content itself has no history action. */
+    return 1;
+  }
   old_target = notify_history_scroll_target;
   if (ev->button == Button4)
     notify_history_scroll_target -= NOTIFY_HISTORY_ENTRY_H;
@@ -3635,12 +4049,15 @@ static int notification_buttonpress(XButtonPressedEvent *ev) {
   for (i = 0; i < LENGTH(notify_action_x); i++) {
     if (notify_action_w[i] && ev->x >= notify_action_x[i] &&
         ev->x < notify_action_x[i] + notify_action_w[i] &&
-          ev->y >= notify_height - NOTIFY_ACTION_H - 6 &&
-          ev->y < notify_height - 6) {
+           ev->y >= notify_height - NOTIFY_ACTION_H &&
+           ev->y < notify_height) {
       in_action = 1;
       if (ev->button == Button1) {
         notification_emit_action(n, n->actions[i * 2]);
         notification_emit_closed(n, 2);
+        /* An action was handled, so the archived copy keeps only the
+         * notification content, not controls which can no longer be used. */
+        notification_history_clear_controls(n);
         notification_advance();
       }
       return 1;
@@ -3654,12 +4071,13 @@ static int notification_buttonpress(XButtonPressedEvent *ev) {
     if (n->action_count >= 2) {
       notification_emit_action(n, n->actions[0]);
       notification_emit_closed(n, 2);
+      notification_history_clear_controls(n);
       notification_advance();
     }
     return 1;
   }
   if (ev->button == Button3) {
-    notification_emit_closed(n, 2);
+    /* Right-click skips this notification silently and archives it. */
     notification_advance();
     return 1;
   }
@@ -3671,7 +4089,8 @@ static int notification_buttonpress(XButtonPressedEvent *ev) {
 }
 
 static int notification_input_keypress(XKeyEvent *ev) {
-  Notification *n = notify_current;
+  Notification *n = notify_active ? notify_current : notify_history_input;
+  int history_input = !notify_active && notify_history_input == n;
   KeySym keysym;
   char text[64];
   int len;
@@ -3681,16 +4100,32 @@ static int notification_input_keypress(XKeyEvent *ev) {
   keysym = XLookupKeysym(ev, 0);
   if (keysym == XK_Escape) {
     notify_input_focus = 0;
-    notification_emit_closed(n, 2);
-    notification_advance();
+    if (history_input) {
+      notification_history_clear_controls(n);
+      notify_history_input = NULL;
+      notification_history_layout();
+      drawbars();
+    } else {
+      notification_emit_closed(n, 2);
+      notification_history_clear_controls(n);
+      notification_advance();
+    }
     XSetInputFocus(dpy, root, RevertToParent, CurrentTime);
     return 1;
   }
   if (keysym == XK_Return || keysym == XK_KP_Enter) {
     notify_input_focus = 0;
     notification_emit_input(n);
-    notification_emit_closed(n, 2);
-    notification_advance();
+    if (history_input) {
+      notification_history_clear_controls(n);
+      notify_history_input = NULL;
+      notification_history_layout();
+      drawbars();
+    } else {
+      notification_emit_closed(n, 2);
+      notification_history_clear_controls(n);
+      notification_advance();
+    }
     XSetInputFocus(dpy, root, RevertToParent, CurrentTime);
     return 1;
   }
@@ -3736,9 +4171,40 @@ static void notification_dispatch(void) {
 }
 
 static void notification_tick(void) {
-  if (notify_current && notification_elapsed(&notify_current->shown_at) >=
+  if (notify_transition_pending &&
+      notification_elapsed(&notify_transition_started) >=
+          NOTIFY_TRANSITION_MS / 1000.0) {
+    notify_transition_pending = 0;
+    if (notify_head) {
+      notify_current = notify_head;
+      notify_head = notify_current->next;
+      if (!notify_head)
+        notify_tail = NULL;
+      notify_current->next = NULL;
+      notify_input_focus = 0;
+      notify_hovered = 0;
+      notify_hover = -1;
+      clock_gettime(CLOCK_MONOTONIC, &notify_current->shown_at);
+      notification_update_layout(notify_current);
+      notify_active = 1;
+      clockbar_dynw = notify_width;
+      clockbar_peak = 0.0f;
+      drawbars();
+      resizebarwin(selmon);
+    } else if (notify_clock_hovered && notify_history_count) {
+      notification_history_show();
+    } else {
+      drawbars();
+      resizebarwin(selmon);
+    }
+    return;
+  }
+  if (!notify_hovered && notify_current &&
+      notification_elapsed(&notify_current->shown_at) >=
                            NOTIFY_TIMEOUT) {
-    notification_emit_closed(notify_current, 1);
+    /* Timed-out notifications remain actionable from history.  Do not send
+     * NotificationClosed here; the application must stay able to receive a
+     * later ActionInvoked or InputSubmitted for this notification. */
     notification_advance();
   }
 }
@@ -3963,8 +4429,9 @@ void drawbar(Monitor *m) {
 
   /* center bar: clock in normal mode, notification panel when active */
    unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
-                                    : ((clockbar_dynw && !fullscreen_st && m == selmon)
-                                          ? clockbar_dynw : cw);
+                                     : ((clockbar_dynw && !notify_clock_hovered &&
+                                         !fullscreen_st && m == selmon)
+                                           ? clockbar_dynw : cw);
   unsigned int tcw = clockbar_cw;
   XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
   XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, dcw, bh);
@@ -4388,10 +4855,14 @@ void enternotify(XEvent *e) {
   XCrossingEvent *ev = &e->xcrossing;
 
   if (ev->window == selmon->barcenterwin) {
+    if (!notification_center_active() &&
+        !notification_clock_hit(ev->x,
+                                clockbar_dynw ? clockbar_dynw : clockbar_cw))
+      return;
     notify_clock_hovered = 1;
     if (notify_active)
       notification_set_hovered(1);
-    else if (notify_history_count)
+    else if (!notify_transition_pending && notify_history_count)
       notification_history_show();
     return;
   }
@@ -5333,10 +5804,16 @@ void motionnotify(XEvent *e) {
   XMotionEvent *ev = &e->xmotion;
 
   if (ev->window == selmon->barcenterwin) {
+    if (!notification_center_active() &&
+        !notification_clock_hit(ev->x,
+                                clockbar_dynw ? clockbar_dynw : clockbar_cw))
+      return;
     notify_clock_hovered = 1;
     if (notify_active)
       notification_motion(ev);
-    else if (notify_history_count && !notify_history_active)
+    else if (notify_history_active)
+      notification_history_motion(ev);
+    else if (!notify_transition_pending && notify_history_count)
       notification_history_show();
     return;
   }
@@ -6116,9 +6593,10 @@ void resizebarwin(Monitor *m) {
 	if (!kw) kw = 1;
 	if (!rw) rw = 1;
 	{
-	   unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
-                                     : ((clockbar_dynw && !fullscreen_st && m == selmon)
-                                             ? clockbar_dynw : cw);
+   unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
+                                     : ((clockbar_dynw && !notify_clock_hovered &&
+                                         !fullscreen_st && m == selmon)
+                                           ? clockbar_dynw : cw);
 	   unsigned int fcw = (notification_center_active() && m == selmon) ? notify_width : clockbar_cw;
 	   if (!dcw) dcw = 1;
 	   if (!fcw) fcw = 1;
@@ -6493,6 +6971,8 @@ void run(void) {
       timeout = clockbar_timeout;
     if (notify_current && timeout > 100)
       timeout = 100;
+    if (notify_transition_pending && timeout > NOTIFY_TRANSITION_MS)
+      timeout = NOTIFY_TRANSITION_MS;
     if (notify_history_active &&
         notify_history_scroll != notify_history_scroll_target &&
         timeout > clockbar_timeout)
@@ -7341,6 +7821,13 @@ void setup(void) {
     notify_control_hover_scheme[ColFg] = notify_fg;
     notify_control_hover_scheme[ColBg] = control_hover;
     notify_control_hover_scheme[ColBorder] = control_hover;
+
+    notify_action_scheme[ColFg] = control;
+    notify_action_scheme[ColBg] = notify_bg;
+    notify_action_scheme[ColBorder] = notify_bg;
+    notify_action_hover_scheme[ColFg] = notify_fg;
+    notify_action_hover_scheme[ColBg] = notify_bg;
+    notify_action_hover_scheme[ColBorder] = notify_bg;
   }
   notify_summary_scheme[ColFg] = notify_fg;
   notify_summary_scheme[ColBg] = notify_bg;
