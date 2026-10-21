@@ -104,9 +104,10 @@ sendn(const char *msg)
 #define NOTIFY_INPUT_ROW_H 30
 #define NOTIFY_BUTTON_H (NOTIFY_ACTION_H - 6)
 #define NOTIFY_BUTTON_ROW_H NOTIFY_ACTION_H
+#define NOTIFY_BODY_LINE_GAP 1
 #define NOTIFY_ACTION_X  12
 #define NOTIFY_TEXT_TOP_OFFSET 3
-#define NOTIFY_TEXT_BOTTOM_GAP 0
+#define NOTIFY_TEXT_BOTTOM_GAP 6
 #define NOTIFY_IMAGE_BUTTON_GAP 2
 #define NOTIFY_HISTORY_MAX     10
 #define NOTIFY_HISTORY_ENTRY_H 70
@@ -505,6 +506,7 @@ static void setdesktopnames(void);
 static void setfocus(Client *c);
 static int shouldminimize(Client *c);
 static void setfullscreen(Client *c, int fullscreen);
+static void raisefullscreenoverlays(Monitor *m);
 static void sync_bypass_compositor(Client *c);
 static int get_bypass_compositor_value(Client *c);
 static int haswindowproperty(Client *c, Atom prop);
@@ -1261,6 +1263,7 @@ static void notification_history_add(Notification *n);
 static void notification_history_show(void);
 static void notification_history_hide(void);
 static int notification_center_active(void);
+static void notification_update_wm_class(Window win, int active, int history);
 static int notification_history_buttonpress(XButtonPressedEvent *ev);
 static int notification_history_tick(void);
 static void leavenotify(XEvent *e);
@@ -2752,6 +2755,23 @@ static int notification_center_active(void) {
   return notify_active || notify_history_active;
 }
 
+static void notification_update_wm_class(Window win, int active, int history) {
+  XClassHint ch;
+
+  if (!win)
+    return;
+  if (active) {
+    ch.res_name = history ? "notification-history" : "notification";
+    ch.res_class = "notify";
+    XSetClassHint(dpy, win, &ch);
+  } else {
+    /* Restore the normal DWM class when the center returns to clock mode. */
+    ch.res_name = "dwm";
+    ch.res_class = "dwm";
+    XSetClassHint(dpy, win, &ch);
+  }
+}
+
 /* The audio visualizer may make barcenterwin wider than the clock.  Only the
  * fixed clock-sized portion should act as the history hover target while the
  * center is in its normal clock state. */
@@ -2928,7 +2948,7 @@ static void notification_load_image_data(Notification *n, int w, int h,
     for (x = 0; x < w; x++) {
       const unsigned char *p = bytes + y * rowstride + x * 4;
       uint32_t a = has_alpha ? p[3] : 255;
-      pixels[y * w + x] = (a << 24) | (p[2] << 16) | (p[1] << 8) | p[0];
+      pixels[y * w + x] = (a << 24) | (p[0] << 16) | (p[1] << 8) | p[2];
     }
   {
     unsigned int dw, dh;
@@ -2966,6 +2986,37 @@ static unsigned int notification_text_width(const char *text) {
   return width;
 }
 
+static unsigned int notification_body_lines(const char *text) {
+  unsigned int lines = 1;
+
+  if (!text || !*text)
+    return 0;
+  for (; *text; text++)
+    if (*text == '\n')
+      lines++;
+  return lines;
+}
+
+static unsigned int notification_content_height(Notification *n) {
+  unsigned int height = bh;
+  unsigned int body_lines;
+  int has_summary, has_body, has_two_content;
+
+  if (!n)
+    return height;
+  has_summary = n->summary && *n->summary;
+  has_body = n->body && *n->body;
+  has_two_content = (has_summary && has_body) ||
+                    (n->image && (has_summary || has_body));
+  if (!has_two_content)
+    return height;
+
+  body_lines = notification_body_lines(n->body);
+  height = MAX(NOTIFY_TWO_CONTENT_H,
+               32 + body_lines * (drw->fonts->h + NOTIFY_BODY_LINE_GAP) + 8);
+  return height;
+}
+
 static unsigned int notification_history_entry_height(Notification *n) {
   unsigned int height;
   int has_summary, has_body, has_two_content;
@@ -2976,10 +3027,11 @@ static unsigned int notification_history_entry_height(Notification *n) {
   has_body = n->body && *n->body;
   has_two_content = (has_summary && has_body) ||
                     (n->image && (has_summary || has_body));
-  height = (!has_two_content && !n->image) ? bh : NOTIFY_HISTORY_ENTRY_H;
+  height = (!has_two_content && !n->image) ? bh
+                                           : notification_content_height(n);
   if (n->input_enabled)
     height += NOTIFY_INPUT_ROW_H;
-  if (n->action_count >= 2)
+  if (n->action_count > 2)
     height += NOTIFY_BUTTON_ROW_H;
   return height;
 }
@@ -3033,17 +3085,11 @@ static void notification_history_hide(void) {
 static void notification_update_layout(Notification *n) {
   unsigned int text_w, line_w;
   unsigned int min_width;
-  int has_summary, has_body, has_two_content;
-
   if (!n)
     return;
   text_w = notification_text_width(n->summary);
   line_w = notification_text_width(n->body);
   text_w = MAX(text_w, line_w);
-  has_summary = n->summary && *n->summary;
-  has_body = n->body && *n->body;
-  has_two_content = (has_summary && has_body) || (n->image && (has_summary || has_body));
-
   text_w = MAX(text_w, 1);
   if (n->image)
     text_w += n->image_w + 16;
@@ -3061,11 +3107,9 @@ static void notification_update_layout(Notification *n) {
   notify_width = MAX(notify_width, min_width);
 
   /* A one-line notification stays at the normal clock-bar height. */
-  notify_height = bh;
-  if (has_two_content)
-    notify_height = NOTIFY_TWO_CONTENT_H;
+  notify_height = notification_content_height(n);
   if (n->input_enabled || (notify_hovered && n->action_count >= 2)) {
-    unsigned int content_height = has_two_content ? NOTIFY_TWO_CONTENT_H : bh;
+    unsigned int content_height = notification_content_height(n);
     unsigned int controls = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
                             (notify_hovered && n->action_count >= 2
                                  ? NOTIFY_BUTTON_ROW_H
@@ -3536,7 +3580,7 @@ static DBusHandlerResult notification_message(DBusConnection *conn,
 static void notification_draw_text(int x, int y, int width, int bottom,
                                    const char *text) {
   char line[512], *p, *start;
-  int line_h = drw->fonts->h + 4;
+  int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
   if (!text || !*text)
     return;
   start = (char *)text;
@@ -3674,7 +3718,7 @@ static void notification_history_draw(void) {
     has_two_content = (has_summary && has_body) ||
                       (n->image && (has_summary || has_body));
     controls_h = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
-                 (n->action_count >= 2 ? NOTIFY_BUTTON_ROW_H : 0);
+                 (n->action_count > 2 ? NOTIFY_BUTTON_ROW_H : 0);
     content_h = entry_h - controls_h;
     if (entry_bottom <= 0 || y >= (int)notify_height)
       continue;
@@ -3702,11 +3746,11 @@ static void notification_history_draw(void) {
                n->summary, 0);
     drw_setscheme(drw, notify_body_scheme);
     action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count >= 2
+    input_y = n->action_count > 2
                   ? action_y - NOTIFY_INPUT_ROW_H
                   : entry_bottom - NOTIFY_INPUT_ROW_H;
     body_bottom = entry_bottom - 6;
-    if (n->action_count >= 2)
+    if (n->action_count > 2)
       body_bottom = MIN(body_bottom, action_y - 4);
     if (n->input_enabled)
       body_bottom = MIN(body_bottom, input_y - 4);
@@ -3732,7 +3776,7 @@ static void notification_history_draw(void) {
                                                 : n->input_placeholder,
                0);
     }
-    if (n->action_count >= 2) {
+    if (n->action_count > 2) {
       unsigned int i, x = NOTIFY_ACTION_X;
       for (i = 1; i < n->action_count; i += 2) {
         unsigned int w = notification_text_width(n->actions[i]) + 24;
@@ -3808,13 +3852,15 @@ static void notification_history_motion(XMotionEvent *ev) {
     y -= notify_history_scroll;
     entry_bottom = y + entry_h;
     action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count >= 2
+    input_y = n->action_count > 2
                   ? action_y - NOTIFY_INPUT_ROW_H
                   : entry_bottom - NOTIFY_INPUT_ROW_H;
-    if (n->input_enabled && ev->x >= 8 && ev->x < (int)notify_width - 8 &&
+    if (n->input_enabled &&
+        ev->x >= 8 && ev->x < (int)notify_width - 8 &&
         ev->y >= input_y && ev->y < input_y + NOTIFY_INPUT_ROW_H)
       hover_input = 1;
-    if (n->action_count >= 2 && ev->y >= action_y &&
+    if (n->action_count > 2 &&
+        ev->y >= action_y &&
         ev->y < action_y + NOTIFY_ACTION_H) {
       action_x = NOTIFY_ACTION_X;
       for (action = 1; action < n->action_count; action += 2) {
@@ -3879,7 +3925,7 @@ static int notification_history_buttonpress(XButtonPressedEvent *ev) {
     y -= notify_history_scroll;
     entry_bottom = y + entry_h;
     action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count >= 2
+    input_y = n->action_count > 2
                   ? action_y - NOTIFY_INPUT_ROW_H
                   : entry_bottom - NOTIFY_INPUT_ROW_H;
     if (n->input_enabled && ev->y >= input_y && ev->y < input_y +
@@ -3893,7 +3939,7 @@ static int notification_history_buttonpress(XButtonPressedEvent *ev) {
       }
       return 1;
     }
-    if (n->action_count >= 2 && ev->y >= action_y &&
+    if (n->action_count > 2 && ev->y >= action_y &&
         ev->y < action_y + NOTIFY_ACTION_H) {
       action_x = NOTIFY_ACTION_X;
       for (unsigned int action = 1; action < n->action_count; action += 2) {
@@ -3919,7 +3965,18 @@ static int notification_history_buttonpress(XButtonPressedEvent *ev) {
         action_x += action_w + 6;
       }
     }
-    /* A click on the notification content itself has no history action. */
+    if (ev->button == Button1 && n->action_count == 2) {
+      notification_emit_action(n, n->actions[0]);
+      notification_emit_closed(n, 2);
+      notification_history_clear_controls(n);
+      if (notify_history_input == n) {
+        notify_history_input = NULL;
+        notify_input_focus = 0;
+      }
+      notification_history_layout();
+      drawbars();
+    }
+    /* Notifications with one action use the content as their action target. */
     return 1;
   }
   old_target = notify_history_scroll_target;
@@ -4428,6 +4485,9 @@ void drawbar(Monitor *m) {
   drw_map(drw, m->bartitlewin, 0, 0, tlw, bh);
 
   /* center bar: clock in normal mode, notification panel when active */
+   notification_update_wm_class(m->barcenterwin,
+                               m == selmon && notification_center_active(),
+                               notify_history_active && !notify_active);
    unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
                                      : ((clockbar_dynw && !notify_clock_hovered &&
                                          !fullscreen_st && m == selmon)
@@ -6640,8 +6700,20 @@ void resizebarwin(Monitor *m) {
         /* Keep the center window above fullscreen clients as soon as the
          * fullscreen transition lays it out.  The visualizer also needs to
          * stay above the neighboring bar sections while it grows. */
-          if (!fullscreen_st && (notification_center_active() || clockbar_dynw))
-           XRaiseWindow(dpy, m->barcenterwin);
+           if (notification_center_active() ||
+               (clockbar_dynw && !fullscreen_st))
+            XRaiseWindow(dpy, m->barcenterwin);
+           else if (fullscreen_st && m == selmon && m->sel &&
+                    m->sel->isfullscreen) {
+             /* The notification center uses this same X window and is raised
+              * above fullscreen.  Put it back below the fullscreen client
+              * when the notification times out and the clock is restored. */
+             XWindowChanges wc = {0};
+             wc.sibling = m->sel->win;
+             wc.stack_mode = Below;
+             XConfigureWindow(dpy, m->barcenterwin,
+                              CWSibling | CWStackMode, &wc);
+           }
       }
       if (m == selmon) {
         clockbar_win = m->barcenterwin;
@@ -6883,6 +6955,23 @@ void restack(Monitor *m) {
     XRaiseWindow(dpy, m->sidebarwin);
 }
 
+/* Fullscreen clients should cover normal windows, but not dialogs and
+ * compositor/WM-owned overlays.  Keep these above fullscreen after a client
+ * or the WM changes the stacking order. */
+static void raisefullscreenoverlays(Monitor *m) {
+  Client *c;
+
+  if (!m)
+    return;
+  for (c = m->stack; c; c = c->snext)
+    if (c->isontop && !c->isfullscreen && ISVISIBLE(c) && !HIDDEN(c))
+      XRaiseWindow(dpy, c->win);
+  if (m->sidebarvisible)
+    XRaiseWindow(dpy, m->sidebarwin);
+  if (m == selmon && notification_center_active() && m->barcenterwin)
+    XRaiseWindow(dpy, m->barcenterwin);
+}
+
 void checkminimize(void) {
   Monitor *m;
   Client *c;
@@ -7025,12 +7114,8 @@ void run(void) {
         handler[ev.type](&ev); /* call handler */
     }
 
-    /* Keep a fullscreen client above the bar after all requests from the
-     * client in this event batch have been processed. */
-    if (fullscreen_st && selmon && selmon->sel && selmon->sel->isfullscreen) {
-      XRaiseWindow(dpy, selmon->sel->win);
-      XFlush(dpy);
-    }
+    if (fullscreen_st && selmon && selmon->sel && selmon->sel->isfullscreen)
+      raisefullscreenoverlays(selmon);
 
     now = time(NULL);
     notification_tick();
@@ -7614,7 +7699,10 @@ void setfullscreen(Client *c, int fullscreen) {
     for (it = c->mon->stack; it; it = it->snext) {
       if (it == c || !ISVISIBLE(it) || HIDDEN(it))
         continue;
-      if (has_transparency && stickywin && it->issticky)
+      /* Keep overlay clients mapped so dialogs and other always-on-top
+       * windows can still appear over a fullscreen client.  Ordinary
+       * clients are hidden below it as before. */
+      if (it->isontop || (has_transparency && stickywin && it->issticky))
         continue;
       xunmapclient(it);
       it->fshidden = 1;
@@ -7655,6 +7743,7 @@ void setfullscreen(Client *c, int fullscreen) {
   if (fullscreen && c->isfullscreen && c->mon == selmon &&
       c->win) {
     XRaiseWindow(dpy, c->win);
+    raisefullscreenoverlays(c->mon);
     XFlush(dpy);
   }
 }
@@ -7812,9 +7901,13 @@ void setup(void) {
   drw_clr_create(drw, &notify_fg, "#FFFFFF");
   drw_clr_create(drw, &notify_body, "#CDD6F4");
   {
-    Clr control, control_hover;
+    Clr control, control_hover, action_text;
     drw_clr_create(drw, &control, "#363449");
     drw_clr_create(drw, &control_hover, "#514B70");
+    /* Action labels sit between the body text and the dark notification
+     * background; hovering them raises the contrast without changing the
+     * button background. */
+    drw_clr_create(drw, &action_text, "#AEB8D6");
     notify_control_scheme[ColFg] = notify_fg;
     notify_control_scheme[ColBg] = control;
     notify_control_scheme[ColBorder] = control;
@@ -7822,7 +7915,7 @@ void setup(void) {
     notify_control_hover_scheme[ColBg] = control_hover;
     notify_control_hover_scheme[ColBorder] = control_hover;
 
-    notify_action_scheme[ColFg] = control;
+    notify_action_scheme[ColFg] = action_text;
     notify_action_scheme[ColBg] = notify_bg;
     notify_action_scheme[ColBorder] = notify_bg;
     notify_action_hover_scheme[ColFg] = notify_fg;

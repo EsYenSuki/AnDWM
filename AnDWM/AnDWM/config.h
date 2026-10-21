@@ -190,7 +190,7 @@ static const Key keys[] = {
     { MODKEY,                           XK_b,       spawn,          SHCMD("MOZ_X11_EGL=1 MOZ_USE_XINPUT2=1 zen-browser") },
     { MODKEY,                           XK_v,       spawn,          SHCMD("/home/Hi/.config/AnDWM/scripts/bin/clyp") },
     { MODKEY,                           XK_period,  spawn,          SHCMD("rofi -modi \"emoji:rofimoji --action copy --hidden-descriptions\" -show emoji -theme /home/Hi/.config/AnDWM/rofi/moji.rasi") },
-    { MODKEY|ShiftMask,                 XK_c,       spawn,          SHCMD("~/.config/AnDWM/scripts/sh/highlight-pointer.sh") },
+    { MODKEY|ShiftMask,                 XK_c,       spawn,          SHCMD("picom cursor toggle") },
 
     // zoom keybind
     { MODKEY,                           XK_equal,   spawn,          SHCMD("picom-zoom +0.2") },
