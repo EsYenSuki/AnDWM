@@ -26,6 +26,9 @@ typedef struct {
   Window root;
   Drawable drawable;
   Picture picture;
+  Visual *visual;
+  Colormap colormap;
+  int no_background;
   Pixmap bgmap;
   GC gc;
   Clr *scheme;
@@ -62,12 +65,17 @@ void drw_setscheme(Drw *drw, Clr *scm);
 Picture drw_picture_create_resized(Drw *drw, char *src, unsigned int src_w,
                                    unsigned int src_h, unsigned int dst_w,
                                    unsigned int dst_h);
+Picture drw_picture_create_cover(Drw *drw, char *src, unsigned int src_w,
+                                 unsigned int src_h, unsigned int dst_w,
+                                 unsigned int dst_h);
 
 /* Drawing functions */
 void drw_rect(Drw *drw, int x, int y, unsigned int w, unsigned int h,
               int filled, int invert);
 int drw_text(Drw *drw, int x, int y, unsigned int w, unsigned int h,
              unsigned int lpad, const char *text, int invert);
+int drw_text_transparent(Drw *drw, int x, int y, unsigned int w,
+                         unsigned int h, unsigned int lpad, const char *text);
 int drw_text_scroll(Drw *drw, int x, int y, unsigned int w, unsigned int h,
                     unsigned int lpad, const char *text, int offset,
                     unsigned int gap, int invert);
@@ -83,3 +91,11 @@ void drw_pic(Drw *drw, int x, int y, unsigned int w, unsigned int h,
 /* Map functions */
 void drw_map(Drw *drw, Window win, int x, int y, unsigned int w,
              unsigned int h);
+void drw_map_alpha(Drw *drw, Window win, Visual *visual, int x, int y,
+                   unsigned int w, unsigned int h, int fade);
+void drw_map_alpha_notification(Drw *drw, Window win, Visual *visual, int x,
+                                int y, unsigned int w, unsigned int h,
+                                unsigned int solid_height);
+void drw_map_alpha_background(Drw *drw, Window win, Visual *visual, int x,
+                              int y, unsigned int w, unsigned int h,
+                              unsigned long background_pixel);

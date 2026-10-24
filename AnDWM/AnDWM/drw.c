@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <X11/Xlib.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xcursor/Xcursor.h>
@@ -74,6 +75,8 @@ drw_create(Display *dpy, int screen, Window root, unsigned int w, unsigned int h
 	drw->root = root;
 	drw->w = w;
 	drw->h = h;
+	drw->visual = DefaultVisual(dpy, screen);
+	drw->colormap = DefaultColormap(dpy, screen);
 	drw->drawable = XCreatePixmap(dpy, root, w, h, DefaultDepth(dpy, screen));
 	drw->picture = XRenderCreatePicture(dpy, drw->drawable, XRenderFindVisualFormat(dpy, DefaultVisual(dpy, screen)), 0, NULL);
 	drw->gc = XCreateGC(dpy, root, 0, NULL);
@@ -244,7 +247,7 @@ drw_picture_create_resized(Drw *drw, char *src, unsigned int srcw, unsigned int 
 		XImage img = {
 			srcw, srch, 0, ZPixmap, src,
 			ImageByteOrder(drw->dpy), BitmapUnit(drw->dpy), BitmapBitOrder(drw->dpy), 32,
-			32, 0, 32,
+			32, srcw * 4, 32,
 			0, 0, 0
 		};
 		XInitImage(&img);
@@ -280,7 +283,7 @@ drw_picture_create_resized(Drw *drw, char *src, unsigned int srcw, unsigned int 
 		XImage img = {
 		    dstw, dsth, 0, ZPixmap, (char *)imlib_image_get_data_for_reading_only(),
 		    ImageByteOrder(drw->dpy), BitmapUnit(drw->dpy), BitmapBitOrder(drw->dpy), 32,
-		    32, 0, 32,
+		    32, dstw * 4, 32,
 		    0, 0, 0
 		};
 		XInitImage(&img);
@@ -301,6 +304,83 @@ drw_picture_create_resized(Drw *drw, char *src, unsigned int srcw, unsigned int 
 	return pic;
 }
 
+Picture
+drw_picture_create_cover(Drw *drw, char *src, unsigned int srcw,
+                         unsigned int srch, unsigned int dstw,
+                         unsigned int dsth)
+{
+	Imlib_Image origin, scaled;
+	DATA32 *pixels;
+	unsigned int scaled_w, scaled_h, crop_x, crop_y;
+	XImage img;
+	Pixmap pm;
+	Picture pic;
+	GC gc;
+
+	if (!drw || !src || !srcw || !srch || !dstw || !dsth)
+		return None;
+	origin = imlib_create_image_using_data(srcw, srch, (DATA32 *)src);
+	if (!origin)
+		return None;
+	imlib_context_set_image(origin);
+	imlib_image_set_has_alpha(1);
+	/* Scale to the panel width first, preserving the source aspect ratio.
+	 * This keeps the full width of square/portrait artwork; any excess height
+	 * is then removed with a centered crop below.  If width-fitting would not
+	 * fill the destination height, fit the height instead. */
+	scaled_w = dstw;
+	scaled_h = (unsigned int)(((uint64_t)srch * scaled_w + srcw - 1) / srcw);
+	if (scaled_h < dsth) {
+		scaled_h = dsth;
+		scaled_w = (unsigned int)(((uint64_t)srcw * scaled_h + srch - 1) / srch);
+	}
+	if (!scaled_w || !scaled_h) {
+		imlib_free_image_and_decache();
+		return None;
+	}
+	scaled = imlib_create_cropped_scaled_image(0, 0, srcw, srch,
+	                                           scaled_w, scaled_h);
+	if (imlib_context_get_image())
+		imlib_free_image_and_decache();
+	if (!scaled)
+		return None;
+	if (scaled_w != dstw || scaled_h != dsth) {
+		Imlib_Image cropped;
+		unsigned int max_crop_y;
+		imlib_context_set_image(scaled);
+		crop_x = scaled_w > dstw ? (scaled_w - dstw) / 2 : 0;
+		max_crop_y = scaled_h > dsth ? scaled_h - dsth : 0;
+		crop_y = max_crop_y / 2;
+		crop_y = crop_y > 9 ? crop_y - 9 : 0;
+		cropped = imlib_create_cropped_image(crop_x, crop_y, dstw, dsth);
+		imlib_free_image_and_decache();
+		if (!cropped)
+			return None;
+		scaled = cropped;
+	}
+	imlib_context_set_image(scaled);
+	imlib_image_set_has_alpha(1);
+	pixels = imlib_image_get_data_for_reading_only();
+	if (!pixels) {
+		imlib_free_image_and_decache();
+		return None;
+	}
+	img = (XImage){ dstw, dsth, 0, ZPixmap, (char *)pixels,
+		ImageByteOrder(drw->dpy), BitmapUnit(drw->dpy), BitmapBitOrder(drw->dpy),
+		32, 32, dstw * 4, 32, 0, 0, 0 };
+	XInitImage(&img);
+	pm = XCreatePixmap(drw->dpy, drw->root, dstw, dsth, 32);
+	gc = XCreateGC(drw->dpy, pm, 0, NULL);
+	XPutImage(drw->dpy, pm, gc, &img, 0, 0, 0, 0, dstw, dsth);
+	XFreeGC(drw->dpy, gc);
+	imlib_free_image_and_decache();
+	pic = XRenderCreatePicture(drw->dpy, pm,
+	                           XRenderFindStandardFormat(drw->dpy, PictStandardARGB32),
+	                           0, NULL);
+	XFreePixmap(drw->dpy, pm);
+	return pic;
+}
+
 void
 drw_rect(Drw *drw, int x, int y, unsigned int w, unsigned int h, int filled, int invert)
 {
@@ -317,6 +397,7 @@ int
 drw_text(Drw *drw, int x, int y, unsigned int w, unsigned int h, unsigned int lpad, const char *text, int invert)
 {
 	int i, ty, ellipsis_x = 0;
+	int transparent = invert < 0;
 	unsigned int tmpw, ew, ellipsis_w = 0, ellipsis_len;
 	XftDraw *d = NULL;
 	Fnt *usedfont, *curfont, *nextfont;
@@ -339,11 +420,12 @@ drw_text(Drw *drw, int x, int y, unsigned int w, unsigned int h, unsigned int lp
 	if (!render) {
 		w = invert ? invert : ~invert;
 	} else {
-		XSetForeground(drw->dpy, drw->gc, drw->scheme[invert ? ColFg : ColBg].pixel);
-		XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, y, w, h);
-		d = XftDrawCreate(drw->dpy, drw->drawable,
-		                  DefaultVisual(drw->dpy, drw->screen),
-		                  DefaultColormap(drw->dpy, drw->screen));
+		if (!transparent && !drw->no_background) {
+			XSetForeground(drw->dpy, drw->gc, drw->scheme[invert ? ColFg : ColBg].pixel);
+			XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, y, w, h);
+		}
+		d = XftDrawCreate(drw->dpy, drw->drawable, drw->visual,
+		                  drw->colormap);
 		x += lpad;
 		w -= lpad;
 	}
@@ -397,7 +479,7 @@ drw_text(Drw *drw, int x, int y, unsigned int w, unsigned int h, unsigned int lp
 		if (utf8strlen) {
 			if (render) {
 				ty = y + (h - usedfont->h) / 2 + usedfont->xfont->ascent;
-				XftDrawStringUtf8(d, &drw->scheme[invert ? ColBg : ColFg],
+				XftDrawStringUtf8(d, &drw->scheme[invert == 1 ? ColBg : ColFg],
 				                  usedfont->xfont, x, ty, (XftChar8 *)utf8str, utf8strlen);
 			}
 			x += ew;
@@ -463,6 +545,13 @@ no_match:
 }
 
 int
+drw_text_transparent(Drw *drw, int x, int y, unsigned int w, unsigned int h,
+                     unsigned int lpad, const char *text)
+{
+	return drw_text(drw, x, y, w, h, lpad, text, -1);
+}
+
+int
 drw_text_scroll(Drw *drw, int x, int y, unsigned int w, unsigned int h,
                 unsigned int lpad, const char *text, int offset,
                 unsigned int gap, int invert)
@@ -481,18 +570,20 @@ drw_text_scroll_progress(Drw *drw, int x, int y, unsigned int w,
 	XftDraw *d;
 	const char *p;
 	int pos, textw = 0;
+	int transparent = background == (const Clr *)-1;
 	if (!drw || !drw->scheme || !drw->fonts || !text || !w || !h)
 		return 0;
-	XSetForeground(drw->dpy, drw->gc,
-	               (background ? background : &drw->scheme[invert ? ColFg : ColBg])->pixel);
-	XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, y, w, h);
+	if (!transparent && !drw->no_background) {
+		XSetForeground(drw->dpy, drw->gc,
+		               (background ? background : &drw->scheme[invert ? ColFg : ColBg])->pixel);
+		XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, y, w, h);
+	}
 	if (progress && progressw) {
 		if (progressw > w) progressw = w;
 		XSetForeground(drw->dpy, drw->gc, progress->pixel);
 		XFillRectangle(drw->dpy, drw->drawable, drw->gc, x, y, progressw, h);
 	}
-	d = XftDrawCreate(drw->dpy, drw->drawable, DefaultVisual(drw->dpy, drw->screen),
-	                  DefaultColormap(drw->dpy, drw->screen));
+	d = XftDrawCreate(drw->dpy, drw->drawable, drw->visual, drw->colormap);
 	if (!d)
 		return 0;
 	XftDrawSetClipRectangles(d, 0, 0, &(XRectangle){ .x = x + lpad, .y = y,
@@ -559,6 +650,231 @@ drw_map(Drw *drw, Window win, int x, int y, unsigned int w, unsigned int h)
 		return;
 
 	XCopyArea(drw->dpy, drw->drawable, win, drw->gc, x, y, w, h, x, y);
+	XFlush(drw->dpy);
+}
+
+/* Keep notifications fully opaque through the bar-height start point, then
+ * use an accelerating fade down to 25% opacity. */
+void
+drw_map_alpha_notification(Drw *drw, Window win, Visual *visual, int x, int y,
+                           unsigned int w, unsigned int h,
+                           unsigned int solid_height)
+{
+	XRenderPictFormat *format;
+	Picture dest, mask;
+	XRenderColor clear = { 0, 0, 0, 0 };
+	XFixed stops[] = { XDoubleToFixed(0.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0) };
+	XRenderColor colors[] = { { 0, 0, 0, 0xffff },
+	                          { 0, 0, 0, 0xffff }, /* 100% */
+	                          { 0, 0, 0, 0xfe80 }, /* 99.5% */
+	                          { 0, 0, 0, 0xfbff }, /* 98.5% */
+	                          { 0, 0, 0, 0xf740 }, /* 96.5% */
+	                          { 0, 0, 0, 0xef00 }, /* 93.5% */
+	                          { 0, 0, 0, 0xe580 }, /* 89.5% */
+	                          { 0, 0, 0, 0xd880 }, /* 84.5% */
+	                          { 0, 0, 0, 0xc900 }, /* 78.5% */
+	                          { 0, 0, 0, 0xb6ff }, /* 71.5% */
+	                          { 0, 0, 0, 0xa1ff }, /* 63.5% */
+	                          { 0, 0, 0, 0x8000 } }; /* 50% */
+	XLinearGradient linear = { { 0, 0 }, { 0, XDoubleToFixed(h) } };
+
+	if (!drw || !win || !visual || !w || !h)
+		return;
+	if (solid_height > h)
+		solid_height = h;
+	stops[1] = XDoubleToFixed((double)solid_height / (double)h);
+	for (int i = 2; i < 12; i++)
+		stops[i] = XDoubleToFixed((double)solid_height / (double)h +
+		                          (1.0 - (double)solid_height / (double)h) *
+		                          (double)(i - 1) / 10.0);
+	format = XRenderFindVisualFormat(drw->dpy, visual);
+	if (!format)
+		return;
+	dest = XRenderCreatePicture(drw->dpy, win, format, 0, NULL);
+	mask = XRenderCreateLinearGradient(drw->dpy, &linear, stops, colors, 12);
+	if (dest && mask) {
+		XRenderFillRectangle(drw->dpy, PictOpSrc, dest, &clear, x, y, w, h);
+		XRenderComposite(drw->dpy, PictOpOver, drw->picture, mask, dest,
+		                 x, y, 0, 0, x, y, w, h);
+	}
+	if (mask)
+		XRenderFreePicture(drw->dpy, mask);
+	if (dest)
+		XRenderFreePicture(drw->dpy, dest);
+	XFlush(drw->dpy);
+}
+
+void
+drw_map_alpha(Drw *drw, Window win, Visual *visual, int x, int y,
+              unsigned int w, unsigned int h, int fade)
+{
+	XRenderPictFormat *format;
+	Picture dest, mask;
+	XRenderColor clear = { 0, 0, 0, 0 };
+	XFixed stops[] = { XDoubleToFixed(0.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0),
+	                   XDoubleToFixed(1.0), XDoubleToFixed(1.0) };
+	XRenderColor colors[] = { { 0, 0, 0, 0xffff },
+	                          { 0, 0, 0, 0xffff }, /* 100% */
+	                          { 0, 0, 0, 0xfd70 }, /* 99% */
+	                          { 0, 0, 0, 0xf851 }, /* 97% */
+	                          { 0, 0, 0, 0xed70 }, /* 93% */
+	                          { 0, 0, 0, 0xdeb8 }, /* 87% */
+	                          { 0, 0, 0, 0xca3d }, /* 79% */
+	                          { 0, 0, 0, 0xb0a3 }, /* 69% */
+	                          { 0, 0, 0, 0x91ff }, /* 57% */
+	                          { 0, 0, 0, 0x6df4 }, /* 43% */
+	                          { 0, 0, 0, 0x451e }, /* 27% */
+	                          { 0, 0, 0, 0x0000 } };
+	XLinearGradient linear = { { 0, 0 }, { 0, XDoubleToFixed(h) } };
+	int nstops = fade == 3 ? 12 : 2;
+
+	if (!drw || !win || !visual || !w || !h)
+		return;
+	if (fade == 3) {
+		/* Accelerating opacity curve from the top:
+		 * 100%, 99%, 97%, 93%, ... 27%, 0%. */
+		stops[1] = XDoubleToFixed(0.0);
+		stops[2] = XDoubleToFixed(0.1);
+		stops[3] = XDoubleToFixed(0.2);
+		stops[4] = XDoubleToFixed(0.3);
+		stops[5] = XDoubleToFixed(0.4);
+		stops[6] = XDoubleToFixed(0.5);
+		stops[7] = XDoubleToFixed(0.6);
+		stops[8] = XDoubleToFixed(0.7);
+		stops[9] = XDoubleToFixed(0.8);
+		stops[10] = XDoubleToFixed(0.9);
+		stops[11] = XDoubleToFixed(1.0);
+	}
+	format = XRenderFindVisualFormat(drw->dpy, visual);
+	if (!format)
+		return;
+	dest = XRenderCreatePicture(drw->dpy, win, format, 0, NULL);
+	mask = fade ? XRenderCreateLinearGradient(drw->dpy, &linear, stops, colors,
+	                                          nstops) : None;
+	if (dest && mask) {
+		XRenderFillRectangle(drw->dpy, PictOpSrc, dest, &clear, x, y, w, h);
+		XRenderComposite(drw->dpy, PictOpOver, drw->picture, mask, dest,
+		                 x, y, 0, 0, x, y, w, h);
+	} else if (dest) {
+		XRenderFillRectangle(drw->dpy, PictOpSrc, dest, &clear, x, y, w, h);
+		XRenderComposite(drw->dpy, PictOpSrc, drw->picture, None, dest,
+		                 x, y, 0, 0, x, y, w, h);
+	}
+	if (mask)
+		XRenderFreePicture(drw->dpy, mask);
+	if (dest)
+		XRenderFreePicture(drw->dpy, dest);
+	XFlush(drw->dpy);
+}
+
+/* Apply the vertical alpha gradient to a drawable containing only the panel
+ * background.  Notification content is rendered on a separate transparent
+ * layer and composited afterward at full opacity. */
+void
+drw_map_alpha_background(Drw *drw, Window win, Visual *visual, int x, int y,
+                          unsigned int w, unsigned int h,
+                          unsigned long background_pixel)
+{
+	/* The caller supplies a background-only drawable.  Use the server-side
+	 * XRender gradient directly instead of reading every pixel back with
+	 * XGetImage and rebuilding a mask on the CPU for every marquee frame. */
+	(void)background_pixel;
+	drw_map_alpha(drw, win, visual, x, y, w, h, 3);
+	return;
+
+	XRenderPictFormat *format;
+	Picture dest, mask;
+	Pixmap maskpm;
+	XImage *src;
+	XImage maskimg;
+	GC maskgc;
+	char *data;
+	unsigned int ix, iy;
+	XRenderColor clear = { 0, 0, 0, 0 };
+
+	if (!drw || !win || !visual || !w || !h)
+		return;
+	format = XRenderFindVisualFormat(drw->dpy, visual);
+	if (!format)
+		return;
+	src = XGetImage(drw->dpy, drw->drawable, x, y, w, h, AllPlanes, ZPixmap);
+	if (!src)
+		return;
+	data = ecalloc((size_t)w * h, 4);
+	memset(&maskimg, 0, sizeof(maskimg));
+	maskimg.width = w;
+	maskimg.height = h;
+	maskimg.format = ZPixmap;
+	maskimg.data = data;
+	maskimg.byte_order = ImageByteOrder(drw->dpy);
+	maskimg.bitmap_unit = 32;
+	maskimg.bitmap_bit_order = BitmapBitOrder(drw->dpy);
+	maskimg.bitmap_pad = 32;
+	maskimg.depth = 32;
+	maskimg.bits_per_pixel = 32;
+	maskimg.bytes_per_line = w * 4;
+	maskimg.red_mask = 0xff0000;
+	maskimg.green_mask = 0x00ff00;
+	maskimg.blue_mask = 0x0000ff;
+	XInitImage(&maskimg);
+	for (iy = 0; iy < h; iy++) {
+		unsigned int alpha = h > 1 ? 255u - (iy * 255u) / (h - 1) : 255u;
+		for (ix = 0; ix < w; ix++) {
+			unsigned long pixel = XGetPixel(src, ix, iy);
+			unsigned int pr = (pixel >> 16) & 0xff;
+			unsigned int pg = (pixel >> 8) & 0xff;
+			unsigned int pb = pixel & 0xff;
+			unsigned int br = (background_pixel >> 16) & 0xff;
+			unsigned int bg = (background_pixel >> 8) & 0xff;
+			unsigned int bb = background_pixel & 0xff;
+			/* Text and icon edges are anti-aliased into the panel colour
+			 * before this surface is mapped.  Treat small colour deviations
+			 * as background too; otherwise those pre-blended edge pixels
+			 * become a visible halo when the panel fades out. */
+			unsigned int near_background =
+				abs((int)pr - (int)br) <= 24 &&
+				abs((int)pg - (int)bg) <= 24 &&
+				abs((int)pb - (int)bb) <= 24;
+			unsigned int a = near_background ? alpha : 255u;
+			XPutPixel(&maskimg, ix, iy, a << 24);
+		}
+	}
+	maskpm = XCreatePixmap(drw->dpy, drw->root, w, h, 32);
+	maskgc = maskpm ? XCreateGC(drw->dpy, maskpm, 0, NULL) : 0;
+	mask = None;
+	dest = None;
+	if (maskpm && maskgc) {
+		XPutImage(drw->dpy, maskpm, maskgc, &maskimg, 0, 0, 0, 0, w, h);
+		mask = XRenderCreatePicture(drw->dpy, maskpm,
+		                            XRenderFindStandardFormat(drw->dpy,
+		                                                       PictStandardARGB32),
+		                            0, NULL);
+		dest = XRenderCreatePicture(drw->dpy, win, format, 0, NULL);
+	}
+	if (mask && dest) {
+		XRenderFillRectangle(drw->dpy, PictOpSrc, dest, &clear, x, y, w, h);
+		XRenderComposite(drw->dpy, PictOpOver, drw->picture, mask, dest,
+		                 x, y, 0, 0, x, y, w, h);
+	}
+	if (dest)
+		XRenderFreePicture(drw->dpy, dest);
+	if (mask)
+		XRenderFreePicture(drw->dpy, mask);
+	if (maskgc)
+		XFreeGC(drw->dpy, maskgc);
+	if (maskpm)
+		XFreePixmap(drw->dpy, maskpm);
+	XDestroyImage(src);
+	free(data);
 	XFlush(drw->dpy);
 }
 

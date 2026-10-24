@@ -23,7 +23,7 @@ FREETYPEINC = /usr/include/freetype2
 
 # includes and libs
 INCS = -I${X11INC} -I${FREETYPEINC} $(shell pkg-config --cflags libpipewire-0.3 dbus-1)
-LIBS = -L${X11LIB} -lX11 ${XINERAMALIBS} ${FREETYPELIBS} -lXcursor -lXrender -lImlib2 -lm -lpthread $(shell pkg-config --libs libpipewire-0.3 dbus-1)
+LIBS = -L${X11LIB} -lX11 ${XINERAMALIBS} ${FREETYPELIBS} -lXcursor -lXrender -lXext -lImlib2 -lm -lpthread -lvulkan $(shell pkg-config --libs libpipewire-0.3 dbus-1)
 
 # flags
 CPPFLAGS = -D_DEFAULT_SOURCE -D_BSD_SOURCE -D_XOPEN_SOURCE=700L -DVERSION=\"${VERSION}\" ${XINERAMAFLAGS}

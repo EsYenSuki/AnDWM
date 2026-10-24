@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <poll.h>
@@ -93,18 +94,20 @@ sendn(const char *msg)
 #define CLOCK_ANIM_EXTRA 280   /* max px the bar grows past text width */
 #define PW_MONITOR_SINK  1     /* 1 = system audio (what you hear), 0 = mic */
 #define DRAW_FPS         50     /* visualizer update rate */
+#define NOTIFY_MARQUEE_FPS 100 /* notification title/body scrolling rate */
 #define NOTIFY_MAX       5
 #define NOTIFY_TIMEOUT   5
 #define NOTIFY_TRANSITION_MS 500
 #define NOTIFY_TWO_CONTENT_H 70
 #define NOTIFY_MAX_W     300
-#define NOTIFY_IMAGE_RADIUS 8
+#define NOTIFY_IMAGE_RADIUS 16
 #define NOTIFY_MAX_TEXT  4096
 #define NOTIFY_ACTION_H  30
 #define NOTIFY_INPUT_ROW_H 30
 #define NOTIFY_BUTTON_H (NOTIFY_ACTION_H - 6)
 #define NOTIFY_BUTTON_ROW_H NOTIFY_ACTION_H
-#define NOTIFY_BODY_LINE_GAP 1
+#define NOTIFY_BODY_LINE_GAP 0
+#define NOTIFY_BODY_MAX_LINES 4
 #define NOTIFY_ACTION_X  12
 #define NOTIFY_TEXT_TOP_OFFSET 3
 #define NOTIFY_TEXT_BOTTOM_GAP 6
@@ -113,6 +116,62 @@ sendn(const char *msg)
 #define NOTIFY_HISTORY_ENTRY_H 70
 #define NOTIFY_HISTORY_MAX_H   (NOTIFY_HISTORY_ENTRY_H * 5)
 #define NOTIFY_HISTORY_SCROLL_MS 500
+#define FINDER_MAX_APPS 512
+#define FINDER_MAX_TEXT 256
+#define FINDER_EDGE 15
+#define FINDER_ICON_GAP 8
+#define FINDER_MARKER_WIDTH 270
+#define FINDER_CURSOR_BLINK_MS 500
+
+typedef struct FinderApp FinderApp;
+struct FinderApp {
+  char name[FINDER_MAX_TEXT];
+  char exec[PATH_MAX];
+  char file[PATH_MAX];
+  char icon_name[FINDER_MAX_TEXT];
+  Picture icon;
+  int icon_loaded;
+  int recent;
+  int score;
+};
+static FinderApp finder_apps[FINDER_MAX_APPS];
+static unsigned int finder_app_count;
+static unsigned int finder_order[FINDER_MAX_APPS];
+static unsigned int finder_visible;
+static char finder_query[FINDER_MAX_TEXT];
+static char finder_math_result[64];
+static int finder_math_active;
+static int finder_math_help_active;
+static const char *finder_math_help[] = {
+  "+ - * / % ^ ! ( )  f(x) f(a,b)",
+  "sqrt cbrt abs exp ln log2 log10",
+  "pow hypot mod atan2 min max",
+  "sin cos tan asin acos atan",
+  "floor ceil round trunc",
+  "gcd lcm fact",
+  "bitor bitand bitxor bitnot",
+  "shl shr deg rad",
+  "pi e tau phi epsilon",
+  "byte_max word_max dword_max",
+  "int_max int_min uint_max",
+  "kb mb gb tb true false",
+};
+static uint64_t finder_cursor_base_ms;
+static int finder_cursor_visible = 1;
+static size_t finder_cursor;
+static Fnt *finder_result_font;
+static int finder_active;
+static int finder_dirty;
+static int finder_loading;
+static int finder_icons_pending;
+static Visual *finder_argb_visual;
+static int finder_argb_depth;
+static Colormap finder_argb_colormap;
+static int finder_argb_create_failed;
+static int finder_selected;
+static int finder_scroll;
+static char finder_recent[10][PATH_MAX];
+static unsigned int finder_recent_count;
 
 static volatile int clockanim_running = 0;
 static volatile unsigned int clockbar_dynw = 0; /* 0 = use fixed clockwidth() */
@@ -140,6 +199,7 @@ struct Notification {
   Picture image;
   unsigned int image_w, image_h;
   int image_hint;
+  int action_used;
   struct timespec shown_at;
   Notification *next;
 };
@@ -162,8 +222,10 @@ static int notify_history_scroll_target;
 static int notify_history_scroll_start;
 static int notify_history_scroll_end;
 static struct timespec notify_history_scroll_started;
-static Clr notify_bg, notify_fg, notify_body;
+static Clr notify_bg, notify_fg, notify_body, finder_text_clr;
+static const char finder_text[] = "#B8B5C8";
 static Clr notify_summary_scheme[3], notify_body_scheme[3];
+static Clr notify_summary_dim_scheme[3], notify_body_dim_scheme[3];
 static Clr notify_control_scheme[3], notify_control_hover_scheme[3];
 static Clr notify_action_scheme[3], notify_action_hover_scheme[3];
 static int notify_action_x[16], notify_action_w[16];
@@ -175,6 +237,8 @@ static int notify_hover = -1;
 static Notification *notify_history_hover_entry;
 static int notify_history_hover_action = -1;
 static struct timespec notify_hover_started;
+static struct timespec notify_history_hover_started;
+static struct timespec notify_marquee_last_draw;
 
 static struct pw_thread_loop *sound_loop = NULL;
 static struct pw_context *sound_context = NULL;
@@ -417,6 +481,7 @@ static void arrangemon(Monitor *m);
 static void attach(Client *c);
 static void attachstack(Client *c);
 static void buttonpress(XEvent *e);
+static void buttonrelease(XEvent *e);
 static void checkotherwm(void);
 static void cleanup(void);
 static void prepare_workspace_switch(Monitor *m, unsigned int oldtags, unsigned int newtags);
@@ -438,7 +503,10 @@ static Monitor *dirtomon(int dir);
 static void dragmfact(const Arg *arg);
 static void dragcfact(const Arg *arg);
 static void drawbar(Monitor *m);
+static void drawrightbar(Monitor *m, unsigned int rw);
+static void drawrightbar_only(void);
 static void drawbars(void);
+static int status_text_visible(const char *text);
 static int drawstatusbar(Monitor *m, int bh, char *text);
 static void drawtab(Monitor *m);
 static void drawtabs(void);
@@ -520,6 +588,9 @@ static void setnumdesktops(void);
 static void setup(void);
 static void setviewport(void);
 static void seturgent(Client *c, int urg);
+static int hasurgentclients(void);
+static void demandattention(Client *c);
+static void updateurgentborders(void);
 static void show(Client *c);
 static void showhide(Client *c);
 static void restorefullscreenhidden(Monitor *m);
@@ -554,11 +625,38 @@ static void updatepreview(void);
 static void updateclientlist(void);
 static void updateclock(void);
 static void updateclockbar(void);
+static void finder(const Arg *arg);
+static void finder_close(void);
+static int finder_pointer_inside(XButtonEvent *ev);
+static void finder_motion(XMotionEvent *ev);
+static void finder_focus_pointer(void);
+static int finder_keypress(XKeyEvent *ev);
+static int finder_buttonpress(XButtonPressedEvent *ev);
+static void finder_load_apps(void);
+static int finder_load_next_icon(void);
+static void finder_load_recent(void);
+static void finder_save_recent(void);
 static void status_start(void);
 static void status_stop(void);
 static void status_consume(void);
 static int update_mpris_scroll(void);
+static void mpris_load_art(unsigned int target_w, unsigned int target_h);
+static void mpris_panel_button(XButtonPressedEvent *ev);
+static void mpris_panel_motion(XMotionEvent *ev);
+static void mpris_panel_draw(Monitor *m, unsigned int w, unsigned int h);
+static void mpris_collapse_panel(void);
+static void mpris_volume_marker(Monitor *m, int x, int y,
+                                unsigned int width, unsigned int height);
+static void finder_marker(Monitor *m, int row);
+static int mpris_pointer_over_marker(Monitor *m);
+static int mpris_pointer_over_bar(Monitor *m);
 static int drag_next_event(XEvent *ev);
+/* These are defined with the other dwm globals below; the MPRIS helpers are
+ * kept near the status worker for readability. */
+static int bh;
+static Display *dpy;
+static Drw *drw;
+static Clr **scheme;
 
 #define STATUS_SLOTS 3
 #define STATUS_SIZE 1024
@@ -567,13 +665,25 @@ static int drag_next_event(XEvent *ev);
 #define MPRIS_SCROLL_PAD 8
 #define MPRIS_SCROLL_INTERVAL_NS 33333333ULL
 #define MPRIS_COMPLETE_THRESHOLD 0.995
+#define MPRIS_PANEL_MIN_WIDTH 320
+#define MPRIS_PANEL_HOVER_H 2
+#define MPRIS_VOLUME_CURVE 9.0
+#define MPRIS_VOLUME_MARKER_WIDTH 24
+#define MPRIS_VOLUME_MARKER_HOVER_WIDTH 32
+#define MPRIS_VOLUME_MARKER_HEIGHT 16
+#define MPRIS_VOLUME_MARKER_HOVER_HEIGHT 20
 enum status_slot_state { STATUS_FREE, STATUS_WRITING, STATUS_PUBLISHED,
                          STATUS_READING };
 typedef struct {
 	_Atomic int state;
 	char text[STATUS_SIZE];
 	char mpris[768];
+	char mpris_service[128];
+	char mpris_art[PATH_MAX];
 	double mpris_progress;
+	double mpris_volume;
+	int mpris_playing;
+	int mpris_present;
 } StatusSlot;
 static StatusSlot status_slots[STATUS_SLOTS];
 static pthread_t status_thread;
@@ -586,10 +696,23 @@ static struct timespec mpris_scroll_last;
 static uint64_t mpris_scroll_accum_ns;
 static int mpris_scroll_clock_valid;
 static int mpris_active;
+static int mpris_playing;
+static int mpris_present;
 static unsigned int mpris_scroll_text_width;
 static double mpris_progress = -1.0;
+static double mpris_volume = 1.0;
+static char mpris_service[128];
+static char mpris_art_url[PATH_MAX];
+static Picture mpris_art;
+static int mpris_art_w, mpris_art_h;
+static int mpris_hovered;
+static int mpris_marker_hovered;
+static int mpris_marker_pressed;
+static int mpris_volume_drag;
 static Clr mpris_scroll_bg_clr;
 static Clr mpris_progress_clr;
+static Clr mpris_volume_fill_clr;
+static Clr mpris_volume_empty_clr;
 static int bar_dirty;
 
 static int status_read_int(const char *path, int fallback) {
@@ -904,15 +1027,133 @@ static int status_dbus_property_int64(DBusConnection *connection, const char *se
 	return 1;
 }
 
+static int status_dbus_property_double(DBusConnection *connection, const char *service,
+                                       const char *property, double *out) {
+	DBusMessage *message, *reply;
+	DBusMessageIter iter, variant;
+	const char *interface = "org.mpris.MediaPlayer2.Player";
+	double value;
+
+	message = dbus_message_new_method_call(service, "/org/mpris/MediaPlayer2",
+	        "org.freedesktop.DBus.Properties", "Get");
+	if (!message) return 0;
+	dbus_message_append_args(message, DBUS_TYPE_STRING, &interface,
+	                         DBUS_TYPE_STRING, &property, DBUS_TYPE_INVALID);
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	if (!reply || !dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		if (reply) dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_DOUBLE) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&variant, &value);
+	*out = value;
+	dbus_message_unref(reply);
+	return 1;
+}
+
+static int mpris_method(const char *method) {
+	DBusConnection *connection;
+	DBusMessage *message, *reply;
+	if (!mpris_service[0]) return 0;
+	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
+	if (!connection) return 0;
+	message = dbus_message_new_method_call(mpris_service, "/org/mpris/MediaPlayer2",
+	        "org.mpris.MediaPlayer2.Player", method);
+	if (!message) {
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	if (reply) dbus_message_unref(reply);
+	dbus_connection_unref(connection);
+	return reply != NULL;
+}
+
+static int mpris_set_volume(double volume) {
+	DBusConnection *connection;
+	DBusMessage *message;
+	DBusMessageIter args, variant;
+	const char *interface = "org.mpris.MediaPlayer2.Player";
+	const char *property = "Volume";
+	const char *signature = "d";
+	if (!mpris_service[0]) return 0;
+	volume = MAX(0.0, MIN(1.0, volume));
+	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
+	if (!connection) return 0;
+	message = dbus_message_new_method_call(mpris_service, "/org/mpris/MediaPlayer2",
+	        "org.freedesktop.DBus.Properties", "Set");
+	if (!message) {
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	dbus_message_iter_init_append(message, &args);
+	dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &interface);
+	dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &property);
+	dbus_message_iter_open_container(&args, DBUS_TYPE_VARIANT, signature, &variant);
+	dbus_message_iter_append_basic(&variant, DBUS_TYPE_DOUBLE, &volume);
+	dbus_message_iter_close_container(&args, &variant);
+	/* Volume is changed from pointer-motion events.  Waiting for a synchronous
+	 * reply here can stall the main X event loop when another DBus client (for
+	 * example the notification service) is active.  Queue the Set request and
+	 * keep the local slider responsive instead. */
+	if (!dbus_connection_send(connection, message, NULL)) {
+		dbus_message_unref(message);
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	dbus_connection_flush(connection);
+	dbus_message_unref(message);
+	dbus_connection_unref(connection);
+	mpris_volume = volume;
+	return 1;
+}
+
+/* Map the slider's linear position to a more useful, logarithmic volume
+ * response.  The inverse is used for drawing so the marker follows the same
+ * curve as the value sent to the player. */
+static double mpris_slider_volume(double position) {
+	position = MAX(0.0, MIN(1.0, position));
+	if (position <= 0.0)
+		return 0.0;
+	return expm1(position * log1p(MPRIS_VOLUME_CURVE)) /
+	       MPRIS_VOLUME_CURVE;
+}
+
+static double mpris_volume_position(double volume) {
+	volume = MAX(0.0, MIN(1.0, volume));
+	if (volume <= 0.0)
+		return 0.0;
+	return log1p(volume * MPRIS_VOLUME_CURVE) /
+	       log1p(MPRIS_VOLUME_CURVE);
+}
+
+static double mpris_volume_from_x(int x, int slider_x, int slider_w) {
+	double position;
+
+	/* The marker starts at the fill endpoint, so subtract half its width:
+	 * clicking the marker's center selects the current endpoint. */
+	position = (double)(x - slider_x - MPRIS_VOLUME_MARKER_WIDTH / 2) /
+	           MAX(1, slider_w);
+	return mpris_slider_volume(position);
+}
+
 static int status_mpris_metadata(DBusConnection *connection, const char *service,
                                  char *artist, size_t artistlen,
                                  char *title, size_t titlelen,
+                                 char *art, size_t artlen,
                                  int64_t *length_us) {
 	DBusMessage *message, *reply;
 	DBusMessageIter iter, variant, dict;
 	const char *interface = "org.mpris.MediaPlayer2.Player";
 	const char *property = "Metadata";
-	artist[0] = title[0] = '\0';
+	artist[0] = title[0] = art[0] = '\0';
 	*length_us = 0;
 	message = dbus_message_new_method_call(service, "/org/mpris/MediaPlayer2",
 	        "org.freedesktop.DBus.Properties", "Get");
@@ -965,6 +1206,11 @@ static int status_mpris_metadata(DBusConnection *connection, const char *service
 				if (unsigned_length <= INT64_MAX)
 					*length_us = (int64_t)unsigned_length;
 			}
+		} else if (!strcmp(key, "mpris:artUrl") &&
+		           dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_STRING) {
+			const char *s;
+			dbus_message_iter_get_basic(&value, &s);
+			snprintf(art, artlen, "%s", s ? s : "");
 		}
 next:
 		dbus_message_iter_next(&dict);
@@ -974,7 +1220,9 @@ next:
 }
 
 static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
-                        double *progress) {
+                        char *service_out, size_t service_len,
+                        char *art, size_t artlen, double *progress,
+                        double *volume, int *playing) {
 	DBusConnection *connection;
 	DBusMessage *reply;
 	DBusMessageIter iter, names;
@@ -982,6 +1230,7 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 	int64_t position_us = 0, length_us = 0;
 	char service[128] = "";
 	*progress = -1.0;
+	if (playing) *playing = 0;
 	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
 	if (!connection) return 0;
 	reply = status_dbus_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
@@ -999,7 +1248,9 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 		if (name && !strncmp(name, "org.mpris.MediaPlayer2.", 23)) {
 			snprintf(state, sizeof state, "Stopped");
 			if (status_dbus_property_string(connection, name, "PlaybackStatus",
-			                               state, sizeof state) && !strcmp(state, "Playing")) {
+			                               state, sizeof state) &&
+			    (!strcmp(state, "Playing") || !strcmp(state, "Paused"))) {
+				if (playing) *playing = !strcmp(state, "Playing");
 				snprintf(service, sizeof service, "%s", name);
 				break;
 			}
@@ -1008,10 +1259,13 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 	}
 	dbus_message_unref(reply);
 	if (!service[0] || !status_mpris_metadata(connection, service, artist, sizeof artist,
-	                                       title, sizeof title, &length_us)) {
+	                                       title, sizeof title, art, artlen, &length_us)) {
 		dbus_connection_unref(connection);
 		return 0;
 	}
+	snprintf(service_out, service_len, "%s", service);
+	*volume = 1.0;
+	(void)status_dbus_property_double(connection, service, "Volume", volume);
 	if (length_us > 0 && status_dbus_property_int64(connection, service,
 	                                                  "Position", &position_us)) {
 		if (position_us < 0) position_us = 0;
@@ -1028,9 +1282,15 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 	 * malformed players fall back to the normal status branch. */
 	if (raw && rawlen)
 		snprintf(raw, rawlen, "[%s]  %s", artist[0] ? artist : "UNKNOWN ARTIST", title);
-	snprintf(out, outlen,
-	         "^c#1E1D2D^ ^b#B8E9B4^ 󰎆^c#1E1D2D^ ^m^%s^M^^d^^c#96CDFB^",
-	         raw && rawlen ? raw : "");
+	/* Keep the player active while paused, but only expose the scrolling
+	 * title segment while playback is actually running. */
+	if (!playing || *playing) {
+		snprintf(out, outlen,
+		         "^c#1E1D2D^ ^b#B8E9B4^ 󰎆^c#1E1D2D^^m^ %s^M^^d^^c#96CDFB^",
+		         raw && rawlen ? raw : "");
+	} else if (out && outlen) {
+		out[0] = '\0';
+	}
 	dbus_connection_unref(connection);
 	return 1;
 }
@@ -1073,7 +1333,11 @@ static int status_fan(char *icon, size_t iconlen) {
 }
 
 static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_len,
-                        double *mpris_progress_out,
+                        char *mpris_service_out, size_t mpris_service_len,
+                        char *mpris_art_out, size_t mpris_art_len,
+                        double *mpris_progress_out, double *mpris_volume_out,
+                        int *mpris_playing_out,
+                        int *mpris_present_out,
                         unsigned long long *last_total, unsigned long long *last_active) {
 	unsigned long long total = 0, active = 0, used, memtotal;
 	int mempercent, cpu = 0, cap, charging, strength, temp;
@@ -1129,15 +1393,27 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 	if (!fan_st) fan[0] = '\0';
 	if (mpris_out && mpris_len) mpris_out[0] = '\0';
 	if (mpris_progress_out) *mpris_progress_out = -1.0;
+	if (mpris_service_out && mpris_service_len) mpris_service_out[0] = '\0';
+	if (mpris_art_out && mpris_art_len) mpris_art_out[0] = '\0';
+	if (mpris_volume_out) *mpris_volume_out = 1.0;
+	if (mpris_playing_out) *mpris_playing_out = 0;
+	if (mpris_present_out) *mpris_present_out = 0;
 	has_player = status_mpris(player, sizeof player, mpris_out, mpris_len,
-	                          mpris_progress_out);
+	                          mpris_service_out, mpris_service_len,
+	                          mpris_art_out, mpris_art_len,
+	                          mpris_progress_out, mpris_volume_out,
+	                          mpris_playing_out);
+	if (mpris_present_out) *mpris_present_out = has_player;
 	sav_icon[0] = '\0';
 	if (fan[0] || !strcmp(governor, "performance")) {
 		snprintf(sav_icon, sizeof sav_icon, "  %s%s%s", fan,
 		         fan[0] && !strcmp(governor, "performance") ? " " : "",
 		         !strcmp(governor, "performance") ? "" : "");
 	}
-	if (has_player) {
+	/* A paused player remains present for MPRIS interaction, but the
+	 * top-right bar should fall back to the regular status layout rather
+	 * than showing an empty player segment. */
+	if (has_player && (!mpris_playing_out || *mpris_playing_out)) {
 			snprintf(out, outlen,
 			"^c#a6e3a1^%s %s^c%s^ ^b#96CDFB^ %s ^d^"
 			"^c#1E1D2D^ ^b#96CDFB^ %s ^d^"
@@ -1155,16 +1431,24 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 }
 
 static void *status_worker(void *arg) {
-	char local[STATUS_SIZE], local_mpris[768];
+	char local[STATUS_SIZE], local_mpris[768], local_service[128], local_art[PATH_MAX];
 	char last_mpris[768] = "";
 	double local_mpris_progress;
+	double local_mpris_volume;
+	int local_mpris_playing;
+	int local_mpris_present;
 	double last_mpris_progress = -1.0;
 	unsigned long long last_total = 0, last_active = 0;
 	(void)arg;
 	while (atomic_load_explicit(&status_running, memory_order_acquire)) {
-		struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+		/* The bar is covered by fullscreen clients.  Keep status alive, but
+		 * reduce hardware/DBus/MPRIS polling while it cannot be seen. */
+		struct timespec ts = { .tv_sec = fullscreen_st ? 5 : 1, .tv_nsec = 0 };
 		status_make(local, sizeof local, local_mpris, sizeof local_mpris,
-		            &local_mpris_progress,
+		            local_service, sizeof local_service, local_art, sizeof local_art,
+		            &local_mpris_progress, &local_mpris_volume,
+		            &local_mpris_playing,
+		            &local_mpris_present,
 		            &last_total, &last_active);
 		/* Some browser players briefly omit Position while refreshing their
 		 * metadata. Keep the last known value for the same track instead of
@@ -1185,7 +1469,12 @@ static void *status_worker(void *arg) {
 				STATUS_WRITING, memory_order_acquire, memory_order_relaxed)) {
 				memcpy(status_slots[i].text, local, sizeof local);
 				memcpy(status_slots[i].mpris, local_mpris, sizeof local_mpris);
+				memcpy(status_slots[i].mpris_service, local_service, sizeof local_service);
+				memcpy(status_slots[i].mpris_art, local_art, sizeof local_art);
 				status_slots[i].mpris_progress = local_mpris_progress;
+				status_slots[i].mpris_volume = local_mpris_volume;
+				status_slots[i].mpris_playing = local_mpris_playing;
+				status_slots[i].mpris_present = local_mpris_present;
 				atomic_store_explicit(&status_slots[i].state, STATUS_PUBLISHED, memory_order_release);
 				if (status_event_fd >= 0) { uint64_t one = 1; (void)write(status_event_fd, &one, sizeof one); }
 				break;
@@ -1230,23 +1519,255 @@ static void status_consume(void) {
 				mpris_scroll_text_width = 0;
 				mpris_scroll_accum_ns = 0;
 				mpris_scroll_clock_valid = 0;
-				memcpy(mpris_text, status_slots[i].mpris, sizeof mpris_text);
-				mpris_text[sizeof mpris_text - 1] = '\0';
-				mpris_active = mpris_text[0] != '\0';
+			memcpy(mpris_text, status_slots[i].mpris, sizeof mpris_text);
+			mpris_text[sizeof mpris_text - 1] = '\0';
+			mpris_active = mpris_text[0] != '\0';
+			}
+			memcpy(mpris_service, status_slots[i].mpris_service, sizeof mpris_service);
+			mpris_service[sizeof mpris_service - 1] = '\0';
+			if (strcmp(mpris_art_url, status_slots[i].mpris_art)) {
+				memcpy(mpris_art_url, status_slots[i].mpris_art, sizeof mpris_art_url);
+				mpris_art_url[sizeof mpris_art_url - 1] = '\0';
+				/* The artwork is loaded by mpris_panel_draw with the actual
+				 * right-bar width.  Do not cache a placeholder-sized picture. */
+				if (mpris_art) {
+					XRenderFreePicture(dpy, mpris_art);
+					mpris_art = None;
+				}
+				mpris_art_w = mpris_art_h = 0;
 			}
 			mpris_progress = status_slots[i].mpris_progress;
+			mpris_volume = status_slots[i].mpris_volume;
+			mpris_playing = status_slots[i].mpris_playing;
+			mpris_present = status_slots[i].mpris_present;
+			/* Paused players have no scrolling title, but remain available to
+			 * keep the expanded panel and its playback controls alive. */
+			mpris_active = mpris_present;
+			/* A paused player remains active, so keep the expanded panel while
+			 * it is hovered.  If the player disappears, collapse immediately
+			 * regardless of where the pointer is. */
+			if (!mpris_active && (mpris_hovered || mpris_volume_drag ||
+			                     mpris_marker_hovered)) {
+				mpris_hovered = 0;
+				mpris_volume_drag = 0;
+				mpris_marker_hovered = 0;
+				mpris_marker_pressed = 0;
+				mpris_collapse_panel();
+			}
 			atomic_store_explicit(&status_slots[i].state, STATUS_FREE, memory_order_release);
-			bar_dirty = 1;
+			/* Fullscreen does not expose the bar, so defer repainting until it
+			 * ends while still consuming the newest status snapshot. */
+			if (!fullscreen_st)
+				bar_dirty = 1;
 			break;
 		}
 	}
+}
+
+static void mpris_load_art(unsigned int target_w, unsigned int target_h) {
+	Imlib_Image image;
+	const char *path = mpris_art_url;
+	DATA32 *data;
+	int w, h;
+	char file_path[PATH_MAX];
+
+	if (mpris_art)
+		XRenderFreePicture(dpy, mpris_art);
+	mpris_art = None;
+	mpris_art_w = mpris_art_h = 0;
+	if (!path[0])
+		return;
+	if (!strncmp(path, "file://", 7)) {
+		path += 7;
+		if (*path == '/') {
+			snprintf(file_path, sizeof file_path, "%s", path);
+			path = file_path;
+		}
+	} else if (path[0] != '/') {
+		/* Avoid blocking dwm on remote artwork URLs. */
+		return;
+	}
+	image = imlib_load_image(path);
+	if (!image)
+		return;
+	imlib_context_set_image(image);
+	w = imlib_image_get_width();
+	h = imlib_image_get_height();
+	data = imlib_image_get_data_for_reading_only();
+	if (data && w > 0 && h > 0)
+		mpris_art = drw_picture_create_cover(drw, (char *)data, w, h,
+		                                      target_w, target_h);
+	if (mpris_art) {
+		mpris_art_w = target_w;
+		mpris_art_h = target_h;
+	}
+	if (imlib_context_get_image())
+		imlib_free_image();
+}
+
+static void mpris_panel_button(XButtonPressedEvent *ev) {
+	int y = ev->y - bh;
+	int control_w = 34;
+	int slider_x = control_w + 12;
+	int slider_w = MAX(1, (int)statuswidth(stext) - slider_x - 120);
+	int volume_x = slider_x + slider_w + 6;
+	int previous_x = volume_x + 46;
+	int next_x = previous_x + control_w;
+	int marker_half_width = (mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_WIDTH : MPRIS_VOLUME_MARKER_WIDTH) / 2;
+	if (!mpris_active || y < 0 || y >= bh)
+		return;
+	/* Mouse buttons 4 and 5 are wheel-up and wheel-down in X11.  Handle
+	 * them independently of the pointer's horizontal position so scrolling
+	 * over any part of the expanded player changes volume in 5% steps. */
+	if (ev->button == Button4 || ev->button == Button5) {
+		mpris_set_volume(mpris_volume + (ev->button == Button4 ? 0.05 : -0.05));
+		bar_dirty = 1;
+		return;
+	}
+	if (ev->x < control_w) {
+		mpris_method("PlayPause");
+	} else if (ev->x >= slider_x - marker_half_width &&
+	           ev->x <= slider_x + slider_w + marker_half_width) {
+		mpris_volume_drag = 1;
+		mpris_set_volume(mpris_volume_from_x(ev->x, slider_x, slider_w));
+	} else if (ev->x >= previous_x && ev->x < next_x) {
+		mpris_method("Previous");
+	} else if (ev->x >= next_x && ev->x < next_x + control_w) {
+		mpris_method("Next");
+	}
+	bar_dirty = 1;
+}
+
+static void mpris_panel_motion(XMotionEvent *ev) {
+	int slider_x = 34 + 12;
+	int slider_w = MAX(1, (int)statuswidth(stext) - slider_x - 120);
+	int marker_half_width = (mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_WIDTH : MPRIS_VOLUME_MARKER_WIDTH) / 2;
+	if (mpris_volume_drag &&
+	    ev->x >= slider_x - marker_half_width &&
+	    ev->x <= slider_x + slider_w + marker_half_width)
+		mpris_set_volume(mpris_volume_from_x(ev->x, slider_x, slider_w));
+}
+
+static void mpris_panel_draw(Monitor *m, unsigned int w, unsigned int h) {
+	/* Cover the complete expanded bar, including the upper status half. */
+	unsigned int art_y = 0;
+	unsigned int panel_h = h ? h : 1;
+	int control_w = 34;
+	int slider_x = control_w + 12;
+	int slider_w;
+	int volume_x;
+	int previous_x;
+	int next_x;
+	int track_y;
+	int fill_w;
+	int knob_x;
+	int marker_width = mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_WIDTH : MPRIS_VOLUME_MARKER_WIDTH;
+	int marker_height = mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_HEIGHT : MPRIS_VOLUME_MARKER_HEIGHT;
+	char volume[16];
+	static const char *controls[] = {"", ""};
+	const char *playback = mpris_playing ? controls[0] : "";
+	(void)m;
+	slider_w = MAX(1, (int)w - slider_x - 120);
+	volume_x = slider_x + slider_w + 6;
+	previous_x = volume_x + 46;
+	next_x = previous_x + control_w;
+	track_y = bh + bh / 2 - 2;
+	fill_w = (int)(slider_w * mpris_volume_position(mpris_volume) + 0.5);
+	/* The marker's left edge starts exactly at the filled track's right edge. */
+	knob_x = slider_x + fill_w;
+	if (knob_x < slider_x)
+		knob_x = slider_x;
+	if (knob_x > slider_x + slider_w)
+		knob_x = slider_x + slider_w;
+	/* Keep the marker center fixed while it grows on hover. */
+	if (mpris_marker_hovered)
+		knob_x -= (MPRIS_VOLUME_MARKER_HOVER_WIDTH -
+		           MPRIS_VOLUME_MARKER_WIDTH) / 2;
+	/* Always make the cached picture match the actual expanded bar size.  The
+	 * status update can load a small placeholder before rw is known; using that
+	 * size for the panel would leave the thumbnail narrower than the bar. */
+	if (mpris_art_url[0] &&
+	    (!mpris_art || mpris_art_w != (int)w || mpris_art_h != (int)panel_h))
+		mpris_load_art(w, panel_h);
+
+	XSetForeground(drw->dpy, drw->gc, scheme[SchemeNorm][ColBg].pixel);
+	XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, art_y, w, panel_h);
+	if (mpris_art)
+		drw_pic(drw, 0, art_y, w, panel_h, mpris_art);
+	/* Use one continuous gradient instead of stacked strips, which avoids
+	 * visible horizontal banding in the artwork. */
+	{
+		XFixed stops[] = { XDoubleToFixed(0.0), XDoubleToFixed(0.25),
+		                  XDoubleToFixed(1.0) };
+		XRenderColor colors[] = {
+			{ scheme[SchemeNorm][ColBg].color.red,
+			  scheme[SchemeNorm][ColBg].color.green,
+			  scheme[SchemeNorm][ColBg].color.blue, 0xFFFF },
+			{ scheme[SchemeNorm][ColBg].color.red,
+			  scheme[SchemeNorm][ColBg].color.green,
+			  scheme[SchemeNorm][ColBg].color.blue, 0xFFFF },
+			{ scheme[SchemeNorm][ColBg].color.red,
+			  scheme[SchemeNorm][ColBg].color.green,
+			  scheme[SchemeNorm][ColBg].color.blue, 0x0000 }
+		};
+		XLinearGradient linear = {
+			{ 0, 0 }, { 0, XDoubleToFixed(panel_h) }
+		};
+		Picture overlay = XRenderCreateLinearGradient(dpy, &linear, stops,
+		                                             colors, LENGTH(stops));
+		if (overlay) {
+			XRenderComposite(dpy, PictOpOver, overlay, None, drw->picture,
+			                 0, 0, 0, 0, 0, art_y, w, panel_h);
+			XRenderFreePicture(dpy, overlay);
+		}
+	}
+
+	/* Draw the transport glyphs without clearing their rectangles, so the
+	 * artwork remains visible beneath and between the controls. */
+	drw_setscheme(drw, scheme[SchemeTitle]);
+	drw_text_transparent(drw, 10, bh + 4, 28, MAX(1, bh - 8), 0,
+	                     playback);
+	drw_text_transparent(drw, previous_x, bh + 4, 28, MAX(1, bh - 8), 0,
+	                     controls[1]);
+	drw_text_transparent(drw, next_x, bh + 4, 28, MAX(1, bh - 8), 0, "");
+	drw_setscheme(drw, scheme[SchemeNorm]);
+	XSetForeground(drw->dpy, drw->gc, mpris_volume_empty_clr.pixel);
+	XFillRectangle(drw->dpy, drw->drawable, drw->gc, slider_x, track_y,
+	               slider_w, 4);
+	if (fill_w > 0) {
+		XSetForeground(drw->dpy, drw->gc, mpris_volume_fill_clr.pixel);
+		XFillRectangle(drw->dpy, drw->drawable, drw->gc, slider_x, track_y,
+		               fill_w, 4);
+	}
+	/* Connect the filled endpoint to the center of the separate marker. */
+	XSetForeground(drw->dpy, drw->gc, mpris_volume_fill_clr.pixel);
+	XFillRectangle(drw->dpy, drw->drawable, drw->gc,
+	               slider_x + fill_w, track_y + 1, marker_width / 2, 2);
+	/* Center the marker vertically on the 4-pixel track. */
+	mpris_volume_marker(m, knob_x, track_y + 2 - marker_height / 2,
+	                    marker_width, marker_height);
+	snprintf(volume, sizeof volume, "%d%%", (int)(mpris_volume * 100.0 + 0.5));
+	drw_setscheme(drw, scheme[SchemeTitle]);
+	drw_text_transparent(drw, volume_x, bh + 4, 38, MAX(1, bh - 8), 0, volume);
 }
 
 static void notification_init(void);
 static void notification_shutdown(void);
 static void notification_dispatch(void);
 static void notification_tick(void);
+static double notification_elapsed(const struct timespec *started);
 static void notification_draw(void);
+static void notification_draw_foreground(int history);
+static void notification_redraw_center_only(void);
+static void notification_present_layers(int history);
+static void map_center_window(Window win, int x, int y, unsigned int w,
+                              unsigned int h, int fade);
+static int notification_foreground_pass;
+static int notification_background_only;
 static void notification_advance(void);
 static void notification_clear_queue(void);
 static void notification_emit_closed(Notification *n, uint32_t reason);
@@ -1263,7 +1784,8 @@ static void notification_history_add(Notification *n);
 static void notification_history_show(void);
 static void notification_history_hide(void);
 static int notification_center_active(void);
-static void notification_update_wm_class(Window win, int active, int history);
+static void notification_update_wm_class(Window win, int active, int history,
+                                         int finder);
 static int notification_history_buttonpress(XButtonPressedEvent *ev);
 static int notification_history_tick(void);
 static void leavenotify(XEvent *e);
@@ -1305,6 +1827,7 @@ static unsigned int numlockmask = 0;
 static Time last_ev_time;
 static void (*handler[LASTEvent])(XEvent *) = {
     [ButtonPress] = buttonpress,
+    [ButtonRelease] = buttonrelease,
     [ClientMessage] = clientmessage,
     [ConfigureRequest] = configurerequest,
     [ConfigureNotify] = configurenotify,
@@ -1324,6 +1847,8 @@ static void (*handler[LASTEvent])(XEvent *) = {
     [UnmapNotify] = unmapnotify};
 static Atom wmatom[WMLast], netatom[NetLast], xatom[XLast];
 static int running = 1;
+static int urgentflash = 1;
+static struct timespec urgentflash_last;
 static int xkb_event_base = 0;
 static int alt_held = 0;
 /* Client currently being dragged; used to keep it visible across tag views. */
@@ -1339,6 +1864,13 @@ static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
 
+static void mpris_collapse_panel(void) {
+	if (!selmon)
+		return;
+	drawbars();
+	resizebarwin(selmon);
+}
+
 static int update_mpris_scroll(void) {
 	struct timespec now_mono;
 	unsigned int textw;
@@ -1346,7 +1878,7 @@ static int update_mpris_scroll(void) {
 	uint64_t elapsed_ns = 0;
 	uint64_t steps;
 
-	if (!mpris_active) {
+  if (fullscreen_st || !mpris_active) {
 		mpris_scroll_clock_valid = 0;
 		mpris_scroll_accum_ns = 0;
 		return 0;
@@ -1411,10 +1943,14 @@ static int drag_next_event(XEvent *ev) {
 	updateclockbar();
 	redraw = bar_dirty;
 	bar_dirty = 0;
-	if (update_mpris_scroll())
-		redraw = 1;
-	if (redraw)
-		drawbars();
+  if (update_mpris_scroll())
+    redraw = 1;
+  if (redraw) {
+    if (finder_active)
+      drawrightbar_only();
+    else
+      drawbars();
+  }
 	if (!XPending(dpy) && !(pfd[0].revents & POLLIN))
 		return 0;
 	XNextEvent(dpy, ev);
@@ -1461,6 +1997,12 @@ struct Monitor {
   Window barcenterwin;
   Window barkbwin;
   Window barrightwin;
+  Window mpris_volume_markerwin;
+  Window finder_markerwin;
+  int finder_marker_mapped;
+  int finder_marker_stacked;
+  int finder_marker_x;
+  int finder_marker_y;
   Window tabwin;
   Window tagwin;
   Window sidebarwin;
@@ -1475,6 +2017,143 @@ struct Monitor {
   const Layout *lt[2];
   Pertag *pertag;
 };
+
+/* Keep the volume position as a separate top-level X11 window.  It is placed
+ * above the bar for compositors while forwarding its mouse input to the bar. */
+static void mpris_volume_marker(Monitor *m, int x, int y,
+                                unsigned int width, unsigned int height) {
+  Window child;
+  int root_x, root_y;
+  XWindowChanges wc = {0};
+  XClassHint marker_ch = {
+    "dwm-mpris-volume-marker",
+    mpris_marker_hovered ? "dwm-mpris-volume-marker-larg"
+                         : "dwm-mpris-volume-marker"
+  };
+
+  if (!m->mpris_volume_markerwin || !mpris_hovered || !mpris_active)
+    return;
+  XTranslateCoordinates(dpy, m->barrightwin, root, 0, 0,
+                        &root_x, &root_y, &child);
+  /* Set the compositor-visible class before changing geometry, so a class
+   * rule for the previous hover state cannot be applied to the new frame. */
+  XSetClassHint(dpy, m->mpris_volume_markerwin, &marker_ch);
+  /* Apply the complete geometry in one X request so a resize never becomes
+   * visible before its matching position update. */
+  wc.x = root_x + x;
+  wc.y = root_y + y;
+  wc.width = width;
+  wc.height = height;
+  wc.sibling = m->barrightwin;
+  wc.stack_mode = Above;
+  XConfigureWindow(dpy, m->mpris_volume_markerwin,
+                   CWX | CWY | CWWidth | CWHeight | CWSibling | CWStackMode,
+                   &wc);
+  {
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(dpy, m->mpris_volume_markerwin, &wa) &&
+        wa.map_state != IsViewable)
+      XMapWindow(dpy, m->mpris_volume_markerwin);
+  }
+}
+
+static void finder_marker(Monitor *m, int row) {
+  Window child;
+  int root_x, root_y;
+  XWindowChanges wc = {0};
+
+  if (!m->finder_markerwin)
+    return;
+  if (!finder_active || m != selmon || row <= 0) {
+    if (m->finder_marker_mapped) {
+      XUnmapWindow(dpy, m->finder_markerwin);
+      m->finder_marker_mapped = 0;
+    }
+    m->finder_marker_stacked = 0;
+    return;
+  }
+  XTranslateCoordinates(dpy, m->barcenterwin, root, 0, 0,
+                        &root_x, &root_y, &child);
+  wc.x = root_x + (finder_width - FINDER_MARKER_WIDTH) / 2;
+  wc.y = root_y + row * bh;
+  wc.width = FINDER_MARKER_WIDTH;
+  wc.height = 38;
+  if (!m->finder_marker_mapped || m->finder_marker_x != wc.x ||
+      m->finder_marker_y != wc.y) {
+    XConfigureWindow(dpy, m->finder_markerwin,
+                     CWX | CWY | CWWidth | CWHeight, &wc);
+    m->finder_marker_x = wc.x;
+    m->finder_marker_y = wc.y;
+  }
+  if (!m->finder_marker_mapped) {
+    /* Raise only on the hidden -> visible transition. Repeatedly raising an
+     * opaque root-level sibling on every draw causes visible flashes without
+     * a compositor. */
+    XMapRaised(dpy, m->finder_markerwin);
+    m->finder_marker_mapped = 1;
+    m->finder_marker_stacked = 1;
+  } else if (!m->finder_marker_stacked) {
+    XRaiseWindow(dpy, m->finder_markerwin);
+    m->finder_marker_stacked = 1;
+  }
+}
+
+/* The clock animation normally raises the center bar as it grows.  During
+ * the expanded MPRIS panel, keep the right bar above it instead. */
+static void
+restack_mpris_panel(Monitor *m)
+{
+	XWindowChanges wc = {0};
+
+	if (!m || m != selmon || !mpris_hovered || !mpris_active ||
+	    !m->barrightwin)
+		return;
+	if (m->barcenterwin) {
+		wc.sibling = m->barcenterwin;
+		wc.stack_mode = Above;
+		XConfigureWindow(dpy, m->barrightwin, CWSibling | CWStackMode, &wc);
+	} else {
+		XRaiseWindow(dpy, m->barrightwin);
+	}
+}
+
+static int mpris_pointer_over_marker(Monitor *m) {
+  XWindowAttributes wa;
+  Window root_return, child_return;
+  unsigned int mask;
+  int pointer_x, pointer_y, window_x, window_y;
+
+  if (!m->mpris_volume_markerwin ||
+      !XGetWindowAttributes(dpy, m->mpris_volume_markerwin, &wa) ||
+      wa.map_state != IsViewable)
+    return 0;
+  if (!XQueryPointer(dpy, root, &root_return, &child_return,
+                     &pointer_x, &pointer_y, &window_x, &window_y, &mask))
+    return 0;
+  XTranslateCoordinates(dpy, m->mpris_volume_markerwin, root, 0, 0,
+                        &window_x, &window_y, &child_return);
+  return pointer_x >= window_x && pointer_x < window_x + wa.width &&
+         pointer_y >= window_y && pointer_y < window_y + wa.height;
+}
+
+static int mpris_pointer_over_bar(Monitor *m) {
+  XWindowAttributes wa;
+  Window root_return, child_return;
+  unsigned int mask;
+  int pointer_x, pointer_y, window_x, window_y;
+
+  if (!m->barrightwin ||
+      !XGetWindowAttributes(dpy, m->barrightwin, &wa) ||
+      wa.map_state != IsViewable)
+    return 0;
+  if (!XQueryPointer(dpy, root, &root_return, &child_return,
+                     &pointer_x, &pointer_y, &window_x, &window_y, &mask))
+    return 0;
+  XTranslateCoordinates(dpy, m->barrightwin, root, 0, 0,
+                        &window_x, &window_y, &child_return);
+  return pointer_x >= window_x && pointer_x < window_x + wa.width &&
+         pointer_y >= window_y && pointer_y < window_y + wa.height;
+}
 
 #include "movestack.c"
 #include "shiftview.c"
@@ -1659,6 +2338,28 @@ void attachstack(Client *c) {
   c->mon->stack = c;
 }
 
+static void buttonrelease(XEvent *e) {
+  XButtonEvent *ev = &e->xbutton;
+
+  if (mpris_volume_drag || ev->window == selmon->barrightwin ||
+      ev->window == selmon->mpris_volume_markerwin)
+    mpris_volume_drag = 0;
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    mpris_marker_pressed = 0;
+    if (mpris_pointer_over_marker(selmon)) {
+      mpris_marker_hovered = 1;
+      drawbars();
+    }
+  }
+  if (!mpris_volume_drag && mpris_hovered &&
+      !mpris_pointer_over_bar(selmon) &&
+      !mpris_pointer_over_marker(selmon)) {
+    mpris_hovered = 0;
+    drawbars();
+    resizebarwin(selmon);
+  }
+}
+
 void buttonpress(XEvent *e) {
   unsigned int i, x, click;
   int clientbinding;
@@ -1667,6 +2368,46 @@ void buttonpress(XEvent *e) {
   Client *c;
   Monitor *m;
   XButtonPressedEvent *ev = &e->xbutton;
+
+  /* Finder is modal.  A click on a client or another bar section must not
+   * be handled by the normal click bindings while the Finder is open. */
+  if (finder_active) {
+    if (ev->window == selmon->barcenterwin) {
+      finder_buttonpress(ev);
+      return;
+    }
+    if (finder_pointer_inside(ev)) {
+      XButtonPressedEvent inside = *ev;
+      XWindowAttributes attr;
+      if (XGetWindowAttributes(dpy, selmon->barcenterwin, &attr)) {
+        inside.window = selmon->barcenterwin;
+        inside.x = ev->x_root - attr.x;
+        inside.y = ev->y_root - attr.y;
+        finder_buttonpress(&inside);
+      }
+    } else {
+      finder_close();
+      finder_focus_pointer();
+    }
+    return;
+  }
+
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    /* Keep the marker compact during a click/drag. */
+    mpris_marker_pressed = 1;
+    if (mpris_marker_hovered) {
+      mpris_marker_hovered = 0;
+      drawbars();
+    }
+    XButtonPressedEvent forwarded = *ev;
+    Window child;
+    XTranslateCoordinates(dpy, root, selmon->barrightwin,
+                          ev->x_root, ev->y_root, &forwarded.x,
+                          &forwarded.y, &child);
+    forwarded.window = selmon->barrightwin;
+    mpris_panel_button(&forwarded);
+    return;
+  }
 
   click = ClkRootWin;
   /* focus monitor if necessary */
@@ -1709,8 +2450,16 @@ void buttonpress(XEvent *e) {
     /* the remaining area of the title bar is the app icon + app name */
     click = ClkWinTitle;
   } else if (ev->window == selmon->barrightwin) {
+    if (mpris_hovered && mpris_active && ev->y >= bh) {
+      mpris_panel_button(ev);
+      return;
+    }
     click = ClkStatusText;
   } else if (ev->window == selmon->barcenterwin) {
+    if (finder_active) {
+      finder_buttonpress(ev);
+      return;
+    }
     /* While a notification is visible, the center window belongs entirely
      * to it.  Do not let clicks which miss a control fall through to the
      * normal root/bar bindings; those bindings may change focus or reload
@@ -1847,7 +2596,10 @@ void cleanup(void) {
     free(scheme[i]);
   free(scheme);
   XDestroyWindow(dpy, wmcheckwin);
+  drw_fontset_free(finder_result_font);
   drw_free(drw);
+  if (finder_argb_colormap)
+    XFreeColormap(dpy, finder_argb_colormap);
   XFlush(dpy);
   XSetInputFocus(dpy, PointerRoot, RevertToPointerRoot, CurrentTime);
   XDeleteProperty(dpy, root, netatom[NetActiveWindow]);
@@ -1878,6 +2630,16 @@ void cleanupmon(Monitor *mon) {
   XDestroyWindow(dpy, mon->barkbwin);
   XUnmapWindow(dpy, mon->barrightwin);
   XDestroyWindow(dpy, mon->barrightwin);
+  if (mon->mpris_volume_markerwin) {
+    XUnmapWindow(dpy, mon->mpris_volume_markerwin);
+    XDestroyWindow(dpy, mon->mpris_volume_markerwin);
+  }
+    if (mon->finder_markerwin) {
+      XUnmapWindow(dpy, mon->finder_markerwin);
+      mon->finder_marker_mapped = 0;
+      mon->finder_marker_stacked = 0;
+      XDestroyWindow(dpy, mon->finder_markerwin);
+  }
   XUnmapWindow(dpy, mon->tabwin);
   XDestroyWindow(dpy, mon->tabwin);
   XUnmapWindow(dpy, mon->tagwin);
@@ -1966,8 +2728,8 @@ void clientmessage(XEvent *e) {
                         || (cme->data.l[0] == 2 /* _NET_WM_STATE_TOGGLE */ &&
                             !c->isfullscreen)));
   } else if (cme->message_type == netatom[NetActiveWindow]) {
-    if (c != selmon->sel && !c->isurgent)
-      seturgent(c, 1);
+    if (c != selmon->sel)
+      demandattention(c);
   }
 }
 
@@ -2225,11 +2987,38 @@ unsigned int statuswidth(char *stext) {
     isCode = 0;
   free(p);
 
-  return w + horizpadbar;
+	if (mpris_hovered && mpris_active)
+		w = MAX(w, MPRIS_PANEL_MIN_WIDTH);
+	return w + horizpadbar;
+}
+
+static int
+status_text_visible(const char *text)
+{
+	if (!text)
+		return 0;
+	while (*text == ' ' || *text == '\t')
+		text++;
+	return *text != '\0';
+}
+
+static int
+status_next_is_scroll(const char *code)
+{
+	const char *end = strchr(code, '^');
+
+	return end && end[1] == '^' && end[2] == 'm' && end[3] == '^';
 }
 
 int drawstatusbar(Monitor *m, int bh, char *stext) {
   int i, w, x, len;
+  int expanded = mpris_hovered && mpris_active;
+  int content_h = expanded ? bh / 2 : bh;
+  int paired_bg = expanded && !mpris_playing;
+  int bg_segment = -1;
+  int bg_width;
+  int text_bg = 0;
+  int joins_scroll = 0;
   short isCode = 0;
   short isScroll = 0;
   char *text;
@@ -2244,13 +3033,20 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
   w = statuswidth(stext);
   x = horizpadbar / 2;
 
-  XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, w, bh);
-
-  drw_setscheme(drw, scheme[LENGTH(colors)]);
-  drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
-  drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
-  drw_rect(drw, 0, borderpx, w, bh, 1, 1);
+  if (!expanded) {
+    XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
+    XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, w, content_h);
+    drw_setscheme(drw, scheme[LENGTH(colors)]);
+    drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
+    drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
+    drw_rect(drw, 0, borderpx, w, content_h, 1, 1);
+  } else {
+    /* The artwork is already behind this pass.  Do not paint a bar-wide
+     * background; only an explicit ^b field gets a background below. */
+    drw_setscheme(drw, scheme[LENGTH(colors)]);
+    drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
+    drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
+  }
 
   /* process status text */
   i = -1;
@@ -2259,8 +3055,9 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
       isCode = 1;
 
       text[i] = '\0';
+      joins_scroll = status_next_is_scroll(text + i + 1);
        w = isScroll ? mpris_field_width(text) : TEXTW(text) - lrpad;
-        if (isScroll) {
+         if (isScroll) {
           double progress = mpris_progress;
           unsigned int progressw = 0;
           if (progress >= 0.0) {
@@ -2268,16 +3065,47 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
             if (progress >= MPRIS_COMPLETE_THRESHOLD) progress = 1.0;
             progressw = (unsigned int)(progress * w + 0.5);
           }
-          mpris_scroll_text_width = drw_text_scroll_progress(
-              drw, x, borderpx + vertpadbar / 2, w,
-              bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
-              MPRIS_SCROLL_GAP, 0, &mpris_scroll_bg_clr,
+           if (expanded && text_bg && status_text_visible(text)) {
+             XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+              bg_width = MAX(1, w +
+                               (paired_bg && !(bg_segment & 1) ? lrpad + 1 : 0) -
+                                (expanded && bg_segment >= 0 &&
+                                 !isScroll &&
+                                 !joins_scroll &&
+                                 (!paired_bg || (bg_segment & 1)) ? 2 : 0));
+              XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+                             borderpx + vertpadbar / 2, bg_width,
+                             bh - vertpadbar);
+            }
+            mpris_scroll_text_width = drw_text_scroll_progress(
+                drw, x, borderpx + vertpadbar / 2, w,
+                 bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
+               MPRIS_SCROLL_GAP, 0,
+               expanded && (!text_bg || !status_text_visible(text))
+                   ? (const Clr *)-1 : &mpris_scroll_bg_clr,
               progress >= 0.0 ? &mpris_progress_clr : NULL,
               progressw);
         }
-       else
-         drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text,
-                  0);
+        else {
+          if (expanded && text_bg && status_text_visible(text)) {
+            XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+            bg_width = MAX(1, w +
+                             (paired_bg && !(bg_segment & 1) ? lrpad + 1 : 0) -
+                              (expanded && bg_segment >= 0 &&
+                               !isScroll &&
+                               !joins_scroll &&
+                               (!paired_bg || (bg_segment & 1)) ? 2 : 0));
+            XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+                            borderpx + vertpadbar / 2, bg_width,
+                            bh - vertpadbar);
+          }
+          if (expanded)
+            drw_text_transparent(drw, x, borderpx + vertpadbar / 2, w,
+                                 bh - vertpadbar, 0, text);
+          else
+            drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar,
+                     0, text, 0);
+        }
 
       x += w;
 
@@ -2293,11 +3121,14 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
           char buf[8];
           memcpy(buf, (char *)text + i + 1, 7);
           buf[7] = '\0';
-          drw_clr_create(drw, &drw->scheme[ColBg], buf);
-          i += 7;
+           drw_clr_create(drw, &drw->scheme[ColBg], buf);
+           text_bg = 1;
+           bg_segment++;
+           i += 7;
         } else if (text[i] == 'd') {
           drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
           drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
+          text_bg = 0;
         } else if (text[i] == 'r') {
           int rx = atoi(text + ++i);
           while (text[++i] != ',')
@@ -2336,15 +3167,39 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
         if (progress >= MPRIS_COMPLETE_THRESHOLD) progress = 1.0;
         progressw = (unsigned int)(progress * w + 0.5);
       }
-      mpris_scroll_text_width = drw_text_scroll_progress(
-          drw, x, borderpx + vertpadbar / 2, w,
-          bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
-          MPRIS_SCROLL_GAP, 0, &mpris_scroll_bg_clr,
+      if (expanded && text_bg && status_text_visible(text)) {
+        XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+         bg_width = MAX(1, w +
+                          (paired_bg && !(bg_segment & 1) ? lrpad + 1 : 0) -
+                          (expanded && bg_segment >= 0 &&
+                           (!paired_bg || (bg_segment & 1)) ? 2 : 0));
+         XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+             borderpx + vertpadbar / 2, bg_width,
+            bh - vertpadbar);
+      }
+       mpris_scroll_text_width = drw_text_scroll_progress(
+           drw, x, borderpx + vertpadbar / 2, w,
+            bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
+          MPRIS_SCROLL_GAP, 0,
+          expanded && (!text_bg || !status_text_visible(text))
+              ? (const Clr *)-1 : &mpris_scroll_bg_clr,
           progress >= 0.0 ? &mpris_progress_clr : NULL,
           progressw);
     }
-    else
-      drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text, 0);
+    else {
+      if (expanded && text_bg && status_text_visible(text)) {
+        XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+        XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+                       borderpx + vertpadbar / 2, w + lrpad + 1,
+                       bh - vertpadbar);
+      }
+      if (expanded)
+         drw_text_transparent(drw, x, borderpx + vertpadbar / 2, w,
+                              bh - vertpadbar, 0, text);
+      else
+        drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0,
+                 text, 0);
+    }
   }
 
   drw_setscheme(drw, scheme[SchemeNorm]);
@@ -2685,6 +3540,1131 @@ unsigned int clockwidth(void) {
   return TEXTW(clockstr) - lrpad + 2 * clockpad;
 }
 
+static void finder_expand_path(const char *path, char *out, size_t size) {
+  const char *home = getenv("HOME");
+  if (path[0] == '~' && path[1] == '/' && home)
+    snprintf(out, size, "%s/%s", home, path + 2);
+  else
+    snprintf(out, size, "%s", path);
+}
+
+static void finder_math_skip(const char **input) {
+  while (isspace((unsigned char)**input))
+    (*input)++;
+}
+
+static int finder_math_expression(const char **input, double *value);
+static int finder_math_unary(const char **input, double *value);
+
+static int finder_math_identifier(const char **input, char *name, size_t size) {
+  const char *start = *input;
+  size_t len;
+
+  if (!isalpha((unsigned char)**input) && **input != '_')
+    return 0;
+  (*input)++;
+  while (isalnum((unsigned char)**input) || **input == '_')
+    (*input)++;
+  len = (size_t)(*input - start);
+  if (len >= size)
+    return 0;
+  memcpy(name, start, len);
+  name[len] = '\0';
+  return 1;
+}
+
+/* Parse a parenthesised argument list.  Commas separate arguments, but they
+ * are not expression operators, so the normal expression parser stops at the
+ * next comma or closing parenthesis. */
+static int finder_math_args(const char **input, double *args, int max,
+                            int *count) {
+  finder_math_skip(input);
+  if (**input != '(')
+    return 0;
+  (*input)++;
+  *count = 0;
+  finder_math_skip(input);
+  if (**input == ')') {
+    (*input)++;
+    return 1;
+  }
+  while (*count < max) {
+    if (!finder_math_expression(input, &args[*count]))
+      return 0;
+    (*count)++;
+    finder_math_skip(input);
+    if (**input == ',') {
+      (*input)++;
+      continue;
+    }
+    if (**input == ')') {
+      (*input)++;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Bit operations use exact non-negative integers up to 2^53. */
+static int finder_math_u64(double value, unsigned long long *out) {
+  if (!isfinite(value) || value < 0.0 || value > 9007199254740992.0 ||
+      floor(value) != value)
+    return 0;
+  *out = (unsigned long long)value;
+  return 1;
+}
+
+static int finder_math_i64(double value, long long *out) {
+  if (!isfinite(value) || value < -9007199254740992.0 ||
+      value > 9007199254740992.0 || floor(value) != value)
+    return 0;
+  *out = (long long)value;
+  return 1;
+}
+
+static int finder_math_apply(const char *name, const double *args, int count,
+                             double *value) {
+  double v, a, b;
+  int i;
+
+  if (count == 1) {
+    v = args[0];
+    if (!strcasecmp(name, "sqrt")) {
+      if (v < 0.0)
+        return 0;
+      *value = sqrt(v);
+    } else if (!strcasecmp(name, "cbrt")) {
+      *value = cbrt(v);
+    } else if (!strcasecmp(name, "abs")) {
+      *value = fabs(v);
+    } else if (!strcasecmp(name, "exp")) {
+      *value = exp(v);
+    } else if (!strcasecmp(name, "ln") || !strcasecmp(name, "log")) {
+      if (v <= 0.0)
+        return 0;
+      *value = log(v);
+    } else if (!strcasecmp(name, "log2")) {
+      if (v <= 0.0)
+        return 0;
+      *value = log2(v);
+    } else if (!strcasecmp(name, "log10")) {
+      if (v <= 0.0)
+        return 0;
+      *value = log10(v);
+    } else if (!strcasecmp(name, "sin")) {
+      *value = sin(v);
+    } else if (!strcasecmp(name, "cos")) {
+      *value = cos(v);
+    } else if (!strcasecmp(name, "tan")) {
+      *value = tan(v);
+    } else if (!strcasecmp(name, "asin")) {
+      if (v < -1.0 || v > 1.0)
+        return 0;
+      *value = asin(v);
+    } else if (!strcasecmp(name, "acos")) {
+      if (v < -1.0 || v > 1.0)
+        return 0;
+      *value = acos(v);
+    } else if (!strcasecmp(name, "atan")) {
+      *value = atan(v);
+    } else if (!strcasecmp(name, "floor")) {
+      *value = floor(v);
+    } else if (!strcasecmp(name, "ceil")) {
+      *value = ceil(v);
+    } else if (!strcasecmp(name, "round")) {
+      *value = round(v);
+    } else if (!strcasecmp(name, "trunc")) {
+      *value = trunc(v);
+    } else if (!strcasecmp(name, "deg")) {
+      *value = v * 180.0 / 3.14159265358979323846;
+    } else if (!strcasecmp(name, "rad")) {
+      *value = v * 3.14159265358979323846 / 180.0;
+    } else if (!strcasecmp(name, "fact")) {
+      if (v < 0.0 || v > 170.0 || floor(v) != v)
+        return 0;
+      *value = 1.0;
+      for (i = 2; i <= (int)v; i++)
+        *value *= i;
+    } else if (!strcasecmp(name, "bitnot")) {
+      long long n;
+      if (!finder_math_i64(v, &n))
+        return 0;
+      *value = (double)(~n);
+    } else {
+      return 0;
+    }
+    return isfinite(*value);
+  }
+
+  if (count != 2)
+    return 0;
+  a = args[0];
+  b = args[1];
+  if (!strcasecmp(name, "pow")) {
+    *value = pow(a, b);
+  } else if (!strcasecmp(name, "hypot")) {
+    *value = hypot(a, b);
+  } else if (!strcasecmp(name, "mod")) {
+    if (b == 0.0)
+      return 0;
+    *value = fmod(a, b);
+  } else if (!strcasecmp(name, "atan2")) {
+    *value = atan2(a, b);
+  } else if (!strcasecmp(name, "min")) {
+    *value = MIN(a, b);
+  } else if (!strcasecmp(name, "max")) {
+    *value = MAX(a, b);
+  } else if (!strcasecmp(name, "gcd")) {
+    unsigned long long x, y, t;
+    if (!finder_math_u64(a, &x) || !finder_math_u64(b, &y))
+      return 0;
+    while (y) {
+      t = x % y;
+      x = y;
+      y = t;
+    }
+    *value = (double)x;
+  } else if (!strcasecmp(name, "lcm")) {
+    unsigned long long x, y, t, g;
+    if (!finder_math_u64(a, &x) || !finder_math_u64(b, &y))
+      return 0;
+    if (x == 0 || y == 0) {
+      *value = 0.0;
+      return 1;
+    }
+    {
+      unsigned long long xx = x, yy = y;
+      while (yy) {
+        t = xx % yy;
+        xx = yy;
+        yy = t;
+      }
+      g = xx;
+    }
+    if ((double)(x / g) * (double)y > 9007199254740992.0)
+      return 0;
+    *value = (double)((x / g) * y);
+  } else if (!strcasecmp(name, "bitor") ||
+             !strcasecmp(name, "bitand") ||
+             !strcasecmp(name, "bitxor")) {
+    long long x, y;
+    if (!finder_math_i64(a, &x) || !finder_math_i64(b, &y))
+      return 0;
+    if (!strcasecmp(name, "bitor"))
+      *value = (double)(x | y);
+    else if (!strcasecmp(name, "bitand"))
+      *value = (double)(x & y);
+    else
+      *value = (double)(x ^ y);
+  } else if (!strcasecmp(name, "shl") || !strcasecmp(name, "shr")) {
+    long long x, n;
+    if (!finder_math_i64(a, &x) || !finder_math_i64(b, &n) ||
+        n < 0 || n > 62)
+      return 0;
+    if (!strcasecmp(name, "shl"))
+      *value = (double)((unsigned long long)x << (unsigned int)n);
+    else
+      *value = (double)((unsigned long long)x >> (unsigned int)n);
+  } else {
+    return 0;
+  }
+  return isfinite(*value);
+}
+
+static int finder_math_constant(const char *name, double *value) {
+  if (!strcasecmp(name, "pi"))
+    *value = 3.14159265358979323846;
+  else if (!strcasecmp(name, "e"))
+    *value = 2.71828182845904523536;
+  else if (!strcasecmp(name, "tau"))
+    *value = 6.28318530717958647692;
+  else if (!strcasecmp(name, "phi"))
+    *value = 1.61803398874989484820;
+  else if (!strcasecmp(name, "epsilon"))
+    *value = 2.22044604925031308085e-16;
+  else if (!strcasecmp(name, "byte_max"))
+    *value = 255.0;
+  else if (!strcasecmp(name, "word_max"))
+    *value = 65535.0;
+  else if (!strcasecmp(name, "dword_max"))
+    *value = 4294967295.0;
+  else if (!strcasecmp(name, "int_max"))
+    *value = 2147483647.0;
+  else if (!strcasecmp(name, "int_min"))
+    *value = -2147483648.0;
+  else if (!strcasecmp(name, "uint_max"))
+    *value = 4294967295.0;
+  else if (!strcasecmp(name, "kb"))
+    *value = 1024.0;
+  else if (!strcasecmp(name, "mb"))
+    *value = 1048576.0;
+  else if (!strcasecmp(name, "gb"))
+    *value = 1073741824.0;
+  else if (!strcasecmp(name, "tb"))
+    *value = 1099511627776.0;
+  else if (!strcasecmp(name, "true"))
+    *value = 1.0;
+  else if (!strcasecmp(name, "false"))
+    *value = 0.0;
+  else
+    return 0;
+  return 1;
+}
+
+static int finder_math_primary(const char **input, double *value) {
+  char name[32];
+  char *end;
+  double number, args[2];
+  int count;
+
+  finder_math_skip(input);
+  if (**input == '(') {
+    (*input)++;
+    if (!finder_math_expression(input, value))
+      return 0;
+    finder_math_skip(input);
+    if (**input != ')')
+      return 0;
+    (*input)++;
+    return 1;
+  }
+  if (isalpha((unsigned char)**input) || **input == '_') {
+    if (!finder_math_identifier(input, name, sizeof(name)))
+      return 0;
+    finder_math_skip(input);
+    if (**input == '(') {
+      if (!finder_math_args(input, args, (int)LENGTH(args), &count))
+        return 0;
+      return finder_math_apply(name, args, count, value);
+    }
+    return finder_math_constant(name, value);
+  }
+  errno = 0;
+  number = strtod(*input, &end);
+  if (end == *input || errno == ERANGE || !isfinite(number))
+    return 0;
+  *input = end;
+  *value = number;
+  return 1;
+}
+
+static int finder_math_postfix(const char **input, double *value) {
+  double fact;
+  int i;
+
+  if (!finder_math_primary(input, value))
+    return 0;
+  for (;;) {
+    finder_math_skip(input);
+    if (**input != '!')
+      return 1;
+    (*input)++;
+    if (!isfinite(*value) || *value < 0.0 || *value > 170.0 ||
+        floor(*value) != *value)
+      return 0;
+    fact = 1.0;
+    for (i = 2; i <= (int)*value; i++)
+      fact *= i;
+    *value = fact;
+  }
+}
+
+static int finder_math_power(const char **input, double *value) {
+  double rhs;
+
+  if (!finder_math_postfix(input, value))
+    return 0;
+  finder_math_skip(input);
+  if (**input == '^') {
+    (*input)++;
+    if (!finder_math_unary(input, &rhs))
+      return 0;
+    *value = pow(*value, rhs);
+    if (!isfinite(*value))
+      return 0;
+  }
+  return 1;
+}
+
+static int finder_math_unary(const char **input, double *value) {
+  finder_math_skip(input);
+  if (**input == '+') {
+    (*input)++;
+    return finder_math_unary(input, value);
+  }
+  if (**input == '-') {
+    (*input)++;
+    if (!finder_math_unary(input, value))
+      return 0;
+    *value = -*value;
+    return 1;
+  }
+  return finder_math_power(input, value);
+}
+
+static int finder_math_term(const char **input, double *value) {
+  double rhs;
+  char op;
+
+  if (!finder_math_unary(input, value))
+    return 0;
+  for (;;) {
+    finder_math_skip(input);
+    op = **input;
+    if (op != '*' && op != '/' && op != '%')
+      return 1;
+    (*input)++;
+    if (!finder_math_unary(input, &rhs))
+      return 0;
+    if (op == '*') {
+      *value *= rhs;
+    } else {
+      if (rhs == 0.0)
+        return 0;
+      if (op == '/')
+        *value /= rhs;
+      else
+        *value = fmod(*value, rhs);
+    }
+    if (!isfinite(*value))
+      return 0;
+  }
+}
+
+static int finder_math_expression(const char **input, double *value) {
+  double rhs;
+  char op;
+
+  if (!finder_math_term(input, value))
+    return 0;
+  for (;;) {
+    finder_math_skip(input);
+    op = **input;
+    if (op != '+' && op != '-')
+      return 1;
+    (*input)++;
+    if (!finder_math_term(input, &rhs))
+      return 0;
+    if (op == '+')
+      *value += rhs;
+    else
+      *value -= rhs;
+    if (!isfinite(*value))
+      return 0;
+  }
+}
+
+static void finder_update_math(void) {
+  const char *input = finder_query;
+  double value;
+  int has_operator = strpbrk(finder_query, "+-*/%^!()") != NULL;
+
+  finder_math_active = 0;
+  finder_math_help_active = 0;
+  finder_math_result[0] = '\0';
+  if (!finder_query[0])
+    return;
+  if (!strcasecmp(finder_query, "math")) {
+    finder_math_help_active = 1;
+    return;
+  }
+  if (!has_operator) {
+    char name[32];
+
+    finder_math_skip(&input);
+    if (finder_math_identifier(&input, name, sizeof(name))) {
+      finder_math_skip(&input);
+      if (*input == '\0' && finder_math_constant(name, &value)) {
+        snprintf(finder_math_result, sizeof(finder_math_result), "%.15g",
+                 value);
+        finder_math_active = 1;
+      }
+    }
+    return;
+  }
+  if (!finder_math_expression(&input, &value))
+    return;
+  finder_math_skip(&input);
+  if (*input != '\0')
+    return;
+  snprintf(finder_math_result, sizeof(finder_math_result), "%.15g", value);
+  finder_math_active = 1;
+}
+
+static uint64_t finder_monotonic_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void finder_cursor_reset(void) {
+  finder_cursor_base_ms = finder_monotonic_ms();
+  finder_cursor_visible = 1;
+}
+
+static int finder_cursor_state(void) {
+  uint64_t elapsed = finder_monotonic_ms() - finder_cursor_base_ms;
+  return ((elapsed / FINDER_CURSOR_BLINK_MS) & 1ULL) == 0;
+}
+
+static size_t finder_cursor_prev(const char *text, size_t pos) {
+  if (pos == 0)
+    return 0;
+  pos--;
+  while (pos > 0 && ((unsigned char)text[pos] & 0xc0) == 0x80)
+    pos--;
+  return pos;
+}
+
+static size_t finder_cursor_next(const char *text, size_t pos) {
+  size_t len = strlen(text);
+  if (pos >= len)
+    return len;
+  pos++;
+  while (pos < len && ((unsigned char)text[pos] & 0xc0) == 0x80)
+    pos++;
+  return pos;
+}
+
+static int finder_matches(const FinderApp *app) {
+  if (finder_math_active || finder_math_help_active)
+    return 0;
+  if (!finder_query[0])
+    return 1;
+  return strcasestr(app->name, finder_query) ||
+         strcasestr(app->exec, finder_query);
+}
+
+static int finder_cmp(const void *a, const void *b) {
+  const FinderApp *aa = a, *bb = b;
+  if (aa->recent != bb->recent)
+    return bb->recent - aa->recent;
+  return strcasecmp(aa->name, bb->name);
+}
+
+/* Rank how closely an application name matches the query.  A complete or
+ * prefix match is more relevant than a match at a word boundary, which in
+ * turn is more relevant than an arbitrary substring.  Command-only matches
+ * stay visible but sort below every name match. */
+static int finder_name_score(const char *name) {
+  const char *match;
+  size_t qlen = strlen(finder_query);
+  int score;
+
+  if (strcasecmp(name, finder_query) == 0)
+    return 100000;
+  if (strncasecmp(name, finder_query, qlen) == 0)
+    return 90000;
+  match = strcasestr(name, finder_query);
+  if (!match)
+    return 0;
+  score = (match > name && !isalnum((unsigned char)match[-1])) ? 70000 : 50000;
+  return score - (int)(match - name) * 10;
+}
+
+static int finder_match_score(const FinderApp *app) {
+  int score;
+
+  if (!finder_query[0])
+    return 0;
+  if ((score = finder_name_score(app->name)) != 0)
+    return score;
+  return strcasestr(app->exec, finder_query) ? 10000 : 0;
+}
+
+static int finder_rank_cmp(const void *a, const void *b) {
+  const FinderApp *aa = &finder_apps[*(const unsigned int *)a];
+  const FinderApp *bb = &finder_apps[*(const unsigned int *)b];
+
+  if (aa->score != bb->score)
+    return bb->score - aa->score;
+  if (aa->recent != bb->recent)
+    return bb->recent - aa->recent;
+  return strcasecmp(aa->name, bb->name);
+}
+
+/* Build the visible result order.  Without a query this preserves the
+ * recents-first list; while searching, textual relevance wins and recency is
+ * only used to break ties. */
+static void finder_rank(void) {
+  finder_visible = 0;
+  for (unsigned int i = 0; i < finder_app_count; i++) {
+    if (!finder_matches(&finder_apps[i]))
+      continue;
+    finder_apps[i].score = finder_match_score(&finder_apps[i]);
+    finder_order[finder_visible++] = i;
+  }
+  qsort(finder_order, finder_visible, sizeof(finder_order[0]),
+        finder_rank_cmp);
+}
+
+static void finder_icon_path(const FinderApp *app, char *out, size_t size) {
+  const char *home = getenv("HOME");
+  const char *name = app->icon_name;
+  static const char *roots[] = {
+    "/usr/local/share/icons", "/usr/share/icons", NULL
+  };
+  static const char *sizes[] = {
+    "scalable", "512x512", "384x384", "256x256", "192x192",
+    "128x128", "96x96", "64x64", "48x48", "32x32", "24x24",
+    "22x22", "16x16", "512", "384", "256", "192", "128", "96",
+    "64", "48", "32", "24", "22", "16", NULL
+  };
+  static const char *extensions[] = {"png", "svg", "xpm", NULL};
+  char root[PATH_MAX], candidate[PATH_MAX];
+  DIR *dir;
+  struct dirent *entry;
+  unsigned int i, j;
+
+  out[0] = '\0';
+  if (!name[0])
+    return;
+  if (name[0] == '/') {
+    snprintf(out, size, "%s", name);
+    return;
+  }
+  /* An Icon= value may already include an extension, but most desktop files
+   * contain a theme icon name without one. */
+  if (strchr(name, '.')) {
+    if (home) {
+      snprintf(candidate, sizeof(candidate), "%s/.local/share/icons/%s", home, name);
+      if (access(candidate, R_OK) == 0) {
+        snprintf(out, size, "%s", candidate);
+        return;
+      }
+    }
+    for (i = 0; roots[i]; i++) {
+      snprintf(candidate, sizeof(candidate), "%s/%s", roots[i], name);
+      if (access(candidate, R_OK) == 0) {
+        snprintf(out, size, "%s", candidate);
+        return;
+      }
+    }
+    snprintf(candidate, sizeof(candidate), "/usr/share/pixmaps/%s", name);
+    if (access(candidate, R_OK) == 0) {
+      snprintf(out, size, "%s", candidate);
+      return;
+    }
+  }
+
+  /* Check every installed icon theme, not only hicolor.  Themes such as
+   * Papirus and Breeze commonly store the application icons there. */
+  for (i = 0; roots[i] || (home && i == 0); i++) {
+    const char *base = roots[i];
+    if (i == 0 && home) {
+      snprintf(root, sizeof(root), "%s/.local/share/icons", home);
+      base = root;
+    }
+    if (!base)
+      continue;
+    dir = opendir(base);
+    if (!dir)
+      continue;
+    while ((entry = readdir(dir))) {
+      if (entry->d_name[0] == '.')
+        continue;
+      for (j = 0; sizes[j]; j++) {
+        unsigned int k;
+        for (k = 0; extensions[k]; k++) {
+          snprintf(candidate, sizeof(candidate), "%s/%s/%s/apps/%s.%s",
+                   base, entry->d_name, sizes[j], name, extensions[k]);
+          if (access(candidate, R_OK) == 0) {
+            snprintf(out, size, "%s", candidate);
+            closedir(dir);
+            return;
+          }
+        }
+      }
+    }
+    closedir(dir);
+  }
+
+  for (i = 0; extensions[i]; i++) {
+    snprintf(candidate, sizeof(candidate), "/usr/share/pixmaps/%s.%s",
+             name, extensions[i]);
+    if (access(candidate, R_OK) == 0) {
+      snprintf(out, size, "%s", candidate);
+      return;
+    }
+  }
+}
+
+static void finder_load_icon(FinderApp *app) {
+  char path[PATH_MAX];
+  Imlib_Image image;
+  DATA32 *data;
+  int w, h;
+
+  finder_icon_path(app, path, sizeof(path));
+  if (!path[0] || !(image = imlib_load_image(path)))
+    return;
+  imlib_context_set_image(image);
+  w = imlib_image_get_width();
+  h = imlib_image_get_height();
+  data = imlib_image_get_data_for_reading_only();
+  if (data && w > 0 && h > 0)
+    /* Always run icon data through the Imlib2 scaling path.  The fast path in
+     * drw_picture_create_resized assumes the source stride/format matches an
+     * XImage exactly, which is not true for all PNG/SVG loaders and results
+     * in an empty ARGB picture for many desktop icons. */
+    app->icon = drw_picture_create_cover(drw, (char *)data, w, h, 22, 22);
+  if (image && imlib_context_get_image())
+    imlib_free_image();
+}
+
+static void finder_free_icons(void) {
+  for (unsigned int i = 0; i < finder_app_count; i++)
+    if (finder_apps[i].icon) {
+      XRenderFreePicture(dpy, finder_apps[i].icon);
+      finder_apps[i].icon = None;
+    }
+}
+
+/* The application list itself is rebuilt from the XDG desktop directories,
+ * but the recent order is learned state and should survive restarting dwm or
+ * logging in again. */
+static int finder_recent_path(char *path, size_t size, int create_dirs) {
+  const char *state = getenv("XDG_STATE_HOME");
+  const char *home = getenv("HOME");
+  char dir[PATH_MAX];
+
+  if (state && state[0] == '/') {
+    snprintf(dir, sizeof(dir), "%s/dwm", state);
+  } else if (home && home[0]) {
+    snprintf(dir, sizeof(dir), "%s/.local/state/dwm", home);
+    if (create_dirs) {
+      char local[PATH_MAX], state_dir[PATH_MAX];
+      snprintf(local, sizeof(local), "%s/.local", home);
+      snprintf(state_dir, sizeof(state_dir), "%s/.local/state", home);
+      (void)mkdir(local, 0700);
+      (void)mkdir(state_dir, 0700);
+    }
+  } else {
+    return 0;
+  }
+  if (create_dirs)
+    (void)mkdir(dir, 0700);
+  return snprintf(path, size, "%s/finder-recent", dir) < (int)size;
+}
+
+static void finder_load_recent(void) {
+  char path[PATH_MAX], line[PATH_MAX];
+  FILE *fp;
+
+  finder_recent_count = 0;
+  if (!finder_recent_path(path, sizeof(path), 0) ||
+      !(fp = fopen(path, "r")))
+    return;
+  while (finder_recent_count < LENGTH(finder_recent) &&
+         fgets(line, sizeof(line), fp)) {
+    line[strcspn(line, "\r\n")] = '\0';
+    if (!line[0])
+      continue;
+    snprintf(finder_recent[finder_recent_count],
+             sizeof(finder_recent[finder_recent_count]), "%s", line);
+    finder_recent_count++;
+  }
+  fclose(fp);
+}
+
+static void finder_save_recent(void) {
+  char path[PATH_MAX], temp[PATH_MAX];
+  FILE *fp;
+
+  if (!finder_recent_path(path, sizeof(path), 1))
+    return;
+  if (snprintf(temp, sizeof(temp), "%s.tmp", path) >= (int)sizeof(temp))
+    return;
+  if (!(fp = fopen(temp, "w")))
+    return;
+  for (unsigned int i = 0; i < finder_recent_count; i++)
+    fprintf(fp, "%s\n", finder_recent[i]);
+  if (fclose(fp) == 0)
+    (void)rename(temp, path);
+  else
+    (void)unlink(temp);
+}
+
+static void finder_load_apps(void) {
+  unsigned int i;
+  finder_free_icons();
+  finder_app_count = 0;
+  for (i = 0; finder_app_dirs[i] && finder_app_count < FINDER_MAX_APPS; i++) {
+    char dirpath[PATH_MAX];
+    DIR *dir;
+    struct dirent *entry;
+    finder_expand_path(finder_app_dirs[i], dirpath, sizeof(dirpath));
+    if (!(dir = opendir(dirpath)))
+      continue;
+    while ((entry = readdir(dir)) && finder_app_count < FINDER_MAX_APPS) {
+      char path[PATH_MAX], line[PATH_MAX + 32], *value;
+      FILE *fp;
+      FinderApp *app;
+      if (!strstr(entry->d_name, ".desktop"))
+        continue;
+      snprintf(path, sizeof(path), "%s/%s", dirpath, entry->d_name);
+      if (!(fp = fopen(path, "r")))
+        continue;
+      app = &finder_apps[finder_app_count];
+      memset(app, 0, sizeof(*app));
+      while (fgets(line, sizeof(line), fp)) {
+        if (!strncmp(line, "Name=", 5) && !app->name[0])
+          snprintf(app->name, sizeof(app->name), "%s", line + 5);
+        else if (!strncmp(line, "Exec=", 5) && !app->exec[0])
+          snprintf(app->exec, sizeof(app->exec), "%s", line + 5);
+        else if (!strncmp(line, "Icon=", 5) && !app->icon_name[0])
+          snprintf(app->icon_name, sizeof(app->icon_name), "%s", line + 5);
+        else if (!strncmp(line, "NoDisplay=true", 15) ||
+                 !strncmp(line, "Hidden=true", 11))
+          app->name[0] = '\0';
+      }
+      fclose(fp);
+      if (!app->name[0] || !app->exec[0])
+        continue;
+      app->name[strcspn(app->name, "\r\n")] = '\0';
+      app->exec[strcspn(app->exec, "\r\n")] = '\0';
+      app->icon_name[strcspn(app->icon_name, "\r\n")] = '\0';
+      /* Desktop field codes are not useful for a launcher without files. */
+      while ((value = strchr(app->exec, '%')))
+        memmove(value, value + ((value[1] && strchr("fFuUdiCk", value[1])) ? 2 : 1),
+                strlen(value + ((value[1] && strchr("fFuUdiCk", value[1])) ? 2 : 1)) + 1);
+      snprintf(app->file, sizeof(app->file), "%s", path);
+      for (unsigned int r = 0; r < finder_recent_count; r++)
+        if (!strcmp(finder_recent[r], app->file)) {
+          app->recent = (int)(finder_recent_count - r);
+          break;
+        }
+       finder_app_count++;
+    }
+    closedir(dir);
+  }
+  qsort(finder_apps, finder_app_count, sizeof(*finder_apps), finder_cmp);
+  finder_rank();
+}
+
+/* Decode at most one visible icon per event-loop pass.  Icon lookup can walk
+ * several theme directories and image decoding can be expensive, so neither
+ * should delay the first Finder frame or a keypress. */
+static int finder_load_next_icon(void) {
+  int end = MIN((int)finder_visible, finder_scroll + finder_rows);
+
+  for (int i = finder_scroll; i < end; i++) {
+    FinderApp *app = &finder_apps[finder_order[i]];
+    if (app->icon_loaded)
+      continue;
+    app->icon_loaded = 1;
+    finder_load_icon(app);
+    return 1;
+  }
+  return 0;
+}
+
+static int finder_visible_count(void) {
+  return (int)finder_visible;
+}
+
+/* One row is always reserved for the query.  The remaining rows follow the
+ * number of matching applications, up to the configured maximum. */
+static int finder_display_rows(void) {
+  if (finder_math_active)
+    return 2;
+  if (finder_math_help_active)
+    return 1 + (int)LENGTH(finder_math_help);
+  int rows = finder_visible_count() - finder_scroll;
+  int app_rows = MAX(0, MIN(finder_rows, rows));
+  return 1 + app_rows;
+}
+
+static int finder_set_scroll(int scroll) {
+  int maxscroll = MAX(0, finder_visible_count() - finder_rows);
+
+  scroll = MAX(0, MIN(maxscroll, scroll));
+  if (scroll == finder_scroll)
+    return 0;
+  finder_scroll = scroll;
+  return 1;
+}
+
+static FinderApp *finder_selected_app(void) {
+  if (finder_selected < 0 || (unsigned int)finder_selected >= finder_visible)
+    return NULL;
+  return &finder_apps[finder_order[finder_selected]];
+}
+
+static void finder_close(void) {
+  finder_active = 0;
+  finder_loading = 0;
+  finder_icons_pending = 0;
+  finder_dirty = 1;
+  finder_query[0] = '\0';
+  finder_math_active = 0;
+  finder_math_help_active = 0;
+  finder_math_result[0] = '\0';
+  finder_cursor = 0;
+  finder_cursor_reset();
+  finder_selected = 0;
+  finder_scroll = 0;
+  finder_visible = 0;
+  XUngrabPointer(dpy, CurrentTime);
+  XUngrabKeyboard(dpy, CurrentTime);
+  XSetInputFocus(dpy, root, RevertToParent, CurrentTime);
+  resizebarwin(selmon);
+  drawbars();
+}
+
+static int finder_pointer_inside(XButtonEvent *ev) {
+  XWindowAttributes attr;
+  if (!selmon || !selmon->barcenterwin ||
+      !XGetWindowAttributes(dpy, selmon->barcenterwin, &attr))
+    return 0;
+  return ev->x_root >= attr.x && ev->x_root < attr.x + (int)attr.width &&
+          ev->y_root >= attr.y && ev->y_root < attr.y + (int)attr.height;
+}
+
+static void finder_motion(XMotionEvent *ev) {
+  XWindowAttributes attr;
+  int row, selected;
+
+  if (!finder_active || finder_math_active || finder_math_help_active ||
+      !selmon || !selmon->barcenterwin ||
+      !XGetWindowAttributes(dpy, selmon->barcenterwin, &attr) ||
+      ev->x_root < attr.x || ev->x_root >= attr.x + (int)attr.width ||
+      ev->y_root < attr.y || ev->y_root >= attr.y + (int)attr.height)
+    return;
+
+  row = (ev->y_root - attr.y) / MAX(1, bh);
+  if (row <= 0 || row >= finder_display_rows())
+    return;
+  selected = finder_scroll + row - 1;
+  if (selected == finder_selected)
+    return;
+  finder_selected = selected;
+  finder_dirty = 1;
+  finder_icons_pending = 1;
+  drawbars();
+}
+
+static void finder_focus_pointer(void) {
+  Window root_return, child;
+  int root_x, root_y, win_x, win_y;
+  unsigned int mask;
+  Client *c;
+
+  if (!XQueryPointer(dpy, root, &root_return, &child, &root_x, &root_y,
+                     &win_x, &win_y, &mask))
+    return;
+  if ((c = wintoclient(child))) {
+    if (c->mon != selmon)
+      selmon = c->mon;
+    focus(c);
+  }
+}
+
+static void finder_launch(void) {
+  FinderApp *app = finder_selected_app();
+  pid_t pid;
+  if (!app)
+    return;
+  if ((pid = fork()) == 0) {
+    setsid();
+    execl("/bin/sh", "sh", "-c", app->exec, (char *)NULL);
+    _exit(127);
+  }
+  for (unsigned int i = 0; i < finder_recent_count; i++) {
+    if (strcmp(finder_recent[i], app->file))
+      continue;
+    for (unsigned int j = i; j + 1 < finder_recent_count; j++)
+      snprintf(finder_recent[j], sizeof(finder_recent[j]), "%s",
+               finder_recent[j + 1]);
+    finder_recent_count--;
+    break;
+  }
+  for (unsigned int i = MIN(finder_recent_count, LENGTH(finder_recent) - 1);
+       i > 0; i--)
+    snprintf(finder_recent[i], sizeof(finder_recent[i]), "%s",
+             finder_recent[i - 1]);
+  snprintf(finder_recent[0], sizeof(finder_recent[0]), "%s", app->file);
+  if (finder_recent_count < LENGTH(finder_recent))
+    finder_recent_count++;
+  finder_save_recent();
+  finder_close();
+}
+
+static void finder(const Arg *arg) {
+  (void)arg;
+  /* Keep the modal Finder off fullscreen clients.  It would otherwise raise
+   * itself above the fullscreen window and steal keyboard focus.  Closing an
+   * already-open Finder is still allowed. */
+  if (!finder_active && (fullscreen_st ||
+                         (selmon && selmon->sel && selmon->sel->isfullscreen)))
+    return;
+  finder_active = !finder_active;
+  finder_dirty = 1;
+  finder_query[0] = '\0';
+  finder_math_active = 0;
+  finder_math_help_active = 0;
+  finder_math_result[0] = '\0';
+  finder_cursor = 0;
+  finder_cursor_reset();
+  finder_selected = 0;
+  finder_scroll = 0;
+  if (finder_active) {
+    /* Open and paint the query row first.  Desktop metadata and icons are
+     * loaded by the event loop after this frame is visible. */
+    finder_free_icons();
+    finder_app_count = 0;
+    finder_visible = 0;
+    finder_loading = 1;
+    finder_icons_pending = 0;
+    /* Keep Escape available even if an application changes focus while the
+     * Finder is active. */
+    XGrabKeyboard(dpy, selmon->barcenterwin, True, GrabModeAsync,
+                  GrabModeAsync, CurrentTime);
+    /* Client windows normally consume their own ButtonPress events.  Grab
+     * the pointer so outside clicks are delivered to dwm and can close the
+     * modal Finder instead of falling through to the application. */
+     XGrabPointer(dpy, root, False, ButtonPressMask | PointerMotionMask,
+                  GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+    XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent, CurrentTime);
+     } else {
+    finder_loading = 0;
+    finder_icons_pending = 0;
+    finder_close();
+    return;
+  }
+  resizebarwin(selmon);
+  drawbars();
+}
+
+static int finder_keypress(XKeyEvent *ev) {
+  KeySym keysym = XLookupKeysym(ev, 0);
+  char text[64];
+  int len, query_changed = 0, cursor_moved = 0;
+  size_t n;
+
+  if (!finder_active)
+    return 0;
+  n = strlen(finder_query);
+  if (finder_cursor > n)
+    finder_cursor = n;
+  if (keysym == XK_Escape) {
+    finder_close();
+    return 1;
+  } else if (keysym == XK_Return || keysym == XK_KP_Enter) {
+    finder_launch();
+    return 1;
+  } else if (keysym == XK_Up) {
+    if (finder_selected > 0) finder_selected--;
+  } else if (keysym == XK_Down) {
+    if (finder_selected + 1 < finder_visible_count())
+      finder_selected++;
+  } else if (keysym == XK_Left) {
+    size_t prev = finder_cursor_prev(finder_query, finder_cursor);
+    if (prev != finder_cursor) {
+      finder_cursor = prev;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_Right) {
+    size_t next = finder_cursor_next(finder_query, finder_cursor);
+    if (next != finder_cursor) {
+      finder_cursor = next;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_Home) {
+    if (finder_cursor != 0) {
+      finder_cursor = 0;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_End) {
+    if (finder_cursor != n) {
+      finder_cursor = n;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_BackSpace) {
+    if (finder_cursor > 0) {
+      size_t prev = finder_cursor_prev(finder_query, finder_cursor);
+      memmove(finder_query + prev, finder_query + finder_cursor,
+              n - finder_cursor + 1);
+      finder_cursor = prev;
+      query_changed = 1;
+    }
+  } else if (keysym == XK_Delete) {
+    if (finder_cursor < n) {
+      size_t next = finder_cursor_next(finder_query, finder_cursor);
+      memmove(finder_query + finder_cursor, finder_query + next,
+              n - next + 1);
+      query_changed = 1;
+    }
+  } else {
+    len = XLookupString(ev, text, sizeof(text) - 1, NULL, NULL);
+    if (len <= 0)
+      return 1;
+    text[len] = '\0';
+    if (n + (size_t)len < sizeof(finder_query)) {
+      memmove(finder_query + finder_cursor + len,
+              finder_query + finder_cursor, n - finder_cursor + 1);
+      memcpy(finder_query + finder_cursor, text, (size_t)len);
+      finder_cursor += (size_t)len;
+      query_changed = 1;
+    }
+  }
+  if (query_changed) {
+    finder_update_math();
+    finder_rank();
+    finder_selected = 0;
+    finder_set_scroll(0);
+  }
+  if (query_changed || cursor_moved)
+    finder_cursor_reset();
+  finder_dirty = 1;
+  if (cursor_moved) {
+    resizebarwin(selmon);
+    drawbars();
+    return 1;
+  }
+  finder_icons_pending = 1;
+  if (finder_selected < finder_scroll)
+    finder_set_scroll(finder_selected);
+  if (finder_selected >= finder_scroll + finder_rows)
+    finder_set_scroll(finder_selected - finder_rows + 1);
+  resizebarwin(selmon);
+  drawbars();
+  return 1;
+}
+
+static int finder_buttonpress(XButtonPressedEvent *ev) {
+  int row;
+  if (!finder_active)
+    return finder_active;
+  if (ev->button == Button4) {
+    finder_set_scroll(finder_scroll - 1);
+    finder_selected = MAX(finder_scroll, finder_selected - 1);
+    finder_dirty = 1;
+    finder_icons_pending = 1;
+    resizebarwin(selmon);
+    drawbars();
+    return 1;
+  }
+  if (ev->button == Button5) {
+    finder_set_scroll(finder_scroll + 1);
+    finder_selected = MIN(finder_scroll + finder_rows - 1, finder_selected + 1);
+    finder_dirty = 1;
+    finder_icons_pending = 1;
+    resizebarwin(selmon);
+    drawbars();
+    return 1;
+  }
+  if (ev->button != Button1)
+    return 1;
+  row = ev->y / MAX(1, bh);
+  if (row > 0 && row < finder_display_rows()) {
+    finder_selected = finder_scroll + row - 1;
+    finder_launch();
+  }
+  return 1;
+}
+
 static char *notify_strdup(const char *s) {
   return s ? strdup(s) : strdup("");
 }
@@ -2755,12 +4735,17 @@ static int notification_center_active(void) {
   return notify_active || notify_history_active;
 }
 
-static void notification_update_wm_class(Window win, int active, int history) {
+static void notification_update_wm_class(Window win, int active, int history,
+                                         int finder) {
   XClassHint ch;
 
   if (!win)
     return;
-  if (active) {
+  if (finder) {
+    ch.res_name = "finder";
+    ch.res_class = "finder";
+    XSetClassHint(dpy, win, &ch);
+  } else if (active) {
     ch.res_name = history ? "notification-history" : "notification";
     ch.res_class = "notify";
     XSetClassHint(dpy, win, &ch);
@@ -2994,7 +4979,7 @@ static unsigned int notification_body_lines(const char *text) {
   for (; *text; text++)
     if (*text == '\n')
       lines++;
-  return lines;
+  return MIN(lines, NOTIFY_BODY_MAX_LINES);
 }
 
 static unsigned int notification_content_height(Notification *n) {
@@ -3581,10 +5566,12 @@ static void notification_draw_text(int x, int y, int width, int bottom,
                                    const char *text) {
   char line[512], *p, *start;
   int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
+  unsigned int lines = 0;
   if (!text || !*text)
     return;
   start = (char *)text;
-  while (*start && y < bottom - NOTIFY_TEXT_BOTTOM_GAP) {
+  while (*start && y < bottom - NOTIFY_TEXT_BOTTOM_GAP &&
+         lines < NOTIFY_BODY_MAX_LINES) {
     p = strchr(start, '\n');
     if (p) {
       size_t len = MIN((size_t)(p - start), sizeof(line) - 1);
@@ -3597,7 +5584,89 @@ static void notification_draw_text(int x, int y, int width, int bottom,
     }
     drw_text(drw, x, y, width, line_h, 8, line, 0);
     y += line_h;
+    lines++;
   }
+}
+
+static void notification_draw_marquee_line(int x, int y, int width, int height,
+                                           int lpad, const char *text,
+                                           const struct timespec *started,
+                                           int scroll) {
+  unsigned int textw;
+  double elapsed, distance, period, phase;
+  int offset;
+
+  if (!text || !*text || width <= 0)
+    return;
+  textw = notification_text_width(text);
+  if (!scroll || textw <= (unsigned int)width) {
+    drw_text(drw, x, y, width, height, lpad, text, 0);
+    return;
+  }
+  elapsed = notification_elapsed(started);
+  if (elapsed < 0.7) {
+    drw_text(drw, x, y, width, height, lpad, text, 0);
+    return;
+  }
+  distance = textw - width + 24;
+  period = 2.0 * distance / 35.0;
+  phase = fmod(elapsed - 0.7, period);
+  offset = (int)(phase <= period / 2.0
+                     ? phase * 35.0
+                     : (period - phase) * 35.0);
+  drw_text_scroll_progress(drw, x, y, width, height, lpad, text,
+                           offset, 24, 0, NULL, NULL, 0);
+}
+
+static void notification_draw_marquee_text(int x, int y, int width, int bottom,
+                                           const char *text,
+                                           const struct timespec *started,
+                                           int scroll) {
+  char line[512], *p, *start;
+  int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
+  unsigned int lines = 0;
+
+  if (!text || !*text)
+    return;
+  start = (char *)text;
+  while (*start && y < bottom - NOTIFY_TEXT_BOTTOM_GAP &&
+         lines < NOTIFY_BODY_MAX_LINES) {
+    p = strchr(start, '\n');
+    if (p) {
+      size_t len = MIN((size_t)(p - start), sizeof(line) - 1);
+      memcpy(line, start, len);
+      line[len] = '\0';
+      start = p + 1;
+    } else {
+      strncpy(line, start, sizeof(line) - 1);
+      line[sizeof(line) - 1] = '\0';
+      start += strlen(start);
+    }
+    notification_draw_marquee_line(x, y, width, line_h, 8, line, started,
+                                   scroll);
+    y += line_h;
+    lines++;
+  }
+}
+
+static void notification_dim_image(Picture image, int x, int y,
+                                   unsigned int w, unsigned int h) {
+  Picture overlay;
+  XRenderColor color = { 0, 0, 0, 0x4000 };
+
+  /* Reuse drw->picture.  During the history foreground pass it is already
+   * bound to the temporary 32-bit ARGB pixmap; creating another picture from
+   * a visual can produce BadMatch when drawable depth and visual differ. */
+  if (!drw || !drw->picture || !image)
+    return;
+  overlay = XRenderCreateSolidFill(dpy, &color);
+  if (overlay)
+    /* Use the image alpha as the mask.  This darkens only visible pixels
+     * and leaves transparent pixels and the source alpha untouched. */
+    XRenderComposite(dpy, PictOpOver, overlay, image, drw->picture, 0, 0, 0,
+                     0, x, y, w, h);
+  if (overlay)
+    XRenderFreePicture(dpy, overlay);
 }
 
 static void notification_draw(void) {
@@ -3618,9 +5687,13 @@ static void notification_draw(void) {
   if (notify_hovered && n->image && n->action_count >= 2)
     controls_h += NOTIFY_IMAGE_BUTTON_GAP + 6;
   content_h = notify_height - controls_h;
-  XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
-                 notify_width, notify_height);
+  if (!notification_foreground_pass) {
+    XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
+    XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
+                   notify_width, notify_height);
+  }
+  if (notification_background_only)
+    return;
   if (n->image) {
     int image_x = 12;
     int image_y = (content_h - (int)n->image_h) / 2;
@@ -3641,12 +5714,23 @@ static void notification_draw(void) {
     summary_y = body_y = MAX(0, (content_h - (drw->fonts->h + 8)) / 2);
   }
   drw_setscheme(drw, notify_summary_scheme);
-  if (has_summary)
-    drw_text(drw, text_x, summary_y, text_w, drw->fonts->h + 8, 8,
-             n->summary, 0);
+  if (has_summary) {
+    if (notify_hovered)
+      notification_draw_marquee_line(text_x, summary_y, text_w,
+                                     drw->fonts->h + 8, 8, n->summary,
+                                     &notify_hover_started, 1);
+    else
+      drw_text(drw, text_x, summary_y, text_w, drw->fonts->h + 8, 8,
+               n->summary, 0);
+  }
   drw_setscheme(drw, notify_body_scheme);
-  if (has_body)
-    notification_draw_text(text_x, body_y, text_w, content_h, n->body);
+  if (has_body) {
+    if (notify_hovered)
+      notification_draw_marquee_text(text_x, body_y, text_w, content_h,
+                                     n->body, &notify_hover_started, 1);
+    else
+      notification_draw_text(text_x, body_y, text_w, content_h, n->body);
+  }
 
   memset(notify_action_x, 0, sizeof(notify_action_x));
   memset(notify_action_w, 0, sizeof(notify_action_w));
@@ -3700,9 +5784,13 @@ static void notification_history_draw(void) {
   notification_history_layout();
   for (n = notify_history_head; n && count < LENGTH(entries); n = n->next)
     entries[count++] = n;
-  XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
-                 notify_width, notify_height);
+  if (!notification_foreground_pass) {
+    XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
+    XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
+                   notify_width, notify_height);
+  }
+  if (notification_background_only)
+    return;
   for (index = 0; index < count; index++) {
     /* The newest notification is shown at the top. */
     n = entries[count - 1 - index];
@@ -3735,16 +5823,25 @@ static void notification_history_draw(void) {
       text_w = notify_width - text_x - 12;
       drw_pic(drw, 12, y + ((int)content_h - image_h) / 2,
               image_w, image_h, n->image);
+      if (!n->action_count || n->action_used)
+        notification_dim_image(
+            n->image, 12, y + ((int)content_h - image_h) / 2, image_w,
+            image_h);
     }
-    drw_setscheme(drw, notify_summary_scheme);
+    drw_setscheme(drw, !n->action_count || n->action_used
+                              ? notify_summary_dim_scheme
+                              : notify_summary_scheme);
     text_y = has_two_content ? y + 7 + NOTIFY_TEXT_TOP_OFFSET
                              : y + MAX(0, ((int)content_h -
                                            (drw->fonts->h + 8)) / 2);
     if (has_summary)
-      drw_text(drw, text_x, text_y, text_w,
-               drw->fonts->h + 6, 8,
-               n->summary, 0);
-    drw_setscheme(drw, notify_body_scheme);
+      notification_draw_marquee_line(text_x, text_y, text_w,
+                                     drw->fonts->h + 6, 8, n->summary,
+                                     &notify_history_hover_started,
+                                     notify_history_hover_entry == n);
+    drw_setscheme(drw, !n->action_count || n->action_used
+                            ? notify_body_dim_scheme
+                            : notify_body_scheme);
     action_y = entry_bottom - NOTIFY_ACTION_H;
     input_y = n->action_count > 2
                   ? action_y - NOTIFY_INPUT_ROW_H
@@ -3754,11 +5851,13 @@ static void notification_history_draw(void) {
       body_bottom = MIN(body_bottom, action_y - 4);
     if (n->input_enabled)
       body_bottom = MIN(body_bottom, input_y - 4);
-    notification_draw_text(text_x, has_two_content
-                                      ? y + 32 + NOTIFY_TEXT_TOP_OFFSET
-                                      : text_y,
-                           text_w,
-                           MIN(body_bottom, (int)notify_height), n->body);
+    notification_draw_marquee_text(text_x, has_two_content
+                                             ? y + 32 + NOTIFY_TEXT_TOP_OFFSET
+                                             : text_y,
+                                   text_w,
+                                   MIN(body_bottom, (int)notify_height),
+                                   n->body, &notify_history_hover_started,
+                                   notify_history_hover_entry == n);
     if (n->input_enabled) {
       notify_input_x = 8;
       notify_input_y = input_y;
@@ -3797,6 +5896,109 @@ static void notification_history_draw(void) {
                 notify_width - 8, entry_bottom - 1);
     }
   }
+}
+
+/* Render notification foreground separately, just like Finder.  The first
+ * pass supplies the fading panel; this pass supplies real ARGB glyph/icon
+ * pixels and is composited over it without any background halo. */
+static void notification_draw_foreground(int history)
+{
+  Drawable saved_drawable;
+  Picture saved_picture, picture, dest;
+  GC saved_gc, gc;
+  Visual *saved_visual;
+  Colormap saved_colormap;
+  int saved_no_background;
+  Pixmap pixmap;
+  XRenderPictFormat *format, *dest_format;
+  XRenderColor clear = { 0, 0, 0, 0 };
+
+  if (!finder_argb_visual || !notify_width || !notify_height)
+    return;
+  format = XRenderFindStandardFormat(dpy, PictStandardARGB32);
+  dest_format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+  if (!format || !dest_format)
+    return;
+  pixmap = XCreatePixmap(dpy, root, notify_width, notify_height, 32);
+  if (!pixmap)
+    return;
+  gc = XCreateGC(dpy, pixmap, 0, NULL);
+  picture = XRenderCreatePicture(dpy, pixmap, format, 0, NULL);
+  dest = XRenderCreatePicture(dpy, selmon->barcenterwin, dest_format, 0, NULL);
+  if (!gc || !picture || !dest) {
+    if (dest) XRenderFreePicture(dpy, dest);
+    if (picture) XRenderFreePicture(dpy, picture);
+    if (gc) XFreeGC(dpy, gc);
+    XFreePixmap(dpy, pixmap);
+    return;
+  }
+  XRenderFillRectangle(dpy, PictOpSrc, picture, &clear, 0, 0,
+                       notify_width, notify_height);
+  saved_drawable = drw->drawable;
+  saved_picture = drw->picture;
+  saved_gc = drw->gc;
+  saved_visual = drw->visual;
+  saved_colormap = drw->colormap;
+  saved_no_background = drw->no_background;
+  drw->drawable = pixmap;
+  drw->picture = picture;
+  drw->gc = gc;
+  drw->visual = finder_argb_visual;
+  drw->colormap = finder_argb_colormap;
+  drw->no_background = 1;
+  notification_foreground_pass = 1;
+  if (history)
+    notification_history_draw();
+  else
+    notification_draw();
+  notification_foreground_pass = 0;
+  drw->drawable = saved_drawable;
+  drw->picture = saved_picture;
+  drw->gc = saved_gc;
+  drw->visual = saved_visual;
+  drw->colormap = saved_colormap;
+  drw->no_background = saved_no_background;
+  XRenderComposite(dpy, PictOpOver, picture, None, dest, 0, 0, 0, 0,
+                    0, 0, notify_width, notify_height);
+  XRenderFreePicture(dpy, dest);
+  XRenderFreePicture(dpy, picture);
+  XFreeGC(dpy, gc);
+  XFreePixmap(dpy, pixmap);
+}
+
+/* Present the progressive background and transparent content layer without
+ * blocking the X server.  A server grab/synchronous round trip here makes
+ * marquee frames stall under load and prevents the compositor from keeping
+ * up with the animation. */
+static void notification_present_layers(int history)
+{
+  if (!selmon || !selmon->barcenterwin)
+    return;
+  map_center_window(selmon->barcenterwin, 0, 0, notify_width, notify_height,
+                    4);
+  notification_draw_foreground(history);
+  XFlush(dpy);
+}
+
+/* Marquee frames only change the notification center surface.  Avoid
+ * rebuilding and remapping the tags, title, keyboard, and status surfaces
+ * for every text-position update. */
+static void notification_redraw_center_only(void)
+{
+  int history;
+
+  if (!selmon || !selmon->barcenterwin || !notification_center_active())
+    return;
+  history = notify_history_active && !notify_active;
+  notification_background_only = 1;
+  if (history)
+    notification_history_draw();
+  else
+    notification_draw();
+  notification_background_only = 0;
+  /* Fade only the panel-colour pixels; text, images, and controls remain at
+   * fixed opacity. */
+  notification_present_layers(history);
 }
 
 static void notification_motion(XMotionEvent *ev) {
@@ -3883,6 +6085,7 @@ static void notification_history_motion(XMotionEvent *ev) {
       notify_history_hover_action != hover_action) {
     notify_history_hover_entry = n;
     notify_history_hover_action = hover_action;
+    clock_gettime(CLOCK_MONOTONIC, &notify_history_hover_started);
     drawbars();
   }
 }
@@ -4052,6 +6255,8 @@ static void notification_emit_closed(Notification *n, uint32_t reason) {
 
 static void notification_emit_action(Notification *n, const char *action) {
   DBusMessage *signal;
+  if (n)
+    n->action_used = 1;
   if (!notify_conn || !n || !action)
     return;
   signal = dbus_message_new_signal("/org/freedesktop/Notifications",
@@ -4069,6 +6274,8 @@ static void notification_emit_input(Notification *n) {
   DBusMessage *signal;
   const char *action;
   const char *text;
+  if (n)
+    n->action_used = 1;
   if (!notify_conn || !n || !n->input_action)
     return;
   action = n->input_action;
@@ -4228,6 +6435,22 @@ static void notification_dispatch(void) {
 }
 
 static void notification_tick(void) {
+  if ((notify_history_active && notify_history_hover_entry) || notify_hovered) {
+    struct timespec now;
+    long elapsed_ms;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    elapsed_ms = (now.tv_sec - notify_marquee_last_draw.tv_sec) * 1000L +
+                 (now.tv_nsec - notify_marquee_last_draw.tv_nsec) / 1000000L;
+    if (!notify_marquee_last_draw.tv_sec ||
+        elapsed_ms >= 1000 / NOTIFY_MARQUEE_FPS) {
+      notify_marquee_last_draw = now;
+      notification_redraw_center_only();
+    }
+  } else {
+    notify_marquee_last_draw.tv_sec = 0;
+    notify_marquee_last_draw.tv_nsec = 0;
+  }
   if (notify_transition_pending &&
       notification_elapsed(&notify_transition_started) >=
           NOTIFY_TRANSITION_MS / 1000.0) {
@@ -4398,7 +6621,8 @@ static void barwidths(Monitor *m, unsigned int *tw, unsigned int *tlw,
   /* Notifications participate in the bar layout and push the other bar
    * sections aside.  The visualizer is an overlay: its animated width must
    * not change the layout of the title, keyboard, or status sections. */
-   *cw = (notification_center_active() && m == selmon) ? notify_width : clockbar_cw;
+  *cw = finder_active && m == selmon ? finder_width :
+        ((notification_center_active() && m == selmon) ? notify_width : clockbar_cw);
   *kw = kblayoutwidth();
   *tw = tagsbarwidth(m);
   avail = (barW > *tw + *rw + *cw + *kw + 4 * bargap + stgap)
@@ -4409,13 +6633,119 @@ static void barwidths(Monitor *m, unsigned int *tw, unsigned int *tlw,
     *tlw = avail;
 }
 
+static void map_center_window(Window win, int x, int y, unsigned int w,
+                              unsigned int h, int fade) {
+  if (finder_argb_visual)
+    if (fade == 4)
+      drw_map_alpha_background(drw, win, finder_argb_visual, x, y, w, h,
+                               notify_bg.pixel);
+    else if (fade == 2)
+      drw_map_alpha_notification(drw, win, finder_argb_visual, x, y, w, h,
+                                 0);
+    else
+      drw_map_alpha(drw, win, finder_argb_visual, x, y, w, h, fade);
+  else
+    drw_map(drw, win, x, y, w, h);
+}
+
+static void finder_window_text_at(Window win, int x, int y, unsigned int w,
+                                  unsigned int h, const char *text, Clr *color,
+                                  Fnt *font, int centered) {
+  XftDraw *draw;
+  XGlyphInfo ext;
+  int tx, baseline;
+  if (!finder_argb_visual || !text || !*text || !font)
+    return;
+  draw = XftDrawCreate(dpy, win, finder_argb_visual, finder_argb_colormap);
+  if (!draw)
+    return;
+  XftTextExtentsUtf8(dpy, font->xfont, (const FcChar8 *)text,
+                     strlen(text), &ext);
+  tx = x + (centered && w > ext.xOff ? (int)(w - ext.xOff) / 2 : 0);
+  baseline = y + ((int)h - font->xfont->ascent - font->xfont->descent) / 2
+             + font->xfont->ascent;
+  XftDrawStringUtf8(draw, color, font->xfont, tx, baseline,
+                    (const FcChar8 *)text, strlen(text));
+  XftDrawDestroy(draw);
+}
+
+static void finder_window_text(Window win, int x, int y, unsigned int w,
+                               unsigned int h, const char *text, Clr *color,
+                               Fnt *font) {
+  finder_window_text_at(win, x, y, w, h, text, color, font, 1);
+}
+
+/* Draw the query centred like finder_window_text(), then append a blinking
+ * cursor after the text.  The text stays centred whether the cursor is shown
+ * or hidden, so it does not jitter on every blink. */
+static void finder_window_query(Window win, int x, int y, unsigned int w,
+                                unsigned int h, const char *text, Clr *color,
+                                Fnt *font, int cursor, size_t cursor_pos) {
+  XftDraw *draw;
+  XGlyphInfo ext, cursor_ext;
+  size_t len;
+  int tx, baseline, cursor_h, cursor_x;
+
+  if (!finder_argb_visual || !text || !*text || !font)
+    return;
+  draw = XftDrawCreate(dpy, win, finder_argb_visual, finder_argb_colormap);
+  if (!draw)
+    return;
+  len = strlen(text);
+  if (cursor_pos > len)
+    cursor_pos = len;
+  XftTextExtentsUtf8(dpy, font->xfont, (const FcChar8 *)text, len, &ext);
+  tx = x + (w > ext.xOff ? (int)(w - ext.xOff) / 2 : 0);
+  baseline = y + ((int)h - font->xfont->ascent - font->xfont->descent) / 2
+             + font->xfont->ascent;
+  XftDrawStringUtf8(draw, color, font->xfont, tx, baseline,
+                    (const FcChar8 *)text, len);
+  if (cursor) {
+    memset(&cursor_ext, 0, sizeof(cursor_ext));
+    if (cursor_pos > 0)
+      XftTextExtentsUtf8(dpy, font->xfont, (const FcChar8 *)text, cursor_pos,
+                         &cursor_ext);
+    cursor_x = tx + (int)cursor_ext.xOff + (cursor_pos == len ? 2 : 1);
+    cursor_h = (int)font->h;
+    if (cursor_h > (int)h)
+      cursor_h = (int)h;
+    if (cursor_h < 2)
+      cursor_h = 2;
+    XftDrawRect(draw, color, cursor_x,
+                y + ((int)h - cursor_h) / 2, 2, (unsigned int)cursor_h);
+  }
+  XftDrawDestroy(draw);
+}
+
+static void finder_window_icon(Window win, int x, int y, unsigned int w,
+                               unsigned int h, Picture icon) {
+  XRenderPictFormat *format;
+  Picture dest;
+  if (!finder_argb_visual || !icon)
+    return;
+  format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+  dest = format ? XRenderCreatePicture(dpy, win, format, 0, NULL) : None;
+  if (dest) {
+    XRenderComposite(dpy, PictOpOver, icon, None, dest, 0, 0, 0, 0,
+                     x, y, w, h);
+    XRenderFreePicture(dpy, dest);
+  }
+}
+
+static int finder_argb_error(Display *display, XErrorEvent *event) {
+  (void)display;
+  if (event->request_code == 1)
+    finder_argb_create_failed = 1;
+  return 0;
+}
+
 void drawbar(Monitor *m) {
   int y = borderpx;
   int bh_n = bh - borderpx * 2;
   int boxs = drw->fonts->h / 9;
   int boxw = drw->fonts->h / 6 + 2;
   int x, w;
-  unsigned int i, occ = 0, urg = 0;
+  unsigned int i, occ = 0;
   unsigned int tw, tlw, cw, kw, rw;
   Client *c;
 
@@ -4427,8 +6757,6 @@ void drawbar(Monitor *m) {
 
   for (c = m->clients; c; c = c->next) {
     occ |= (c->issticky ? c->oldtags : c->tags);
-    if (c->isurgent)
-      urg |= (c->issticky ? c->oldtags : c->tags);
   }
 
   barwidths(m, &tw, &tlw, &cw, &kw, &rw);
@@ -4444,7 +6772,7 @@ void drawbar(Monitor *m) {
     drw_setscheme(
         drw, scheme[occ & 1 << i ? (m->colorfultag ? tagschemes[i] : SchemeSel)
                                  : SchemeTag]);
-    drw_text(drw, x, y, w, bh_n, lrpad / 2, tags[i], urg & 1 << i);
+    drw_text(drw, x, y, w, bh_n, lrpad / 2, tags[i], 0);
     if (ulineall ||
         m->tagset[m->seltags] &
             1 << i) /* if there are conflicts, just move these lines directly
@@ -4486,28 +6814,187 @@ void drawbar(Monitor *m) {
 
   /* center bar: clock in normal mode, notification panel when active */
    notification_update_wm_class(m->barcenterwin,
-                               m == selmon && notification_center_active(),
-                               notify_history_active && !notify_active);
-   unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
-                                     : ((clockbar_dynw && !notify_clock_hovered &&
-                                         !fullscreen_st && m == selmon)
-                                           ? clockbar_dynw : cw);
-  unsigned int tcw = clockbar_cw;
-  XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, dcw, bh);
-   if (notify_active && m == selmon) {
-     notification_draw();
-     drw_map(drw, m->barcenterwin, 0, 0, notify_width, notify_height);
-   } else if (notify_history_active && m == selmon) {
-     notification_history_draw();
-     drw_map(drw, m->barcenterwin, 0, 0, notify_width, notify_height);
-  } else {
+                                 m == selmon && (notification_center_active() || finder_active),
+                                 notify_history_active && !notify_active,
+                                 m == selmon && finder_active);
+   /* Finder must override a notification that was already open. */
+   unsigned int dcw = (finder_active && m == selmon) ? finder_width
+                                      : ((notification_center_active() && m == selmon) ? notify_width
+                                       : ((clockbar_dynw && !notify_clock_hovered &&
+                                          m == selmon)
+                                             ? clockbar_dynw : cw));
+   unsigned int tcw = clockbar_cw;
+   XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
+   /* Finder owns several bar rows.  Clear the complete backing-surface area
+    * before drawing it; clearing only the normal bar height leaves stale
+    * pixels in the lower rows when the pointer is not generating expose
+    * events for the center window. */
+      XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, dcw,
+                    (finder_active && m == selmon)
+                        ? bh * finder_display_rows() + FINDER_EDGE : bh);
+      if (finder_active && m == selmon && finder_dirty) {
+         int row = 1;
+         Clr finder_row_scheme[3];
+         const char *query_display = finder_query[0] ? finder_query : clockstr;
+         unsigned int query_width = drw_fontset_getwidth(drw, query_display);
+         unsigned int query_pad = query_width < dcw - 2 * FINDER_EDGE
+                                      ? (dcw - 2 * FINDER_EDGE - query_width) / 2
+                                      : 0;
+          /* First map only opaque background rectangles.  Applying the
+           * gradient to the complete drw surface also fades glyphs and
+           * icons, so Finder's foreground is rendered directly into the
+           * ARGB window after this pass. */
+          if (finder_argb_visual) {
+            XSetForeground(drw->dpy, drw->gc, scheme[SchemeTitle][ColBg].pixel);
+            XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, dcw, bh);
+            XSetForeground(drw->dpy, drw->gc, scheme[SchemeNorm][ColBg].pixel);
+            XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, bh, dcw,
+                           bh * (finder_display_rows() - 1) + FINDER_EDGE);
+            map_center_window(m->barcenterwin, 0, 0, dcw,
+                              bh * finder_display_rows() + FINDER_EDGE, 3);
+            finder_window_query(m->barcenterwin, FINDER_EDGE, 0,
+                                dcw - 2 * FINDER_EDGE, bh, query_display,
+                                &scheme[SchemeTitle][ColFg], drw->fonts,
+                                finder_query[0] && finder_cursor_visible,
+                                finder_cursor);
+            if (finder_math_active) {
+              finder_window_text(m->barcenterwin, FINDER_EDGE, bh,
+                                 dcw - 2 * FINDER_EDGE, bh,
+                                 finder_math_result,
+                                 &scheme[SchemeTitle][ColFg],
+                                 finder_result_font ? finder_result_font : drw->fonts);
+            }
+            if (finder_math_help_active) {
+              for (i = 0; i < LENGTH(finder_math_help) &&
+                          row < finder_display_rows(); i++, row++)
+                finder_window_text_at(m->barcenterwin, FINDER_EDGE, row * bh,
+                                      dcw - 2 * FINDER_EDGE, bh,
+                                      finder_math_help[i], &finder_text_clr,
+                                      drw->fonts, 0);
+            }
+            for (i = (unsigned int)finder_scroll;
+                 !finder_math_active && !finder_math_help_active &&
+                 i < finder_visible && row < finder_display_rows();
+                 i++) {
+              FinderApp *app = &finder_apps[finder_order[i]];
+              finder_window_text_at(m->barcenterwin,
+                                     FINDER_EDGE + clockpad / 2 + 22 + FINDER_ICON_GAP,
+                                     row * bh, dcw, bh, app->name,
+                                      ((int)i == finder_selected)
+                                        ? &scheme[SchemeTitle][ColFg]
+                                        : &finder_text_clr,
+                                     drw->fonts, 0);
+              if (app->icon)
+                finder_window_icon(m->barcenterwin, FINDER_EDGE + clockpad / 2,
+                                   row * bh + (bh - 22) / 2, 22, 22,
+                                   app->icon);
+              row++;
+            }
+          } else {
+            drw_setscheme(drw, scheme[SchemeTitle]);
+            drw_text(drw, FINDER_EDGE, 0, dcw - 2 * FINDER_EDGE, bh,
+                     query_pad, query_display, 0);
+            if (finder_query[0] && finder_cursor_visible) {
+              XGlyphInfo cursor_ext;
+              size_t query_len = strlen(finder_query);
+              size_t cursor_pos = MIN(finder_cursor, query_len);
+              int cursor_h = (int)drw->fonts->h;
+              int cursor_x;
+
+              memset(&cursor_ext, 0, sizeof(cursor_ext));
+              if (cursor_pos > 0)
+                XftTextExtentsUtf8(dpy, drw->fonts->xfont,
+                                   (const FcChar8 *)finder_query, cursor_pos,
+                                   &cursor_ext);
+              cursor_x = FINDER_EDGE + (int)query_pad +
+                         (int)cursor_ext.xOff +
+                         (cursor_pos == query_len ? 2 : 1);
+              if (cursor_h > bh - 4)
+                cursor_h = bh - 4;
+              if (cursor_h < 2)
+                cursor_h = 2;
+              if (cursor_x + 2 <= (int)dcw - FINDER_EDGE)
+                drw_rect(drw, cursor_x, (bh - cursor_h) / 2, 2,
+                         (unsigned int)cursor_h, 1, 0);
+            }
+            if (finder_math_active) {
+              Fnt *saved_fonts = drw->fonts;
+              unsigned int result_width;
+              drw->fonts = finder_result_font ? finder_result_font : saved_fonts;
+              result_width = drw_fontset_getwidth(drw, finder_math_result);
+              unsigned int result_pad = result_width < dcw - 2 * FINDER_EDGE
+                                          ? (dcw - 2 * FINDER_EDGE - result_width) / 2
+                                          : 0;
+              drw_setscheme(drw, scheme[SchemeTitle]);
+              drw_text(drw, FINDER_EDGE, bh, dcw - 2 * FINDER_EDGE, bh,
+                       result_pad, finder_math_result, 0);
+              drw->fonts = saved_fonts;
+            }
+            if (finder_math_help_active) {
+              finder_row_scheme[ColFg] = finder_text_clr;
+              finder_row_scheme[ColBg] = scheme[SchemeNorm][ColBg];
+              finder_row_scheme[ColBorder] = scheme[SchemeNorm][ColBorder];
+              drw_setscheme(drw, finder_row_scheme);
+              for (i = 0; i < LENGTH(finder_math_help) &&
+                          row < finder_display_rows(); i++, row++)
+                drw_text(drw, 0, row * bh, dcw, bh, FINDER_EDGE,
+                         finder_math_help[i], 0);
+            }
+            for (i = (unsigned int)finder_scroll;
+                 !finder_math_active && !finder_math_help_active &&
+                 i < finder_visible && row < finder_display_rows();
+                 i++) {
+              FinderApp *app = &finder_apps[finder_order[i]];
+              finder_row_scheme[ColFg] = finder_text_clr;
+              finder_row_scheme[ColBg] = scheme[SchemeNorm][ColBg];
+              finder_row_scheme[ColBorder] = scheme[SchemeNorm][ColBorder];
+              if ((int)i == finder_selected)
+                finder_row_scheme[ColFg] = scheme[SchemeTitle][ColFg];
+              drw_setscheme(drw, finder_row_scheme);
+              drw_text(drw, 0, row * bh, dcw, bh,
+                       FINDER_EDGE + clockpad / 2 + 22 + FINDER_ICON_GAP,
+                       app->name, 0);
+              if (app->icon)
+                drw_pic(drw, FINDER_EDGE + clockpad / 2,
+                        row * bh + (bh - 22) / 2, 22, 22,
+                        app->icon);
+              row++;
+            }
+            map_center_window(m->barcenterwin, 0, 0, dcw,
+                              bh * finder_display_rows() + FINDER_EDGE, 3);
+          }
+          finder_marker(m, finder_visible_count() > finder_scroll &&
+                           finder_selected >= finder_scroll &&
+                           finder_selected < finder_scroll + finder_rows
+                             ? finder_selected - finder_scroll + 1 : 0);
+          finder_dirty = 0;
+     } else if (finder_active && m == selmon) {
+       /* The Finder surface is already current. Keep its marker and backing
+        * window untouched while the other bar sections continue updating. */
+         finder_marker(m, finder_visible_count() > finder_scroll &&
+                         finder_selected >= finder_scroll &&
+                        finder_selected < finder_scroll + finder_rows
+                           ? finder_selected - finder_scroll + 1 : 0);
+       } else if (notify_active && m == selmon) {
+        finder_marker(m, 0);
+        notification_background_only = 1;
+        notification_draw();
+        notification_background_only = 0;
+          notification_present_layers(0);
+       } else if (notify_history_active && m == selmon) {
+        finder_marker(m, 0);
+        notification_background_only = 1;
+        notification_history_draw();
+        notification_background_only = 0;
+          notification_present_layers(1);
+   } else {
+     finder_marker(m, 0);
     drw_setscheme(drw, scheme[m == selmon ? SchemeTitle : SchemeNorm]);
     drw_rect(drw, 0, borderpx, dcw, bh_n, 1, 1);
     drw_text(drw, dcw > tcw ? (int)((dcw - tcw) / 2) : 0,
              borderpx + vertpadbar / 2, tcw, bh - vertpadbar, clockpad, clockstr,
              0);
-    drw_map(drw, m->barcenterwin, 0, 0, dcw, bh);
+    map_center_window(m->barcenterwin, 0, 0, dcw, bh, 0);
   }
 
   /* center bar: keyboard layout */
@@ -4519,9 +7006,35 @@ void drawbar(Monitor *m) {
            kbstr, 0);
   drw_map(drw, m->barkbwin, 0, 0, kw, bh);
 
-  /* right bar: status produced by the lock-free worker */
-  drawstatusbar(m, bh_n, stext);
-  drw_map(drw, m->barrightwin, 0, 0, rw, bh);
+  drawrightbar(m, rw);
+}
+
+static void drawrightbar(Monitor *m, unsigned int rw) {
+  /* Keep the right/status surface independent from Finder's center surface.
+   * This lets status and MPRIS updates continue while Finder is open without
+   * redrawing or restacking the Finder. */
+  if (m == selmon && mpris_hovered && mpris_active) {
+    mpris_panel_draw(m, rw, bh * MPRIS_PANEL_HOVER_H);
+    /* Draw the normal status once, above the artwork.  Drawing it before
+     * the panel as well leaves stale glyphs visible through transparent
+     * gaps between ^b status segments. */
+    drawstatusbar(m, bh - borderpx * 2, stext);
+    drw_map(drw, m->barrightwin, 0, 0, rw, bh * MPRIS_PANEL_HOVER_H);
+  } else {
+    if (m->mpris_volume_markerwin)
+      XUnmapWindow(dpy, m->mpris_volume_markerwin);
+    drawstatusbar(m, bh - borderpx * 2, stext);
+    drw_map(drw, m->barrightwin, 0, 0, rw, bh);
+  }
+}
+
+static void drawrightbar_only(void) {
+  if (!selmon || !selmon->barrightwin)
+    return;
+  /* Recompute the right-bar geometry for status strings whose width changed,
+   * but leave Finder's center surface and marker untouched. */
+  resizebarwin(selmon);
+  drawrightbar(selmon, statuswidth(stext));
 }
 
 static uint32_t prealpha(uint32_t p) {
@@ -4914,6 +7427,23 @@ void enternotify(XEvent *e) {
   Monitor *m;
   XCrossingEvent *ev = &e->xcrossing;
 
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    if (!mpris_marker_pressed && !mpris_marker_hovered) {
+      mpris_marker_hovered = 1;
+      drawbars();
+    }
+    return;
+  }
+
+  if (ev->window == selmon->barrightwin) {
+    if (mpris_active && !mpris_hovered) {
+      mpris_hovered = 1;
+		  drawbars();
+      resizebarwin(selmon);
+    }
+    return;
+  }
+
   if (ev->window == selmon->barcenterwin) {
     if (!notification_center_active() &&
         !notification_clock_hit(ev->x,
@@ -4941,6 +7471,36 @@ void enternotify(XEvent *e) {
 
 static void leavenotify(XEvent *e) {
   XCrossingEvent *ev = &e->xcrossing;
+
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    mpris_marker_pressed = 0;
+    mpris_marker_hovered = 0;
+    if (mpris_pointer_over_bar(selmon))
+      return;
+    if (mpris_volume_drag)
+      return;
+    mpris_volume_drag = 0;
+    if (mpris_hovered) {
+      mpris_hovered = 0;
+      drawbars();
+      resizebarwin(selmon);
+    }
+    return;
+  }
+
+  if (ev->window == selmon->barrightwin) {
+    if (mpris_active && mpris_pointer_over_marker(selmon))
+      return;
+    if (mpris_volume_drag)
+      return;
+    mpris_volume_drag = 0;
+    if (mpris_hovered) {
+      mpris_hovered = 0;
+      drawbars();
+      resizebarwin(selmon);
+    }
+    return;
+  }
 
   if (ev->window == selmon->barcenterwin) {
     notify_clock_hovered = 0;
@@ -5307,6 +7867,8 @@ void keypress(XEvent *e) {
 
   /* only KeyPress triggers normal keybindings (avoid double-fire on KeyRelease) */
   if (ev->type != KeyPress)
+    return;
+  if (finder_keypress(ev))
     return;
   if (notification_input_keypress(ev))
     return;
@@ -5863,6 +8425,29 @@ void motionnotify(XEvent *e) {
   Monitor *m;
   XMotionEvent *ev = &e->xmotion;
 
+  if (finder_active) {
+    finder_motion(ev);
+    return;
+  }
+
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    XMotionEvent forwarded = *ev;
+    Window child;
+    XTranslateCoordinates(dpy, root, selmon->barrightwin,
+                          ev->x_root, ev->y_root, &forwarded.x,
+                          &forwarded.y, &child);
+    forwarded.window = selmon->barrightwin;
+    if (mpris_hovered && mpris_active)
+      mpris_panel_motion(&forwarded);
+    return;
+  }
+
+  if (ev->window == selmon->barrightwin) {
+    if (mpris_hovered && mpris_active && ev->y >= bh)
+      mpris_panel_motion(ev);
+    return;
+  }
+
   if (ev->window == selmon->barcenterwin) {
     if (!notification_center_active() &&
         !notification_clock_hit(ev->x,
@@ -6023,7 +8608,7 @@ static void on_process(void *userdata) {
     return;
   }
    /* frozen in fullscreen: node stays connected, no peak is computed */
-    if (fullscreen_st || notification_center_active()) {
+      if (fullscreen_st || notification_center_active() || finder_active) {
     clockbar_peak = 0.0f;
     pw_stream_queue_buffer(sound_stream, b);
     return;
@@ -6076,6 +8661,10 @@ static void *clock_draw_loop(void *data) {
 
     if (notification_center_active()) {
       clockbar_dynw = notify_width;
+      continue;
+    }
+    if (finder_active) {
+      clockbar_dynw = 0;
       continue;
     }
 
@@ -6638,6 +9227,8 @@ void resizebarwin(Monitor *m) {
       XMoveResizeWindow(dpy, m->barkbwin, m->wx, m->by, 1, bh);
     if (m->barrightwin)
       XMoveResizeWindow(dpy, m->barrightwin, m->wx, m->by, 1, bh);
+    if (m->mpris_volume_markerwin)
+      XUnmapWindow(dpy, m->mpris_volume_markerwin);
     if (m == selmon)
       clockbar_win = 0;
     return;
@@ -6653,11 +9244,13 @@ void resizebarwin(Monitor *m) {
 	if (!kw) kw = 1;
 	if (!rw) rw = 1;
 	{
-   unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
-                                     : ((clockbar_dynw && !notify_clock_hovered &&
-                                         !fullscreen_st && m == selmon)
-                                           ? clockbar_dynw : cw);
-	   unsigned int fcw = (notification_center_active() && m == selmon) ? notify_width : clockbar_cw;
+   unsigned int dcw = (finder_active && m == selmon) ? finder_width :
+                                      ((notification_center_active() && m == selmon) ? notify_width
+                                       : ((clockbar_dynw && !notify_clock_hovered &&
+                                          !fullscreen_st && m == selmon)
+                                            ? clockbar_dynw : cw));
+   unsigned int fcw = (finder_active && m == selmon) ? finder_width :
+                      ((notification_center_active() && m == selmon) ? notify_width : clockbar_cw);
 	   if (!dcw) dcw = 1;
 	   if (!fcw) fcw = 1;
 
@@ -6691,7 +9284,8 @@ void resizebarwin(Monitor *m) {
         cx = clock_cx - (int)(fcw + 2 * bargap) / 2;
       }
       int center_y = m->by;
-       unsigned int center_h = (notification_center_active() && m == selmon) ? notify_height : bh;
+        unsigned int center_h = (finder_active && m == selmon) ? bh * finder_display_rows() + FINDER_EDGE :
+                               ((notification_center_active() && m == selmon) ? notify_height : bh);
       if (m->barcenterwin) {
         XMoveResizeWindow(dpy, m->barcenterwin,
                           cx + (int)(fcw + 2 * bargap) / 2 - (int)dcw / 2,
@@ -6700,9 +9294,12 @@ void resizebarwin(Monitor *m) {
         /* Keep the center window above fullscreen clients as soon as the
          * fullscreen transition lays it out.  The visualizer also needs to
          * stay above the neighboring bar sections while it grows. */
-           if (notification_center_active() ||
-               (clockbar_dynw && !fullscreen_st))
-            XRaiseWindow(dpy, m->barcenterwin);
+             if ((finder_active && m == selmon && finder_dirty) ||
+                (notification_center_active() &&
+                 !(m == selmon && mpris_hovered && mpris_active)) ||
+               (clockbar_dynw && !fullscreen_st &&
+                !(m == selmon && mpris_hovered && mpris_active)))
+             XRaiseWindow(dpy, m->barcenterwin);
            else if (fullscreen_st && m == selmon && m->sel &&
                     m->sel->isfullscreen) {
              /* The notification center uses this same X window and is raised
@@ -6731,8 +9328,25 @@ void resizebarwin(Monitor *m) {
   }
 
   if (m->barrightwin) {
-    XMoveResizeWindow(dpy, m->barrightwin, rx, m->by, rw, bh);
+    XMoveResizeWindow(dpy, m->barrightwin, rx, m->by, rw,
+                      (m == selmon && mpris_hovered && mpris_active)
+                           ? bh * MPRIS_PANEL_HOVER_H : bh);
     XMapWindow(dpy, m->barrightwin);
+    restack_mpris_panel(m);
+  }
+
+  /* Mapping the neighboring bar windows can put them above a center window
+   * which was just opened.  Finder must remain above those windows even when
+   * the pointer is elsewhere, so do the final raise after all bar sections
+   * have been mapped. */
+   if (m->barcenterwin && finder_active && m == selmon && finder_dirty) {
+    XRaiseWindow(dpy, m->barcenterwin);
+    if (m->finder_markerwin && m->finder_marker_mapped) {
+      /* The center window was just raised, so restore the marker's position
+       * once. Do not restack it during ordinary Finder redraws. */
+      XRaiseWindow(dpy, m->finder_markerwin);
+      m->finder_marker_stacked = 1;
+    }
   }
 }
 
@@ -7039,6 +9653,7 @@ void run(void) {
   int xfd = ConnectionNumber(dpy);
   int timeout;
   const int clockbar_timeout = 1000 / DRAW_FPS;
+  const int notify_marquee_timeout = 1000 / NOTIFY_MARQUEE_FPS;
   time_t next_clock_update = 0;
   struct pollfd pfd[3] = {{.fd = xfd, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
@@ -7053,10 +9668,22 @@ void run(void) {
     time_t minimize_deadline = next_minimize_deadline();
     time_t next_deadline = now - now % 60 + 60;
 
+    if (finder_active && finder_loading) {
+      finder_load_apps();
+      finder_loading = 0;
+      finder_icons_pending = 1;
+      finder_dirty = 1;
+    } else if (finder_active && finder_icons_pending) {
+      if (!finder_load_next_icon())
+        finder_icons_pending = 0;
+      else
+        finder_dirty = 1;
+    }
+
     if (minimize_deadline && minimize_deadline < next_deadline)
       next_deadline = minimize_deadline;
     timeout = next_deadline > now ? (int)((next_deadline - now) * 1000) : 0;
-    if (CLOCK_ANIMATE && timeout > clockbar_timeout)
+    if (CLOCK_ANIMATE && !fullscreen_st && timeout > clockbar_timeout)
       timeout = clockbar_timeout;
     if (notify_current && timeout > 100)
       timeout = 100;
@@ -7066,8 +9693,23 @@ void run(void) {
         notify_history_scroll != notify_history_scroll_target &&
         timeout > clockbar_timeout)
       timeout = clockbar_timeout;
-    if (mpris_active && timeout > clockbar_timeout)
+    if ((notify_hovered ||
+         (notify_history_active && notify_history_hover_entry)) &&
+        timeout > notify_marquee_timeout)
+      timeout = notify_marquee_timeout;
+    if (mpris_active && !fullscreen_st && timeout > clockbar_timeout)
       timeout = clockbar_timeout;
+    if (hasurgentclients() && timeout > 300)
+      timeout = 300;
+    if (finder_active && (finder_loading || finder_icons_pending))
+      timeout = 0;
+    if (finder_active && finder_query[0]) {
+      uint64_t elapsed = finder_monotonic_ms() - finder_cursor_base_ms;
+      uint64_t wait = FINDER_CURSOR_BLINK_MS -
+                      elapsed % FINDER_CURSOR_BLINK_MS;
+      if (timeout > (int)wait)
+        timeout = (int)wait;
+    }
     pfd[1].fd = notify_fd;
     pfd[2].fd = status_event_fd;
     poll(pfd, status_event_fd >= 0 ? 3 : (notify_fd >= 0 ? 2 : 1), timeout);
@@ -7075,15 +9717,53 @@ void run(void) {
       notification_dispatch();
     if (status_event_fd >= 0 && (pfd[2].revents & POLLIN))
       status_consume();
+    {
+      struct timespec now_mono;
+      int urgent_redraw = 0;
+
+      clock_gettime(CLOCK_MONOTONIC, &now_mono);
+      if (hasurgentclients()) {
+        long elapsed_ms = (now_mono.tv_sec - urgentflash_last.tv_sec) * 1000L +
+                          (now_mono.tv_nsec - urgentflash_last.tv_nsec) / 1000000L;
+        if (!urgentflash_last.tv_sec || elapsed_ms >= 300) {
+          urgentflash = !urgentflash;
+          urgentflash_last = now_mono;
+          updateurgentborders();
+          urgent_redraw = 1;
+        }
+      } else {
+        urgentflash = 1;
+        urgentflash_last.tv_sec = 0;
+        urgentflash_last.tv_nsec = 0;
+      }
+      if (urgent_redraw)
+        bar_dirty = 1;
+    }
     if (CLOCK_ANIMATE)
       updateclockbar();
+    if (finder_active && finder_query[0]) {
+      int visible = finder_cursor_state();
+      if (visible != finder_cursor_visible) {
+        finder_cursor_visible = visible;
+        finder_dirty = 1;
+      }
+    }
     {
       int redraw = bar_dirty;
       bar_dirty = 0;
       if (update_mpris_scroll())
         redraw = 1;
-      if (redraw)
-      drawbars();
+      /* Lazy icon decoding marks Finder dirty without touching bar_dirty.  A
+       * full draw is required to show the newly decoded icon; only status or
+       * MPRIS-only updates may use the right-bar fast path. */
+      if (finder_active && finder_dirty)
+        redraw = 1;
+      if (redraw) {
+        if (finder_active && !finder_dirty)
+          drawrightbar_only();
+        else
+          drawbars();
+      }
 	    }
 	    if (!mpris_active) {
 			mpris_scroll_clock_valid = 0;
@@ -7827,9 +10507,41 @@ void setup(void) {
   sw = DisplayWidth(dpy, screen);
   sh = DisplayHeight(dpy, screen);
   root = RootWindow(dpy, screen);
+  {
+    XVisualInfo template = {0}, *visuals;
+    int nvisuals, i;
+    template.screen = screen;
+    template.depth = 32;
+    template.class = TrueColor;
+    visuals = XGetVisualInfo(dpy, VisualScreenMask | VisualDepthMask |
+                             VisualClassMask, &template, &nvisuals);
+    for (i = 0; visuals && i < nvisuals; i++) {
+      XRenderPictFormat *format = XRenderFindVisualFormat(dpy,
+                                                           visuals[i].visual);
+      if (format && format->type == PictTypeDirect &&
+          format->direct.alphaMask) {
+        finder_argb_visual = visuals[i].visual;
+        finder_argb_depth = visuals[i].depth;
+        finder_argb_colormap = XCreateColormap(dpy, root,
+                                               finder_argb_visual, AllocNone);
+        break;
+      }
+    }
+    if (visuals)
+      XFree(visuals);
+  }
   drw = drw_create(dpy, screen, root, sw, sh);
   if (!drw_fontset_create(drw, fonts, LENGTH(fonts)))
     die("no fonts could be loaded.");
+  {
+    Fnt *normal_fonts = drw->fonts;
+    const char *result_fonts[] = {
+      "Iosevka Medium:style:medium:size=16"
+    };
+    finder_result_font = drw_fontset_create(drw, result_fonts,
+                                            LENGTH(result_fonts));
+    drw->fonts = normal_fonts;
+  }
   lrpad = drw->fonts->h;
   bh = drw->fonts->h + 2 + vertpadbar + borderpx * 2;
   th = vertpadtab;
@@ -7894,12 +10606,16 @@ void setup(void) {
   scheme[LENGTH(colors)] = drw_scm_create(drw, colors[0], 3);
   for (i = 0; i < LENGTH(colors); i++)
     scheme[i] = drw_scm_create(drw, colors[i], 3);
-  drw_clr_create(drw, &clrborder, col_borderbar);
-  drw_clr_create(drw, &mpris_scroll_bg_clr, "#a6da95");
-  drw_clr_create(drw, &mpris_progress_clr, "#B8E9B4");
-  drw_clr_create(drw, &notify_bg, "#1E1D2D");
-  drw_clr_create(drw, &notify_fg, "#FFFFFF");
-  drw_clr_create(drw, &notify_body, "#CDD6F4");
+   drw_clr_create(drw, &clrborder, col_borderbar);
+     /* Keep the unplayed portion darker than the light-green progress fill. */
+     drw_clr_create(drw, &mpris_scroll_bg_clr, "#A6DA95");
+   drw_clr_create(drw, &mpris_progress_clr, "#B8E9B4");
+   drw_clr_create(drw, &mpris_volume_fill_clr, "#FFFFFF");
+   drw_clr_create(drw, &mpris_volume_empty_clr, "#777777");
+   drw_clr_create(drw, &notify_bg, "#1E1D2D");
+    drw_clr_create(drw, &notify_fg, "#FFFFFF");
+    drw_clr_create(drw, &notify_body, "#CDD6F4");
+    drw_clr_create(drw, &finder_text_clr, finder_text);
   {
     Clr control, control_hover, action_text;
     drw_clr_create(drw, &control, "#363449");
@@ -7928,6 +10644,12 @@ void setup(void) {
   notify_body_scheme[ColFg] = notify_body;
   notify_body_scheme[ColBg] = notify_bg;
   notify_body_scheme[ColBorder] = notify_bg;
+  drw_clr_create(drw, &notify_summary_dim_scheme[ColFg], "#B0B9D2");
+  drw_clr_create(drw, &notify_summary_dim_scheme[ColBg], "#1E1D2D");
+  drw_clr_create(drw, &notify_summary_dim_scheme[ColBorder], "#1E1D2D");
+  drw_clr_create(drw, &notify_body_dim_scheme[ColFg], "#929CB8");
+  drw_clr_create(drw, &notify_body_dim_scheme[ColBg], "#1E1D2D");
+  drw_clr_create(drw, &notify_body_dim_scheme[ColBorder], "#1E1D2D");
   /* init system tray */
   updatesystray();
   /* init bars */
@@ -7988,6 +10710,49 @@ void seturgent(Client *c, int urg) {
   wmh->flags = urg ? (wmh->flags | XUrgencyHint) : (wmh->flags & ~XUrgencyHint);
   XSetWMHints(dpy, c->win, wmh);
   XFree(wmh);
+}
+
+static int hasurgentclients(void) {
+  Monitor *m;
+  Client *c;
+
+  for (m = mons; m; m = m->next)
+    for (c = m->clients; c; c = c->next)
+      if (c->isurgent)
+        return 1;
+  return 0;
+}
+
+static void demandattention(Client *c) {
+  Arg a;
+
+  if (!c)
+    return;
+  if (!c->isurgent)
+    seturgent(c, 1);
+
+  XSetWindowBorder(dpy, c->win,
+                   urgentflash ? scheme[SchemeSel][ColBorder].pixel
+                               : scheme[SchemeNorm][ColBorder].pixel);
+
+  /* Show the client's tag(s), but deliberately leave the focused client
+   * unchanged.  The user can focus the requesting client when ready. */
+  a.ui = c->tags & TAGMASK;
+  if (a.ui)
+    view(&a);
+  drawbars();
+}
+
+static void updateurgentborders(void) {
+  Monitor *m;
+  Client *c;
+
+  for (m = mons; m; m = m->next)
+    for (c = m->clients; c; c = c->next)
+      if (c->isurgent)
+        XSetWindowBorder(dpy, c->win,
+                         urgentflash ? scheme[SchemeSel][ColBorder].pixel
+                                     : scheme[SchemeNorm][ColBorder].pixel);
 }
 
 void show(Client *c) {
@@ -8441,10 +11206,13 @@ void updatebars(void) {
   XSetWindowAttributes wa = {.override_redirect = True,
                              .background_pixmap = ParentRelative,
                              .event_mask = ButtonPressMask | KeyPressMask |
-                                           ExposureMask | PointerMotionMask |
+                              ExposureMask | PointerMotionMask | ButtonReleaseMask |
                                            EnterWindowMask | LeaveWindowMask};
 
   XClassHint ch = {"dwm", "dwm"};
+  XClassHint marker_ch = {"dwm-mpris-volume-marker",
+                          "dwm-mpris-volume-marker"};
+  XClassHint finder_marker_ch = {"dwm-finder-marker", "dwm-finder-marker"};
   for (m = mons; m; m = m->next) {
     if (m->barwin)
       continue;
@@ -8464,10 +11232,48 @@ void updatebars(void) {
     XDefineCursor(dpy, m->bartitlewin, cursor[CurNormal]->cursor);
     XUnmapWindow(dpy, m->bartitlewin);
     XSetClassHint(dpy, m->bartitlewin, &ch);
-    m->barcenterwin = XCreateWindow(
-        dpy, root, m->wx, m->by, 1, bh, 0, DefaultDepth(dpy, screen),
-        CopyFromParent, DefaultVisual(dpy, screen),
-        CWOverrideRedirect | CWBackPixmap | CWEventMask, &wa);
+    {
+      XSetWindowAttributes cwa = {0};
+      unsigned long cmask = CWOverrideRedirect | CWEventMask;
+      int depth = DefaultDepth(dpy, screen);
+      Visual *visual = DefaultVisual(dpy, screen);
+      if (finder_argb_visual) {
+        cwa.background_pixel = 0;
+        cwa.border_pixel = 0;
+        cwa.colormap = finder_argb_colormap;
+        cmask |= CWColormap | CWBackPixel | CWBorderPixel;
+        depth = finder_argb_depth;
+        visual = finder_argb_visual;
+      } else {
+        cwa.background_pixmap = ParentRelative;
+        cmask |= CWBackPixmap;
+      }
+      cwa.override_redirect = True;
+      cwa.event_mask = wa.event_mask;
+      if (finder_argb_visual)
+        finder_argb_create_failed = 0;
+      if (finder_argb_visual)
+        XSetErrorHandler(finder_argb_error);
+      m->barcenterwin = XCreateWindow(dpy, root, m->wx, m->by, 1, bh, 0,
+                                      depth, InputOutput, visual, cmask,
+                                      &cwa);
+      XSync(dpy, False);
+      if (finder_argb_visual)
+        XSetErrorHandler(xerror);
+      if (finder_argb_create_failed && finder_argb_visual) {
+        finder_argb_visual = NULL;
+        finder_argb_depth = 0;
+        if (finder_argb_colormap) {
+          XFreeColormap(dpy, finder_argb_colormap);
+          finder_argb_colormap = None;
+        }
+        cwa = wa;
+        cmask = CWOverrideRedirect | CWBackPixmap | CWEventMask;
+        m->barcenterwin = XCreateWindow(dpy, root, m->wx, m->by, 1, bh, 0,
+                                        DefaultDepth(dpy, screen), InputOutput,
+                                        DefaultVisual(dpy, screen), cmask, &cwa);
+      }
+    }
     XDefineCursor(dpy, m->barcenterwin, cursor[CurNormal]->cursor);
     XUnmapWindow(dpy, m->barcenterwin);
     XSetClassHint(dpy, m->barcenterwin, &ch);
@@ -8485,6 +11291,41 @@ void updatebars(void) {
     XDefineCursor(dpy, m->barrightwin, cursor[CurNormal]->cursor);
     XUnmapWindow(dpy, m->barrightwin);
     XSetClassHint(dpy, m->barrightwin, &ch);
+    {
+      XSetWindowAttributes mwa = {
+        .override_redirect = True,
+        .background_pixel = mpris_volume_fill_clr.pixel,
+        .border_pixel = 0,
+        .event_mask = ButtonPressMask | ButtonReleaseMask |
+                      PointerMotionMask | EnterWindowMask | LeaveWindowMask
+      };
+      m->mpris_volume_markerwin = XCreateWindow(
+          dpy, root, 0, 0, 24, 16, 0, DefaultDepth(dpy, screen),
+          CopyFromParent, DefaultVisual(dpy, screen),
+          CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask,
+          &mwa);
+      XSetClassHint(dpy, m->mpris_volume_markerwin, &marker_ch);
+      XStoreName(dpy, m->mpris_volume_markerwin, "dwm-mpris-volume-marker");
+      XUnmapWindow(dpy, m->mpris_volume_markerwin);
+    }
+    /* Keep Finder's selection indicator in its own fixed native X11 window.
+     * It is 300x38 pixels and pointer motion never changes the selection. */
+    {
+      XSetWindowAttributes fwa = {
+        .override_redirect = True,
+        .background_pixel = scheme[SchemeTitle][ColFg].pixel,
+        .border_pixel = 0,
+        .event_mask = 0
+      };
+      m->finder_markerwin = XCreateWindow(
+          dpy, root, 0, 0, 300, 38, 0, DefaultDepth(dpy, screen),
+          CopyFromParent, DefaultVisual(dpy, screen),
+          CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask,
+          &fwa);
+      XSetClassHint(dpy, m->finder_markerwin, &finder_marker_ch);
+      XStoreName(dpy, m->finder_markerwin, "dwm-finder-marker");
+      XUnmapWindow(dpy, m->finder_markerwin);
+    }
     /* keep the clock above the status bar so the animation can grow over it */
     {
       XWindowChanges wc = {0};
@@ -9059,6 +11900,7 @@ int main(int argc, char *argv[]) {
     die("dwm: cannot open display");
   checkotherwm();
   setup();
+  finder_load_recent();
 #ifdef __OpenBSD__
   if (pledge("stdio rpath proc exec", NULL) == -1)
     die("pledge");

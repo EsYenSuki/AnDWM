@@ -24,6 +24,16 @@ static const int horizpadbar        = 6;
 static const int vertpadbar         = 12;
 static const int bargap             = 10;   /* space between the bars */
 static const int clockpad           = 24;   /* space before/after the clock text */
+static const int finder_width       = 300;  /* center finder width */
+static const int finder_rows        = 10;   /* number of applications shown */
+static const char *finder_app_dirs[] = {
+    "~/.local/share/applications",
+    "/usr/local/share/applications",
+    "/usr/share/applications",
+    "~/.local/share/flatpak/exports/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+    NULL,
+};
 static const int kblayoutpad        = 17;   /* padding inside the keyboard layout bar */
 static const int vertpadtab         = 35;
 static const int horizpadtabi       = 16;
@@ -184,7 +194,7 @@ static const Key keys[] = {
 
     // screenshot fullscreen and cropped
     { MODKEY|ShiftMask,     		    XK_s,       spawn,          SHCMD("/home/Hi/.config/AnDWM/scripts/bin/znap") },
-    { MODKEY,                           XK_a,       spawn,          SHCMD("rofi -show drun -theme /home/Hi/.config/AnDWM/rofi/config.rasi") },
+    { MODKEY,                           XK_a,       finder,         {0} },
     { MODKEY,                           XK_Return,  spawn,          SHCMD("kitty") },
     { MODKEY,                           XK_e,       spawn,          SHCMD("nemo") },
     { MODKEY,                           XK_b,       spawn,          SHCMD("MOZ_X11_EGL=1 MOZ_USE_XINPUT2=1 zen-browser") },
