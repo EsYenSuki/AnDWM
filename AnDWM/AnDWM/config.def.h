@@ -34,6 +34,7 @@ static const char *finder_app_dirs[] = {
     "/var/lib/flatpak/exports/share/applications",
     NULL,
 };
+static const int notification_gl    = 1;   /* 1: use OpenGL GPU acceleration for notification and history, 0: use XRender fallback */
 static const int kblayoutpad        = 17;   /* padding inside the keyboard layout bar */
 static const int vertpadtab         = 35;
 static const int horizpadtabi       = 16;

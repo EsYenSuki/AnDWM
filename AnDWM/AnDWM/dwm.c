@@ -102,10 +102,8 @@ sendn(const char *msg)
 #define NOTIFY_MAX_W     300
 #define NOTIFY_IMAGE_RADIUS 16
 #define NOTIFY_MAX_TEXT  4096
-#define NOTIFY_ACTION_H  30
-#define NOTIFY_INPUT_ROW_H 30
-#define NOTIFY_BUTTON_H (NOTIFY_ACTION_H - 6)
-#define NOTIFY_BUTTON_ROW_H NOTIFY_ACTION_H
+#define NOTIFY_INPUT_ROW_H 0
+#define NOTIFY_BUTTON_H 100
 #define NOTIFY_BODY_LINE_GAP 0
 #define NOTIFY_BODY_MAX_LINES 4
 #define NOTIFY_ACTION_X  12
@@ -199,6 +197,8 @@ struct Notification {
   Picture image;
   unsigned int image_w, image_h;
   int image_hint;
+  uint32_t *img_pixels;
+  unsigned int img_w, img_h;
   int action_used;
   struct timespec shown_at;
   Notification *next;
@@ -1821,7 +1821,7 @@ static int screen;
 static int sw, sh; /* X display screen geometry width, height */
 static int bh;     /* bar height */
 static int th = 0; /* tab bar geometry */
-static int lrpad;  /* sum of left and right padding for text */
+static int lrpad;  /* sum of left and right  for text */
 static int (*xerrorxlib)(Display *, XErrorEvent *);
 static unsigned int numlockmask = 0;
 static Time last_ev_time;
@@ -4683,6 +4683,7 @@ static void notification_free(Notification *n) {
   free(n->input_action);
   free(n->input_placeholder);
   free(n->input_text);
+  free(n->img_pixels);
   if (n->image)
     XRenderFreePicture(dpy, n->image);
   free(n);
@@ -4702,6 +4703,9 @@ static void notification_free_contents(Notification *n) {
   free(n->input_action);
   free(n->input_placeholder);
   free(n->input_text);
+  free(n->img_pixels);
+  n->img_pixels = NULL;
+  n->img_w = n->img_h = 0;
   if (n->image)
     XRenderFreePicture(dpy, n->image);
   n->app_name = n->summary = n->body = n->icon = NULL;
@@ -4732,7 +4736,7 @@ static void notification_history_clear_controls(Notification *n) {
 }
 
 static int notification_center_active(void) {
-  return notify_active || notify_history_active;
+  return 0;
 }
 
 static void notification_update_wm_class(Window win, int active, int history,
@@ -4909,6 +4913,13 @@ static void notification_load_image(Notification *n, const char *path) {
         drw_picture_create_resized(drw, (char *)data, w, h, dw, dh), dw, dh);
     n->image_w = dw;
     n->image_h = dh;
+
+    n->img_pixels = ecalloc((size_t)w * h, sizeof(uint32_t));
+    if (n->img_pixels) {
+      memcpy(n->img_pixels, data, (size_t)w * h * sizeof(uint32_t));
+      n->img_w = w;
+      n->img_h = h;
+    }
   }
   if (imlib_context_get_image())
     imlib_free_image();
@@ -4943,6 +4954,13 @@ static void notification_load_image_data(Notification *n, int w, int h,
         dh);
     n->image_w = dw;
     n->image_h = dh;
+
+    n->img_pixels = ecalloc((size_t)w * h, sizeof(uint32_t));
+    if (n->img_pixels) {
+      memcpy(n->img_pixels, pixels, (size_t)w * h * sizeof(uint32_t));
+      n->img_w = w;
+      n->img_h = h;
+    }
   }
   n->image_hint = 1;
   free(pixels);
@@ -4982,6 +5000,17 @@ static unsigned int notification_body_lines(const char *text) {
   return MIN(lines, NOTIFY_BODY_MAX_LINES);
 }
 
+static int notification_action_row_y(Notification *n) {
+  int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
+  int has_summary = n && n->summary && *n->summary;
+  int has_body = n && n->body && *n->body;
+  int lines = 0;
+
+  if (has_body)
+    lines += (int)notification_body_lines(n->body);
+  return lines * line_h;
+}
+
 static unsigned int notification_content_height(Notification *n) {
   unsigned int height = bh;
   unsigned int body_lines;
@@ -5017,7 +5046,7 @@ static unsigned int notification_history_entry_height(Notification *n) {
   if (n->input_enabled)
     height += NOTIFY_INPUT_ROW_H;
   if (n->action_count > 2)
-    height += NOTIFY_BUTTON_ROW_H;
+    height += NOTIFY_BUTTON_H;
   return height;
 }
 
@@ -5025,14 +5054,18 @@ static void notification_history_layout(void) {
   Notification *n;
   unsigned int content_h;
   int max_scroll;
+  int pad = 0;
 
   /* Keep history stable while entries are added or removed. */
-  notify_width = NOTIFY_MAX_W;
+  notify_width = NOTIFY_MAX_W + 2U * (unsigned int)pad;
   content_h = 0;
   for (n = notify_history_head; n; n = n->next)
     content_h += notification_history_entry_height(n);
-  notify_height = MIN(MAX(content_h, bh), (unsigned int)NOTIFY_HISTORY_MAX_H);
-  max_scroll = content_h > notify_height ? (int)(content_h - notify_height) : 0;
+  notify_height = MIN(MAX(content_h, bh) + 2U * (unsigned int)pad,
+                     (unsigned int)NOTIFY_HISTORY_MAX_H + 2U * (unsigned int)pad);
+  max_scroll = content_h > notify_height - 2U * (unsigned int)pad
+                   ? (int)(content_h - (notify_height - 2U * (unsigned int)pad))
+                   : 0;
   notify_history_scroll = MAX(0, MIN(notify_history_scroll, max_scroll));
   notify_history_scroll_target = MAX(0, MIN(notify_history_scroll_target,
                                              max_scroll));
@@ -5043,17 +5076,6 @@ static void notification_history_layout(void) {
 }
 
 static void notification_history_show(void) {
-  if (!notify_history_count)
-    return;
-  notify_history_active = 1;
-  notification_history_layout();
-  drawbars();
-  resizebarwin(selmon);
-}
-
-static void notification_history_hide(void) {
-  if (!notify_history_active)
-    return;
   notify_history_active = 0;
   notify_history_input = NULL;
   notify_input_focus = 0;
@@ -5063,13 +5085,16 @@ static void notification_history_hide(void) {
   notify_history_scroll_target = 0;
   notify_history_scroll_start = 0;
   notify_history_scroll_end = 0;
-  drawbars();
-  resizebarwin(selmon);
+}
+
+static void notification_history_hide(void) {
+  notification_history_show();
 }
 
 static void notification_update_layout(Notification *n) {
   unsigned int text_w, line_w;
   unsigned int min_width;
+  int pad = 0;
   if (!n)
     return;
   text_w = notification_text_width(n->summary);
@@ -5086,23 +5111,14 @@ static void notification_update_layout(Notification *n) {
       action_w += notification_text_width(n->actions[i]) + 24;
     text_w = MAX(text_w, action_w);
   }
-  notify_width = MIN(NOTIFY_MAX_W, text_w + 40);
+  notify_width = MIN(NOTIFY_MAX_W, text_w + 40 + 2U * (unsigned int)pad);
   min_width = clockbar_cw ? clockbar_cw : clockwidth();
   min_width = MIN(min_width, NOTIFY_MAX_W);
   notify_width = MAX(notify_width, min_width);
 
-  /* A one-line notification stays at the normal clock-bar height. */
-  notify_height = notification_content_height(n);
-  if (n->input_enabled || (notify_hovered && n->action_count >= 2)) {
-    unsigned int content_height = notification_content_height(n);
-    unsigned int controls = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
-                            (notify_hovered && n->action_count >= 2
-                                 ? NOTIFY_BUTTON_ROW_H
-                                 : 0);
-    if (notify_hovered && n->image && n->action_count >= 2)
-      controls += NOTIFY_IMAGE_BUTTON_GAP + 6;
-    notify_height = MAX(notify_height, content_height + controls);
-  }
+  /* Keep the notification background at the base content height; hover only
+   * reveals the action row without expanding the popup box itself. */
+  notify_height = notification_content_height(n) + 2U * (unsigned int)pad;
 }
 
 static void notification_set_hovered(int hovered) {
@@ -5142,6 +5158,14 @@ static void notification_queue(Notification *n) {
   if (!n)
     return;
 
+  /* Keep the socket path alive but avoid creating any popup/history UI.
+   * Print notifications to stderr instead. */
+  fprintf(stderr, "notification: %s\n%s\n",
+          n->summary && *n->summary ? n->summary : "(no summary)",
+          n->body && *n->body ? n->body : "(no body)");
+  notification_free(n);
+  return;
+
   /* Updates to an entry already in history stay in history. */
   for (p = notify_history_head; p; p = p->next) {
     if (p->id == n->id) {
@@ -5161,6 +5185,10 @@ static void notification_queue(Notification *n) {
       p->image_w = n->image_w;
       p->image_h = n->image_h;
       p->image_hint = n->image_hint;
+      p->img_pixels = n->img_pixels;
+      p->img_w = n->img_w;
+      p->img_h = n->img_h;
+      n->img_pixels = NULL;
       p->id = id;
       free(n);
       if (notify_history_active) {
@@ -5200,8 +5228,12 @@ static void notification_queue(Notification *n) {
       p->image = n->image;
       p->image_w = n->image_w;
       p->image_h = n->image_h;
-       p->image_hint = n->image_hint;
-        p->id = id;
+      p->image_hint = n->image_hint;
+      p->img_pixels = n->img_pixels;
+      p->img_w = n->img_w;
+      p->img_h = n->img_h;
+      n->img_pixels = NULL;
+      p->id = id;
         notify_input_focus = 0;
         notify_hovered = 0;
         notify_hover = -1;
@@ -5231,6 +5263,10 @@ static void notification_queue(Notification *n) {
       p->image_w = n->image_w;
       p->image_h = n->image_h;
       p->image_hint = n->image_hint;
+      p->img_pixels = n->img_pixels;
+      p->img_w = n->img_w;
+      p->img_h = n->img_h;
+      n->img_pixels = NULL;
       p->id = id;
       free(n);
       return;
@@ -5670,232 +5706,11 @@ static void notification_dim_image(Picture image, int x, int y,
 }
 
 static void notification_draw(void) {
-  Notification *n = notify_current;
-  int text_x = 12, text_w = notify_width - 24;
-  int content_h;
-  int controls_h;
-  int summary_y, body_y;
-  int has_summary, has_body;
-  if (!n)
-    return;
-  has_summary = n->summary && *n->summary;
-  has_body = n->body && *n->body;
-  controls_h = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
-               (notify_hovered && n->action_count >= 2
-                    ? NOTIFY_BUTTON_ROW_H
-                    : 0);
-  if (notify_hovered && n->image && n->action_count >= 2)
-    controls_h += NOTIFY_IMAGE_BUTTON_GAP + 6;
-  content_h = notify_height - controls_h;
-  if (!notification_foreground_pass) {
-    XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
-    XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
-                   notify_width, notify_height);
-  }
-  if (notification_background_only)
-    return;
-  if (n->image) {
-    int image_x = 12;
-    int image_y = (content_h - (int)n->image_h) / 2;
-    drw_pic(drw, image_x, image_y, n->image_w, n->image_h, n->image);
-    text_x = image_x + n->image_w + 8;
-    text_w = notify_width - text_x - 12;
-  } else {
-    unsigned int content_w = MAX(notification_text_width(n->summary),
-                                 notification_text_width(n->body));
-    if (content_w && content_w < notify_width)
-      text_x = MAX(0, ((int)notify_width - (int)content_w) / 2 - 8);
-    text_w = notify_width - text_x - 8;
-  }
-  if (has_body && has_summary) {
-    summary_y = 7 + NOTIFY_TEXT_TOP_OFFSET;
-    body_y = 32 + NOTIFY_TEXT_TOP_OFFSET;
-  } else {
-    summary_y = body_y = MAX(0, (content_h - (drw->fonts->h + 8)) / 2);
-  }
-  drw_setscheme(drw, notify_summary_scheme);
-  if (has_summary) {
-    if (notify_hovered)
-      notification_draw_marquee_line(text_x, summary_y, text_w,
-                                     drw->fonts->h + 8, 8, n->summary,
-                                     &notify_hover_started, 1);
-    else
-      drw_text(drw, text_x, summary_y, text_w, drw->fonts->h + 8, 8,
-               n->summary, 0);
-  }
-  drw_setscheme(drw, notify_body_scheme);
-  if (has_body) {
-    if (notify_hovered)
-      notification_draw_marquee_text(text_x, body_y, text_w, content_h,
-                                     n->body, &notify_hover_started, 1);
-    else
-      notification_draw_text(text_x, body_y, text_w, content_h, n->body);
-  }
-
-  memset(notify_action_x, 0, sizeof(notify_action_x));
-  memset(notify_action_w, 0, sizeof(notify_action_w));
-  if (n->input_enabled) {
-    notify_input_x = 8;
-    notify_input_y = notify_height - NOTIFY_INPUT_ROW_H -
-                     (notify_hovered && n->action_count >= 2
-                           ? NOTIFY_BUTTON_ROW_H
-                           : 0);
-    notify_input_w = notify_width - 16;
-    notify_input_h = NOTIFY_ACTION_H - 6;
-    drw_setscheme(drw, notify_hover == -2 ? notify_control_hover_scheme
-                                          : notify_control_scheme);
-    drw_rect(drw, notify_input_x, notify_input_y, notify_input_w,
-             notify_input_h, 1, 1);
-    drw_text(drw, notify_input_x + 6, notify_input_y, notify_input_w - 12,
-             notify_input_h, 6,
-             n->input_text && *n->input_text ? n->input_text
-                                              : n->input_placeholder,
-             0);
-  }
-  if (n->action_count >= 2) {
-    unsigned int i, x = NOTIFY_ACTION_X, button = 0;
-    int y = notify_height - NOTIFY_ACTION_H;
-    for (i = 0; i + 1 < n->action_count && button < LENGTH(notify_action_x);
-         i += 2, button++) {
-      unsigned int w = notification_text_width(n->actions[i + 1]) + 24;
-      if (x + w > notify_width - 8)
-        break;
-      notify_action_x[button] = x;
-      notify_action_w[button] = w;
-      if (notify_hovered) {
-        drw_setscheme(drw, notify_hover == (int)button
-                                ? notify_action_hover_scheme
-                                : notify_action_scheme);
-        drw_text(drw, x, y, w, NOTIFY_BUTTON_H, 12, n->actions[i + 1], 0);
-      }
-      x += w + 6;
-    }
-  }
+  return;
 }
 
 static void notification_history_draw(void) {
-  Notification *n;
-  Notification *entries[NOTIFY_HISTORY_MAX];
-  unsigned int count = 0, index;
-  int y, text_x, text_w, entry_bottom, body_bottom;
-  int action_y, input_y;
-  unsigned int entry_h;
-
-  notification_history_layout();
-  for (n = notify_history_head; n && count < LENGTH(entries); n = n->next)
-    entries[count++] = n;
-  if (!notification_foreground_pass) {
-    XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
-    XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
-                   notify_width, notify_height);
-  }
-  if (notification_background_only)
-    return;
-  for (index = 0; index < count; index++) {
-    /* The newest notification is shown at the top. */
-    n = entries[count - 1 - index];
-    unsigned int image_w, image_h, content_h;
-    int has_summary, has_body, has_two_content, controls_h, text_y;
-    entry_h = notification_history_entry_height(n);
-    y = -notify_history_scroll;
-    for (unsigned int previous = 0; previous < index; previous++)
-      y += notification_history_entry_height(entries[count - 1 - previous]);
-    entry_bottom = y + entry_h;
-    has_summary = n->summary && *n->summary;
-    has_body = n->body && *n->body;
-    has_two_content = (has_summary && has_body) ||
-                      (n->image && (has_summary || has_body));
-    controls_h = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
-                 (n->action_count > 2 ? NOTIFY_BUTTON_ROW_H : 0);
-    content_h = entry_h - controls_h;
-    if (entry_bottom <= 0 || y >= (int)notify_height)
-      continue;
-    text_x = 12;
-    text_w = notify_width - 24;
-    if (n->image) {
-      /* The picture has already been resized when the notification was
-       * received.  Use its real dimensions here: drw_pic composites the
-       * source without scaling, so drawing it into a different aspect ratio
-       * would crop or distort it. */
-      image_w = n->image_w;
-      image_h = n->image_h;
-      text_x = 12 + image_w + 8;
-      text_w = notify_width - text_x - 12;
-      drw_pic(drw, 12, y + ((int)content_h - image_h) / 2,
-              image_w, image_h, n->image);
-      if (!n->action_count || n->action_used)
-        notification_dim_image(
-            n->image, 12, y + ((int)content_h - image_h) / 2, image_w,
-            image_h);
-    }
-    drw_setscheme(drw, !n->action_count || n->action_used
-                              ? notify_summary_dim_scheme
-                              : notify_summary_scheme);
-    text_y = has_two_content ? y + 7 + NOTIFY_TEXT_TOP_OFFSET
-                             : y + MAX(0, ((int)content_h -
-                                           (drw->fonts->h + 8)) / 2);
-    if (has_summary)
-      notification_draw_marquee_line(text_x, text_y, text_w,
-                                     drw->fonts->h + 6, 8, n->summary,
-                                     &notify_history_hover_started,
-                                     notify_history_hover_entry == n);
-    drw_setscheme(drw, !n->action_count || n->action_used
-                            ? notify_body_dim_scheme
-                            : notify_body_scheme);
-    action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count > 2
-                  ? action_y - NOTIFY_INPUT_ROW_H
-                  : entry_bottom - NOTIFY_INPUT_ROW_H;
-    body_bottom = entry_bottom - 6;
-    if (n->action_count > 2)
-      body_bottom = MIN(body_bottom, action_y - 4);
-    if (n->input_enabled)
-      body_bottom = MIN(body_bottom, input_y - 4);
-    notification_draw_marquee_text(text_x, has_two_content
-                                             ? y + 32 + NOTIFY_TEXT_TOP_OFFSET
-                                             : text_y,
-                                   text_w,
-                                   MIN(body_bottom, (int)notify_height),
-                                   n->body, &notify_history_hover_started,
-                                   notify_history_hover_entry == n);
-    if (n->input_enabled) {
-      notify_input_x = 8;
-      notify_input_y = input_y;
-      notify_input_w = notify_width - 16;
-      notify_input_h = NOTIFY_ACTION_H - 6;
-      drw_setscheme(drw, notify_history_hover_entry == n &&
-                            notify_history_hover_action == -2
-                            ? notify_control_hover_scheme
-                            : notify_control_scheme);
-      drw_rect(drw, notify_input_x, notify_input_y, notify_input_w,
-               notify_input_h, 1, 1);
-      drw_text(drw, notify_input_x + 6, notify_input_y,
-               notify_input_w - 12, notify_input_h, 6,
-               n->input_text && *n->input_text ? n->input_text
-                                                : n->input_placeholder,
-               0);
-    }
-    if (n->action_count > 2) {
-      unsigned int i, x = NOTIFY_ACTION_X;
-      for (i = 1; i < n->action_count; i += 2) {
-        unsigned int w = notification_text_width(n->actions[i]) + 24;
-        if (x + w > notify_width - 8)
-          break;
-        drw_setscheme(drw, notify_history_hover_entry == n &&
-                              notify_history_hover_action == (int)(i / 2)
-                              ? notify_action_hover_scheme
-                              : notify_action_scheme);
-        drw_text(drw, x, action_y, w, NOTIFY_BUTTON_H, 12,
-                 n->actions[i], 0);
-        x += w + 6;
-      }
-    }
-    if (index + 1 < count) {
-      XSetForeground(drw->dpy, drw->gc, notify_body.pixel);
-      XDrawLine(drw->dpy, drw->drawable, drw->gc, 8, entry_bottom - 1,
-                notify_width - 8, entry_bottom - 1);
-    }
-  }
+  return;
 }
 
 /* Render notification foreground separately, just like Finder.  The first
@@ -5972,12 +5787,8 @@ static void notification_draw_foreground(int history)
  * up with the animation. */
 static void notification_present_layers(int history)
 {
-  if (!selmon || !selmon->barcenterwin)
-    return;
-  map_center_window(selmon->barcenterwin, 0, 0, notify_width, notify_height,
-                    4);
-  notification_draw_foreground(history);
-  XFlush(dpy);
+  (void)history;
+  return;
 }
 
 /* Marquee frames only change the notification center surface.  Avoid
@@ -5985,20 +5796,7 @@ static void notification_present_layers(int history)
  * for every text-position update. */
 static void notification_redraw_center_only(void)
 {
-  int history;
-
-  if (!selmon || !selmon->barcenterwin || !notification_center_active())
-    return;
-  history = notify_history_active && !notify_active;
-  notification_background_only = 1;
-  if (history)
-    notification_history_draw();
-  else
-    notification_draw();
-  notification_background_only = 0;
-  /* Fade only the panel-colour pixels; text, images, and controls remain at
-   * fixed opacity. */
-  notification_present_layers(history);
+  return;
 }
 
 static void notification_motion(XMotionEvent *ev) {
@@ -6017,11 +5815,12 @@ static void notification_motion(XMotionEvent *ev) {
   else if (n->action_count >= 2) {
     for (i = 0; i < LENGTH(notify_action_x); i++)
       if (notify_action_w[i] && ev->x >= notify_action_x[i] &&
-          ev->x < notify_action_x[i] + notify_action_w[i] &&
-           ev->y >= notify_height - NOTIFY_ACTION_H &&
-           ev->y < notify_height) {
-        hover = (int)i;
-        break;
+          ev->x < notify_action_x[i] + notify_action_w[i]) {
+        int button_y = notification_action_row_y(n);
+        if (ev->y >= button_y && ev->y < button_y + NOTIFY_BUTTON_H) {
+          hover = (int)i;
+          break;
+        }
       }
   }
   if (hover != notify_hover) {
@@ -6031,172 +5830,12 @@ static void notification_motion(XMotionEvent *ev) {
 }
 
 static void notification_history_motion(XMotionEvent *ev) {
-  Notification *n;
-  Notification *entries[NOTIFY_HISTORY_MAX];
-  unsigned int count = 0, index, action;
-  unsigned int entry_h, action_w;
-  int content_y, y = 0, entry_bottom, action_y, input_y, action_x;
-  int hover_action = -1;
-  int hover_input = 0;
-
-  for (n = notify_history_head; n && count < LENGTH(entries); n = n->next)
-    entries[count++] = n;
-  content_y = ev->y + notify_history_scroll;
-  for (index = 0; index < count; index++) {
-    n = entries[count - index - 1];
-    entry_h = notification_history_entry_height(n);
-    if (content_y >= y && content_y < y + (int)entry_h)
-      break;
-    y += entry_h;
-  }
-  if (index < count) {
-    n = entries[count - index - 1];
-    y -= notify_history_scroll;
-    entry_bottom = y + entry_h;
-    action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count > 2
-                  ? action_y - NOTIFY_INPUT_ROW_H
-                  : entry_bottom - NOTIFY_INPUT_ROW_H;
-    if (n->input_enabled &&
-        ev->x >= 8 && ev->x < (int)notify_width - 8 &&
-        ev->y >= input_y && ev->y < input_y + NOTIFY_INPUT_ROW_H)
-      hover_input = 1;
-    if (n->action_count > 2 &&
-        ev->y >= action_y &&
-        ev->y < action_y + NOTIFY_ACTION_H) {
-      action_x = NOTIFY_ACTION_X;
-      for (action = 1; action < n->action_count; action += 2) {
-        action_w = notification_text_width(n->actions[action]) + 24;
-        if (action_x + (int)action_w > (int)notify_width - 8)
-          break;
-        if (ev->x >= action_x && ev->x < action_x + (int)action_w) {
-          hover_action = (int)(action / 2);
-          break;
-        }
-        action_x += action_w + 6;
-      }
-    }
-    if (hover_input)
-      hover_action = -2;
-  } else {
-    n = NULL;
-  }
-  if (notify_history_hover_entry != n ||
-      notify_history_hover_action != hover_action) {
-    notify_history_hover_entry = n;
-    notify_history_hover_action = hover_action;
-    clock_gettime(CLOCK_MONOTONIC, &notify_history_hover_started);
-    drawbars();
-  }
+  (void)ev;
 }
 
 static int notification_history_buttonpress(XButtonPressedEvent *ev) {
-  Notification *n;
-  Notification *entries[NOTIFY_HISTORY_MAX];
-  unsigned int count = 0, index;
-  unsigned int entry_h;
-  int y, entry_bottom, action_y, input_y, content_y;
-  int action_x, action_w;
-  int old_target;
-
-  if (!notify_history_active)
-    return 0;
-  /* Middle and right clicks must not alter history.  Left clicks are handled
-   * below only when they land on an action button or input field. */
-  if (ev->button == Button2 || ev->button == Button3)
-    return 1;
-  if (ev->button != Button4 && ev->button != Button5) {
-    if (ev->button != Button1)
-      return 1;
-    for (n = notify_history_head; n && count < NOTIFY_HISTORY_MAX;
-         n = n->next)
-      entries[count++] = n;
-    if (ev->y < 0 || ev->y >= (int)notify_height)
-      return 1;
-    content_y = (int)ev->y + notify_history_scroll;
-    y = 0;
-    for (index = 0; index < count; index++) {
-      n = entries[count - index - 1];
-      entry_h = notification_history_entry_height(n);
-      if (content_y >= y && content_y < y + (int)entry_h)
-        break;
-      y += entry_h;
-    }
-    if (index >= count)
-      return 1;
-    n = entries[count - index - 1];
-    y -= notify_history_scroll;
-    entry_bottom = y + entry_h;
-    action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count > 2
-                  ? action_y - NOTIFY_INPUT_ROW_H
-                  : entry_bottom - NOTIFY_INPUT_ROW_H;
-    if (n->input_enabled && ev->y >= input_y && ev->y < input_y +
-        NOTIFY_INPUT_ROW_H && ev->x >= 8 && ev->x < (int)notify_width - 8) {
-      if (ev->button == Button1) {
-        notify_history_input = n;
-        notify_input_focus = 1;
-        XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent,
-                       CurrentTime);
-        XFlush(dpy);
-      }
-      return 1;
-    }
-    if (n->action_count > 2 && ev->y >= action_y &&
-        ev->y < action_y + NOTIFY_ACTION_H) {
-      action_x = NOTIFY_ACTION_X;
-      for (unsigned int action = 1; action < n->action_count; action += 2) {
-        action_w = notification_text_width(n->actions[action]) + 24;
-        if (action_x + action_w > (int)notify_width - 8)
-          break;
-        if (ev->x >= action_x && ev->x < action_x + action_w) {
-          if (ev->button == Button1) {
-            notification_emit_action(n, n->actions[action - 1]);
-            /* Match active-notification behavior: the application receives
-             * both the action and the close notification for this ID. */
-            notification_emit_closed(n, 2);
-            notification_history_clear_controls(n);
-            if (notify_history_input == n) {
-              notify_history_input = NULL;
-              notify_input_focus = 0;
-            }
-            notification_history_layout();
-            drawbars();
-          }
-          return 1;
-        }
-        action_x += action_w + 6;
-      }
-    }
-    if (ev->button == Button1 && n->action_count == 2) {
-      notification_emit_action(n, n->actions[0]);
-      notification_emit_closed(n, 2);
-      notification_history_clear_controls(n);
-      if (notify_history_input == n) {
-        notify_history_input = NULL;
-        notify_input_focus = 0;
-      }
-      notification_history_layout();
-      drawbars();
-    }
-    /* Notifications with one action use the content as their action target. */
-    return 1;
-  }
-  old_target = notify_history_scroll_target;
-  if (ev->button == Button4)
-    notify_history_scroll_target -= NOTIFY_HISTORY_ENTRY_H;
-  else
-    notify_history_scroll_target += NOTIFY_HISTORY_ENTRY_H;
-  notification_history_layout();
-  if (notify_history_scroll_target != old_target) {
-    /* Start a new transition at the currently displayed pixel position so
-     * repeated wheel input remains continuous. */
-    notify_history_scroll_start = notify_history_scroll;
-    notify_history_scroll_end = notify_history_scroll_target;
-    clock_gettime(CLOCK_MONOTONIC, &notify_history_scroll_started);
-    drawbars();
-  }
-  return 1;
+  (void)ev;
+  return 0;
 }
 
 static int notification_history_tick(void) {
@@ -6312,19 +5951,20 @@ static int notification_buttonpress(XButtonPressedEvent *ev) {
   }
   for (i = 0; i < LENGTH(notify_action_x); i++) {
     if (notify_action_w[i] && ev->x >= notify_action_x[i] &&
-        ev->x < notify_action_x[i] + notify_action_w[i] &&
-           ev->y >= notify_height - NOTIFY_ACTION_H &&
-           ev->y < notify_height) {
-      in_action = 1;
-      if (ev->button == Button1) {
-        notification_emit_action(n, n->actions[i * 2]);
-        notification_emit_closed(n, 2);
-        /* An action was handled, so the archived copy keeps only the
-         * notification content, not controls which can no longer be used. */
-        notification_history_clear_controls(n);
-        notification_advance();
+        ev->x < notify_action_x[i] + notify_action_w[i]) {
+      int button_y = notification_action_row_y(n);
+      if (ev->y >= button_y && ev->y < button_y + NOTIFY_BUTTON_H) {
+        in_action = 1;
+        if (ev->button == Button1) {
+          notification_emit_action(n, n->actions[i * 2]);
+          notification_emit_closed(n, 2);
+          /* An action was handled, so the archived copy keeps only the
+           * notification content, not controls which can no longer be used. */
+          notification_history_clear_controls(n);
+          notification_advance();
+        }
+        return 1;
       }
-      return 1;
     }
   }
 
@@ -6977,16 +6617,8 @@ void drawbar(Monitor *m) {
                            ? finder_selected - finder_scroll + 1 : 0);
        } else if (notify_active && m == selmon) {
         finder_marker(m, 0);
-        notification_background_only = 1;
-        notification_draw();
-        notification_background_only = 0;
-          notification_present_layers(0);
        } else if (notify_history_active && m == selmon) {
         finder_marker(m, 0);
-        notification_background_only = 1;
-        notification_history_draw();
-        notification_background_only = 0;
-          notification_present_layers(1);
    } else {
      finder_marker(m, 0);
     drw_setscheme(drw, scheme[m == selmon ? SchemeTitle : SchemeNorm]);
