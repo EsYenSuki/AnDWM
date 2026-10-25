@@ -65,6 +65,12 @@
 #include <dbus/dbus.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
+#include <GL/gl.h>
+#include <GL/glx.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <hb.h>
+#include <hb-ft.h>
 
 #define SIDEBAR_WIDTH 64
 #define SIDEBAR_CLICK_THRESH 5
@@ -94,26 +100,31 @@ sendn(const char *msg)
 #define CLOCK_ANIM_EXTRA 280   /* max px the bar grows past text width */
 #define PW_MONITOR_SINK  1     /* 1 = system audio (what you hear), 0 = mic */
 #define DRAW_FPS         50     /* visualizer update rate */
-#define NOTIFY_MARQUEE_FPS 100 /* notification title/body scrolling rate */
 #define NOTIFY_MAX       5
 #define NOTIFY_TIMEOUT   5
 #define NOTIFY_TRANSITION_MS 500
 #define NOTIFY_TWO_CONTENT_H 70
 #define NOTIFY_MAX_W     300
+#define NOTIFY_PADDING   15
+#define NOTIFY_IMAGE_MAX_H 60
 #define NOTIFY_IMAGE_RADIUS 16
 #define NOTIFY_MAX_TEXT  4096
-#define NOTIFY_INPUT_ROW_H 0
-#define NOTIFY_BUTTON_H 100
+#define NOTIFY_INPUT_ROW_H 24
+#define NOTIFY_BUTTON_H 24
 #define NOTIFY_BODY_LINE_GAP 0
 #define NOTIFY_BODY_MAX_LINES 4
+#define NOTIFY_POPUP_BODY_MAX_LINES 2
+#define NOTIFY_POPUP_BODY_HOVER_MAX_LINES 4
+#define NOTIFY_HISTORY_BODY_MAX_LINES 2
+#define NOTIFY_BODY_LINE_BYTES 1024
+#define NOTIFY_HISTORY_FPS 100
 #define NOTIFY_ACTION_X  12
 #define NOTIFY_TEXT_TOP_OFFSET 3
 #define NOTIFY_TEXT_BOTTOM_GAP 6
 #define NOTIFY_IMAGE_BUTTON_GAP 2
 #define NOTIFY_HISTORY_MAX     10
 #define NOTIFY_HISTORY_ENTRY_H 70
-#define NOTIFY_HISTORY_MAX_H   (NOTIFY_HISTORY_ENTRY_H * 5)
-#define NOTIFY_HISTORY_SCROLL_MS 500
+#define NOTIFY_HISTORY_MAX_H   400
 #define FINDER_MAX_APPS 512
 #define FINDER_MAX_TEXT 256
 #define FINDER_EDGE 15
@@ -199,7 +210,11 @@ struct Notification {
   int image_hint;
   uint32_t *img_pixels;
   unsigned int img_w, img_h;
+  GLuint img_texture;
   int action_used;
+  unsigned int body_wrap_width, body_wrap_count, body_wrap_max_lines;
+  int body_wrap_valid;
+  char body_wrap_lines[NOTIFY_BODY_MAX_LINES][NOTIFY_BODY_LINE_BYTES];
   struct timespec shown_at;
   Notification *next;
 };
@@ -213,14 +228,13 @@ static int notify_active;
 static int notify_transition_pending;
 static struct timespec notify_transition_started;
 static int notify_history_active;
+static int notify_image_y, notify_text_y;
 static int notify_clock_hovered;
 static unsigned int notify_width, notify_height;
 static unsigned int notify_count;
 static unsigned int notify_history_count;
 static int notify_history_scroll;
 static int notify_history_scroll_target;
-static int notify_history_scroll_start;
-static int notify_history_scroll_end;
 static struct timespec notify_history_scroll_started;
 static Clr notify_bg, notify_fg, notify_body, finder_text_clr;
 static const char finder_text[] = "#B8B5C8";
@@ -229,6 +243,7 @@ static Clr notify_summary_dim_scheme[3], notify_body_dim_scheme[3];
 static Clr notify_control_scheme[3], notify_control_hover_scheme[3];
 static Clr notify_action_scheme[3], notify_action_hover_scheme[3];
 static int notify_action_x[16], notify_action_w[16];
+static int notify_action_y;
 static int notify_input_x, notify_input_y, notify_input_w, notify_input_h;
 static int notify_input_focus;
 static Notification *notify_history_input;
@@ -238,7 +253,62 @@ static Notification *notify_history_hover_entry;
 static int notify_history_hover_action = -1;
 static struct timespec notify_hover_started;
 static struct timespec notify_history_hover_started;
-static struct timespec notify_marquee_last_draw;
+static uint64_t notify_render_cache_hash;
+static int notify_render_cache_valid;
+static Pixmap notify_history_pixmap;
+static GC notify_history_gc;
+static Picture notify_history_picture;
+static Picture notify_history_mask_picture;
+static Picture notify_history_dest_picture;
+static Picture notify_history_background_picture;
+static Pixmap notify_history_mask_pixmap;
+static Pixmap notify_history_background_pixmap;
+static Window notify_history_dest_window;
+static unsigned int notify_history_pixmap_w, notify_history_pixmap_h;
+static unsigned int notify_history_mask_w, notify_history_mask_h;
+
+/* OpenGL notification rendering */
+static GLXContext notify_gl_ctx = None;
+static GLXFBConfig notify_gl_fbconfig;
+static GLXPbuffer notify_gl_pbuffer = None;
+static unsigned int notify_gl_pbuffer_w, notify_gl_pbuffer_h;
+static int notify_gl_initialized = 0;
+typedef void (*NotificationGLBlendFuncSeparate)(GLenum, GLenum, GLenum,
+                                                GLenum);
+static NotificationGLBlendFuncSeparate notify_gl_blend_func_separate;
+
+/* FreeType + OpenGL font rendering */
+typedef struct {
+  unsigned int tex_id;
+  unsigned int face_index;
+  unsigned int glyph_index;
+  int w, h;
+  int bearing_x, bearing_y;
+  int advance;
+  int loaded;
+} GLGlyph;
+
+#define GL_FONT_MAX_FACES 32
+#define GL_FONT_MAX_GLYPHS 2048
+typedef struct {
+  FT_Face face;
+  hb_font_t *hb_font;
+  char *file;
+  int index;
+  double pixel_size;
+} GLFontFace;
+
+typedef struct {
+  GLFontFace faces[GL_FONT_MAX_FACES];
+  unsigned int face_count;
+  GLGlyph glyphs[GL_FONT_MAX_GLYPHS];
+  unsigned int glyph_count;
+  int height;
+  double pixel_size;
+} GLFont;
+
+static FT_Library ft_lib = NULL;
+static GLFont *gl_font = NULL;
 
 static struct pw_thread_loop *sound_loop = NULL;
 static struct pw_context *sound_context = NULL;
@@ -1757,13 +1827,19 @@ static void mpris_panel_draw(Monitor *m, unsigned int w, unsigned int h) {
 
 static void notification_init(void);
 static void notification_shutdown(void);
+static int notification_gl_init(unsigned int w, unsigned int h);
+static GLFont *gl_font_create(void);
+static int gl_font_add_face(GLFont *font, const char *file, int index,
+                            double pixel_size);
+static unsigned int gl_font_text_width(const char *text);
 static void notification_dispatch(void);
 static void notification_tick(void);
 static double notification_elapsed(const struct timespec *started);
 static void notification_draw(void);
 static void notification_draw_foreground(int history);
-static void notification_redraw_center_only(void);
 static void notification_present_layers(int history);
+static int notification_history_background_create(void);
+static int notification_history_mask_create(unsigned int w, unsigned int h);
 static void map_center_window(Window win, int x, int y, unsigned int w,
                               unsigned int h, int fade);
 static int notification_foreground_pass;
@@ -1776,6 +1852,7 @@ static void notification_emit_input(Notification *n);
 static int notification_buttonpress(XButtonPressedEvent *ev);
 static int notification_input_keypress(XKeyEvent *ev);
 static void notification_update_layout(Notification *n);
+static uint32_t notification_utf8_next(const char **text);
 static void notification_motion(XMotionEvent *ev);
 static void notification_history_motion(XMotionEvent *ev);
 static void notification_history_draw(void);
@@ -4669,10 +4746,83 @@ static char *notify_strdup(const char *s) {
   return s ? strdup(s) : strdup("");
 }
 
+static void notification_image_texture_free(Notification *n) {
+  if (!n || !n->img_texture)
+    return;
+  if (notify_gl_ctx && notify_gl_pbuffer &&
+      glXMakeCurrent(dpy, notify_gl_pbuffer, notify_gl_ctx))
+    glDeleteTextures(1, &n->img_texture);
+  n->img_texture = 0;
+}
+
+static void notification_image_texture_create(Notification *n) {
+  unsigned int w, h;
+  uint32_t *pixels;
+
+  if (!n || n->img_texture || !n->img_pixels || !n->img_w || !n->img_h ||
+      !n->image_w || !n->image_h)
+    return;
+  h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+  w = MAX(1U, (unsigned int)((uint64_t)n->image_w * h / n->image_h));
+  if (w > 100) {
+    w = 100;
+    h = MAX(1U, (unsigned int)((uint64_t)n->image_h * w / n->image_w));
+  }
+  pixels = calloc((size_t)w * h, sizeof(*pixels));
+  if (!pixels)
+    return;
+
+  /* Upload only display-sized pixels: notification source images may be
+   * thousands of pixels wide, but are rendered at no more than 100x60. */
+  for (unsigned int y = 0; y < h; y++)
+    for (unsigned int x = 0; x < w; x++) {
+      double sx = ((x + 0.5) * n->img_w / w) - 0.5;
+      double sy = ((y + 0.5) * n->img_h / h) - 0.5;
+      unsigned int x0, x1, y0, y1;
+      double fx, fy;
+      uint32_t p00, p10, p01, p11, out = 0;
+
+      if (sx < 0) sx = 0;
+      if (sy < 0) sy = 0;
+      x0 = MIN((unsigned int)sx, n->img_w - 1);
+      y0 = MIN((unsigned int)sy, n->img_h - 1);
+      x1 = MIN(x0 + 1, n->img_w - 1);
+      y1 = MIN(y0 + 1, n->img_h - 1);
+      fx = sx - x0;
+      fy = sy - y0;
+      p00 = n->img_pixels[(size_t)y0 * n->img_w + x0];
+      p10 = n->img_pixels[(size_t)y0 * n->img_w + x1];
+      p01 = n->img_pixels[(size_t)y1 * n->img_w + x0];
+      p11 = n->img_pixels[(size_t)y1 * n->img_w + x1];
+      for (unsigned int shift = 0; shift < 32; shift += 8) {
+        double top = ((p00 >> shift) & 0xff) * (1.0 - fx) +
+                     ((p10 >> shift) & 0xff) * fx;
+        double bottom = ((p01 >> shift) & 0xff) * (1.0 - fx) +
+                        ((p11 >> shift) & 0xff) * fx;
+        unsigned int channel = (unsigned int)lround(top * (1.0 - fy) +
+                                                    bottom * fy);
+        out |= channel << shift;
+      }
+      pixels[(size_t)y * w + x] = out;
+    }
+
+  glGenTextures(1, &n->img_texture);
+  if (n->img_texture) {
+    glBindTexture(GL_TEXTURE_2D, n->img_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA,
+                 GL_UNSIGNED_BYTE, pixels);
+  }
+  free(pixels);
+}
+
 static void notification_free(Notification *n) {
   unsigned int i;
   if (!n)
     return;
+  notification_image_texture_free(n);
   free(n->app_name);
   free(n->summary);
   free(n->body);
@@ -4693,6 +4843,9 @@ static void notification_free_contents(Notification *n) {
   unsigned int i;
   if (!n)
     return;
+  n->body_wrap_valid = 0;
+  n->body_wrap_count = 0;
+  notification_image_texture_free(n);
   free(n->app_name);
   free(n->summary);
   free(n->body);
@@ -4736,7 +4889,7 @@ static void notification_history_clear_controls(Notification *n) {
 }
 
 static int notification_center_active(void) {
-  return 0;
+  return notify_active || notify_history_active;
 }
 
 static void notification_update_wm_class(Window win, int active, int history,
@@ -4775,21 +4928,29 @@ static int notification_clock_hit(int x, unsigned int width) {
 }
 
 static void notification_history_add(Notification *n) {
-  Notification *old;
+  Notification *old, *prev;
 
   if (!n)
     return;
-  n->next = NULL;
-  if (notify_history_tail)
-    notify_history_tail->next = n;
-  else
-    notify_history_head = n;
-  notify_history_tail = n;
+  n->next = notify_history_head;
+  notify_history_head = n;
+  if (!notify_history_tail)
+    notify_history_tail = n;
   notify_history_count++;
   while (notify_history_count > NOTIFY_HISTORY_MAX) {
+    prev = NULL;
     old = notify_history_head;
-    notify_history_head = old->next;
-    old->next = NULL;
+    while (old && old->next) {
+      prev = old;
+      old = old->next;
+    }
+    if (!old)
+      break;
+    if (prev)
+      prev->next = NULL;
+    else
+      notify_history_head = NULL;
+    notify_history_tail = prev;
     notification_free(old);
     notify_history_count--;
   }
@@ -4890,6 +5051,42 @@ static Picture notification_round_picture(Picture source, unsigned int w,
   return rounded;
 }
 
+static void notification_round_pixels(uint32_t *pixels, unsigned int w,
+                                      unsigned int h, unsigned int draw_w,
+                                      unsigned int draw_h) {
+  double radius, scale_x, scale_y;
+
+  if (!pixels || !w || !h || !draw_w || !draw_h)
+    return;
+  radius = MIN(NOTIFY_IMAGE_RADIUS, MIN(draw_w, draw_h) / 2.0);
+  if (radius <= 0)
+    return;
+  scale_x = (double)w / draw_w;
+  scale_y = (double)h / draw_h;
+
+  for (unsigned int y = 0; y < h; y++)
+    for (unsigned int x = 0; x < w; x++) {
+      double px = (x + 0.5) / scale_x;
+      double py = (y + 0.5) / scale_y;
+      double dx = px < radius ? radius - px
+          : px > draw_w - radius ? px - (draw_w - radius) : 0;
+      double dy = py < radius ? radius - py
+          : py > draw_h - radius ? py - (draw_h - radius) : 0;
+      double distance, coverage;
+      uint32_t *pixel;
+      unsigned int alpha;
+
+      if (!dx || !dy)
+        continue;
+      distance = sqrt(dx * dx + dy * dy);
+      coverage = fmax(0.0, fmin(1.0, radius + 0.5 - distance));
+      pixel = &pixels[(size_t)y * w + x];
+      alpha = *pixel >> 24;
+      *pixel = (*pixel & 0x00ffffffU) |
+               ((uint32_t)(alpha * coverage + 0.5) << 24);
+    }
+}
+
 static void notification_load_image(Notification *n, const char *path) {
   Imlib_Image image;
   DATA32 *data;
@@ -4908,7 +5105,8 @@ static void notification_load_image(Notification *n, const char *path) {
     unsigned int dw, dh;
     /* Keep the image's aspect ratio.  Images normally fit at their source
      * size, while larger images are reduced to no more than 50 px high. */
-    notification_fit_size(w, h, NOTIFY_MAX_W - 40, 50, &dw, &dh);
+    notification_fit_size(w, h, NOTIFY_MAX_W - 40, NOTIFY_IMAGE_MAX_H,
+                          &dw, &dh);
     n->image = notification_round_picture(
         drw_picture_create_resized(drw, (char *)data, w, h, dw, dh), dw, dh);
     n->image_w = dw;
@@ -4919,6 +5117,14 @@ static void notification_load_image(Notification *n, const char *path) {
       memcpy(n->img_pixels, data, (size_t)w * h * sizeof(uint32_t));
       n->img_w = w;
       n->img_h = h;
+      {
+        unsigned int draw_w = dw, draw_h = dh;
+        if (draw_w > 100) {
+          draw_w = 100;
+          draw_h = MAX(1U, (unsigned int)((uint64_t)dh * draw_w / dw));
+        }
+        notification_round_pixels(n->img_pixels, w, h, draw_w, draw_h);
+      }
     }
   }
   if (imlib_context_get_image())
@@ -4948,7 +5154,8 @@ static void notification_load_image_data(Notification *n, int w, int h,
     }
   {
     unsigned int dw, dh;
-    notification_fit_size(w, h, NOTIFY_MAX_W - 40, 50, &dw, &dh);
+    notification_fit_size(w, h, NOTIFY_MAX_W - 40, NOTIFY_IMAGE_MAX_H,
+                          &dw, &dh);
     n->image = notification_round_picture(
         drw_picture_create_resized(drw, (char *)pixels, w, h, dw, dh), dw,
         dh);
@@ -4960,6 +5167,14 @@ static void notification_load_image_data(Notification *n, int w, int h,
       memcpy(n->img_pixels, pixels, (size_t)w * h * sizeof(uint32_t));
       n->img_w = w;
       n->img_h = h;
+      {
+        unsigned int draw_w = dw, draw_h = dh;
+        if (draw_w > 100) {
+          draw_w = 100;
+          draw_h = MAX(1U, (unsigned int)((uint64_t)dh * draw_w / dw));
+        }
+        notification_round_pixels(n->img_pixels, w, h, draw_w, draw_h);
+      }
     }
   }
   n->image_hint = 1;
@@ -4967,105 +5182,208 @@ static void notification_load_image_data(Notification *n, int w, int h,
 }
 
 static unsigned int notification_text_width(const char *text) {
-  const char *start, *end, *next;
-  char line[512];
-  unsigned int width = 0, line_width;
+  const char *start, *end;
+  char line[1024];
+  unsigned int width = 0;
 
   if (!text || !*text)
     return 0;
+  /* Do not resize the pbuffer when measuring during a popup draw.  The
+   * current drawable may be the full-size notification surface. */
+  if (!gl_font && !notification_gl_init(1, 1))
+    return 0;
+  if (!gl_font)
+    gl_font = gl_font_create();
+  if (!gl_font)
+    return 0;
   start = text;
   while (*start) {
-    next = strchr(start, '\n');
-    end = next ? next : start + strlen(start);
-    {
-      size_t len = MIN((size_t)(end - start), sizeof(line) - 1);
-      memcpy(line, start, len);
-      line[len] = '\0';
-    }
-    line_width = drw_fontset_getwidth(drw, line);
-    width = MAX(width, line_width);
-    start = next ? next + 1 : end;
+    size_t len;
+    end = strchr(start, '\n');
+    len = MIN(end ? (size_t)(end - start) : strlen(start), sizeof(line) - 1);
+    memcpy(line, start, len);
+    line[len] = '\0';
+    width = MAX(width, gl_font_text_width(line));
+    start += len;
+    if (*start == '\n')
+      start++;
+    else if (!*start)
+      break;
   }
   return width;
 }
 
-static unsigned int notification_body_lines(const char *text) {
-  unsigned int lines = 1;
+static unsigned int notification_body_wrap(Notification *n,
+                                             unsigned int width,
+                                             unsigned int max_lines) {
+  const char *p;
 
-  if (!text || !*text)
+  if (!n || !n->body || !*n->body)
     return 0;
-  for (; *text; text++)
-    if (*text == '\n')
-      lines++;
-  return MIN(lines, NOTIFY_BODY_MAX_LINES);
+  max_lines = MIN(max_lines, NOTIFY_BODY_MAX_LINES);
+  if (!max_lines)
+    return 0;
+  if (n->body_wrap_valid && n->body_wrap_width == width &&
+      n->body_wrap_max_lines == max_lines)
+    return n->body_wrap_count;
+
+  n->body_wrap_valid = 0;
+  n->body_wrap_width = width;
+  n->body_wrap_max_lines = max_lines;
+  n->body_wrap_count = 0;
+  p = n->body;
+  while (*p && n->body_wrap_count < max_lines) {
+    unsigned int lines = n->body_wrap_count;
+    char *line = n->body_wrap_lines[lines];
+    size_t used = 0, last_space = 0;
+    const char *after_space = NULL;
+    int explicit_break = 0;
+
+    line[0] = '\0';
+    while (*p && *p != '\n') {
+      const char *next = p;
+      uint32_t cp = notification_utf8_next(&next);
+      size_t bytes = (size_t)(next - p);
+      if (used + bytes >= NOTIFY_BODY_LINE_BYTES) {
+        p = next;
+        break;
+      }
+      memcpy(line + used, p, bytes);
+      line[used + bytes] = '\0';
+      if (notification_text_width(line) > width) {
+        if (last_space) {
+          used = last_space;
+          p = after_space;
+        } else if (used) {
+          p = next == p ? p + 1 : p;
+          break;
+        } else {
+          used += bytes;
+          p = next;
+        }
+        break;
+      }
+      used += bytes;
+      p = next;
+      if (cp == ' ' || cp == '\t') {
+        last_space = used;
+        after_space = p;
+      }
+    }
+    if (*p == '\n') {
+      p++;
+      explicit_break = 1;
+    }
+    while (used && (line[used - 1] == ' ' || line[used - 1] == '\t'))
+      used--;
+    line[used] = '\0';
+    n->body_wrap_count++;
+    if (!used && !explicit_break && *p)
+      p++;
+  }
+  n->body_wrap_valid = 1;
+  return n->body_wrap_count;
+}
+
+static unsigned int notification_text_block_height(int has_summary,
+                                                    unsigned int body_lines) {
+  unsigned int line_h, body_line_h, height;
+  int ascender, descender;
+
+  if (!has_summary && !body_lines)
+    return 0;
+  line_h = (unsigned int)MAX(gl_font ? gl_font->height : drw->fonts->h, 1);
+  body_line_h = (unsigned int)MAX(
+      (int)ceil(gl_font ? gl_font->pixel_size : drw->fonts->h) +
+          NOTIFY_BODY_LINE_GAP,
+      1);
+  if (gl_font && gl_font->face_count) {
+    FT_Size_Metrics metrics = gl_font->faces[0].face->size->metrics;
+    ascender = MAX(1, (int)(metrics.ascender >> 6));
+    descender = MAX(0, -(int)(metrics.descender >> 6));
+  } else {
+    ascender = MAX(1, (int)(line_h * 3 / 4));
+    descender = MAX(0, (int)line_h - ascender);
+  }
+
+  height = (unsigned int)(ascender + descender);
+  if (has_summary && body_lines)
+    height += line_h + 2U;
+  if (body_lines > 1)
+    height += (body_lines - 1) * body_line_h;
+  return height;
 }
 
 static int notification_action_row_y(Notification *n) {
-  int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
-  int has_summary = n && n->summary && *n->summary;
-  int has_body = n && n->body && *n->body;
-  int lines = 0;
-
-  if (has_body)
-    lines += (int)notification_body_lines(n->body);
-  return lines * line_h;
+  (void)n;
+  return notify_action_y;
 }
 
-static unsigned int notification_content_height(Notification *n) {
-  unsigned int height = bh;
-  unsigned int body_lines;
-  int has_summary, has_body, has_two_content;
+static unsigned int notification_history_content_height(Notification *n) {
+  unsigned int height = 0;
+  unsigned int body_width = NOTIFY_MAX_W - 2U * NOTIFY_PADDING;
+  unsigned int body_lines = 0, img_w = 0, img_h = 0;
+  int has_summary, has_body;
 
   if (!n)
-    return height;
+    return (unsigned int)bh;
   has_summary = n->summary && *n->summary;
   has_body = n->body && *n->body;
-  has_two_content = (has_summary && has_body) ||
-                    (n->image && (has_summary || has_body));
-  if (!has_two_content)
-    return height;
+  if (n->image && n->image_w && n->image_h) {
+    img_h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+    img_w = (unsigned int)((uint64_t)n->image_w * img_h / n->image_h);
+    if (img_w > 100) {
+      img_w = 100;
+      img_h = MAX(1U, (unsigned int)((uint64_t)n->image_h * img_w /
+                                     n->image_w));
+    }
+    body_width = body_width > img_w + 12 ? body_width - img_w - 12 : 1;
+  }
+  if (has_body) {
+    body_lines = notification_body_wrap(n, body_width,
+                                        NOTIFY_HISTORY_BODY_MAX_LINES);
+  }
+  height = notification_text_block_height(has_summary, body_lines);
+  return MAX((unsigned int)bh, MAX(height, img_h));
+}
 
-  body_lines = notification_body_lines(n->body);
-  height = MAX(NOTIFY_TWO_CONTENT_H,
-               32 + body_lines * (drw->fonts->h + NOTIFY_BODY_LINE_GAP) + 8);
+static unsigned int notification_history_entry_content_height(Notification *n) {
+  unsigned int height;
+
+  if (!n)
+    return NOTIFY_HISTORY_ENTRY_H;
+  height = notification_history_content_height(n);
+  if (n->input_enabled)
+    height += NOTIFY_INPUT_ROW_H;
+  if (n->action_count >= 4)
+    height += NOTIFY_BUTTON_H;
   return height;
 }
 
 static unsigned int notification_history_entry_height(Notification *n) {
-  unsigned int height;
-  int has_summary, has_body, has_two_content;
+  unsigned int height = notification_history_entry_content_height(n);
 
-  if (!n)
-    return NOTIFY_HISTORY_ENTRY_H;
-  has_summary = n->summary && *n->summary;
-  has_body = n->body && *n->body;
-  has_two_content = (has_summary && has_body) ||
-                    (n->image && (has_summary || has_body));
-  height = (!has_two_content && !n->image) ? bh
-                                           : notification_content_height(n);
-  if (n->input_enabled)
-    height += NOTIFY_INPUT_ROW_H;
-  if (n->action_count > 2)
-    height += NOTIFY_BUTTON_H;
+  if (n && n->next)
+    height += NOTIFY_PADDING;
   return height;
 }
 
 static void notification_history_layout(void) {
   Notification *n;
-  unsigned int content_h;
+  unsigned int content_h, viewport_h;
   int max_scroll;
-  int pad = 0;
 
-  /* Keep history stable while entries are added or removed. */
-  notify_width = NOTIFY_MAX_W + 2U * (unsigned int)pad;
+  if (!gl_font && notification_gl_init(1, 1))
+    gl_font = gl_font_create();
+  notify_width = NOTIFY_MAX_W;
   content_h = 0;
   for (n = notify_history_head; n; n = n->next)
     content_h += notification_history_entry_height(n);
-  notify_height = MIN(MAX(content_h, bh) + 2U * (unsigned int)pad,
-                     (unsigned int)NOTIFY_HISTORY_MAX_H + 2U * (unsigned int)pad);
-  max_scroll = content_h > notify_height - 2U * (unsigned int)pad
-                   ? (int)(content_h - (notify_height - 2U * (unsigned int)pad))
-                   : 0;
+  notify_height = MIN(MAX(content_h + 2U * NOTIFY_PADDING, (unsigned int)bh),
+                      (unsigned int)NOTIFY_HISTORY_MAX_H);
+  viewport_h = notify_height > 2U * NOTIFY_PADDING
+                   ? notify_height - 2U * NOTIFY_PADDING : 0;
+  max_scroll = content_h > viewport_h ? (int)(content_h - viewport_h) : 0;
   notify_history_scroll = MAX(0, MIN(notify_history_scroll, max_scroll));
   notify_history_scroll_target = MAX(0, MIN(notify_history_scroll_target,
                                              max_scroll));
@@ -5076,49 +5394,125 @@ static void notification_history_layout(void) {
 }
 
 static void notification_history_show(void) {
-  notify_history_active = 0;
+  if (!notify_history_count || notify_active || finder_active)
+    return;
+  notify_history_active = 1;
   notify_history_input = NULL;
   notify_input_focus = 0;
   notify_history_hover_entry = NULL;
   notify_history_hover_action = -1;
   notify_history_scroll = 0;
   notify_history_scroll_target = 0;
-  notify_history_scroll_start = 0;
-  notify_history_scroll_end = 0;
+    notify_history_scroll_started.tv_sec = 0;
+    notify_history_scroll_started.tv_nsec = 0;
+  notification_history_layout();
+  drawbars();
+  resizebarwin(selmon);
 }
 
 static void notification_history_hide(void) {
-  notification_history_show();
+  if (!notify_history_active)
+    return;
+  notify_history_active = 0;
+  if (notify_input_focus)
+    XSetInputFocus(dpy, root, RevertToParent, CurrentTime);
+  notify_input_focus = 0;
+  notify_history_input = NULL;
+  notify_history_hover_entry = NULL;
+  notify_history_hover_action = -1;
+  notification_history_layout();
+  drawbars();
+  resizebarwin(selmon);
 }
 
 static void notification_update_layout(Notification *n) {
-  unsigned int text_w, line_w;
-  unsigned int min_width;
-  int pad = 0;
+  unsigned int text_w, body_w, content_w, img_w = 0, img_h = 0;
+  unsigned int content_h, text_content_h, body_lines = 0;
+  int image_y;
+  unsigned int actions = 0, visible_actions = 0;
+  unsigned int action_w = 0, action_label_w[16] = {0};
+  unsigned int control_top;
+  const unsigned int pad = NOTIFY_PADDING;
+
   if (!n)
     return;
-  text_w = notification_text_width(n->summary);
-  line_w = notification_text_width(n->body);
-  text_w = MAX(text_w, line_w);
-  text_w = MAX(text_w, 1);
-  if (n->image)
-    text_w += n->image_w + 16;
-  if (n->input_enabled)
-    text_w = MAX(text_w, notification_text_width(n->input_placeholder) + 32);
-  if (n->action_count >= 2) {
-    unsigned int action_w = 0, i;
-    for (i = 1; i < n->action_count; i += 2)
-      action_w += notification_text_width(n->actions[i]) + 24;
-    text_w = MAX(text_w, action_w);
-  }
-  notify_width = MIN(NOTIFY_MAX_W, text_w + 40 + 2U * (unsigned int)pad);
-  min_width = clockbar_cw ? clockbar_cw : clockwidth();
-  min_width = MIN(min_width, NOTIFY_MAX_W);
-  notify_width = MAX(notify_width, min_width);
 
-  /* Keep the notification background at the base content height; hover only
-   * reveals the action row without expanding the popup box itself. */
-  notify_height = notification_content_height(n) + 2U * (unsigned int)pad;
+  /* Keep image and text alignment based on the baselines actually rendered. */
+  if (!gl_font && notification_gl_init(1, 1))
+    gl_font = gl_font_create();
+
+  /* The optional image stays at its natural aspect ratio and at most 70px
+   * high.  Its width is capped so it cannot consume the whole text column. */
+  if (n->image && n->image_w > 0 && n->image_h > 0) {
+    img_h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+    img_w = (unsigned int)((double)n->image_w * img_h / n->image_h);
+    if (img_w > 100) {
+      img_w = 100;
+      img_h = MAX(1U, (unsigned int)((double)n->image_h * img_w / n->image_w));
+    }
+  }
+
+  text_w = MAX(notification_text_width(n->summary),
+               notification_text_width(n->body));
+  if (n->input_enabled) {
+    text_w = MAX(text_w, notification_text_width(n->input_placeholder));
+    text_w = MAX(text_w, notification_text_width(n->input_text));
+  }
+  actions = n->actions
+      ? MIN(n->action_count / 2, LENGTH(notify_action_x)) : 0;
+  visible_actions = notify_hovered ? actions : 0;
+  for (unsigned int i = 0; i < visible_actions; i++) {
+    action_label_w[i] = notification_text_width(n->actions[i * 2 + 1]);
+    action_w += action_label_w[i];
+  }
+  if (visible_actions > 1)
+    action_w += (visible_actions - 1) * 16;
+  text_w = MAX(text_w, action_w);
+  if (img_w)
+    text_w += img_w + 12;
+  content_w = MIN(NOTIFY_MAX_W - 2U * pad, text_w);
+  notify_width = MAX(100U, content_w + 2U * pad);
+
+  content_w = notify_width - 2U * pad;
+  body_w = MAX(1U, content_w - (img_w ? img_w + 12 : 0));
+  if (n->body && *n->body)
+    body_lines = notification_body_wrap(n, body_w,
+        notify_hovered ? NOTIFY_POPUP_BODY_HOVER_MAX_LINES
+                       : NOTIFY_POPUP_BODY_MAX_LINES);
+  text_content_h = notification_text_block_height(
+      n->summary && *n->summary, body_lines);
+  content_h = MAX(text_content_h, img_h);
+  notify_text_y = (int)(content_h - text_content_h) / 2;
+  image_y = (int)(content_h - img_h) / 2;
+  notify_image_y = image_y;
+
+  memset(notify_action_x, 0, sizeof(notify_action_x));
+  memset(notify_action_w, 0, sizeof(notify_action_w));
+  notify_input_x = (int)pad;
+  notify_input_w = (int)content_w;
+  notify_input_h = n->input_enabled ? NOTIFY_INPUT_ROW_H : 0;
+  control_top = content_h;
+  notify_input_y = n->input_enabled ? (int)(pad + control_top) : 0;
+  notify_action_y = visible_actions ? (int)(pad + control_top +
+      (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0)) : 0;
+  if (visible_actions) {
+    unsigned int used = 0, weight = MAX(action_w, visible_actions);
+    for (unsigned int i = 0; i < visible_actions; i++) {
+      unsigned int cell_weight = action_label_w[i] +
+          (i + 1 < visible_actions ? 16U : 0U);
+      unsigned int cell_w = i + 1 == visible_actions
+          ? content_w - used
+          : MAX(1U, (unsigned int)(((uint64_t)content_w *
+                                    MAX(cell_weight, 1U)) / weight));
+      cell_w = MIN(cell_w, content_w - used);
+      notify_action_x[i] = (int)(pad + used);
+      notify_action_w[i] = (int)cell_w;
+      used += cell_w;
+    }
+  }
+  notify_height = MAX(50U, control_top +
+      (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
+      (visible_actions ? NOTIFY_BUTTON_H : 0) + 2U * pad);
 }
 
 static void notification_set_hovered(int hovered) {
@@ -5157,14 +5551,6 @@ static void notification_queue(Notification *n) {
   Notification *p;
   if (!n)
     return;
-
-  /* Keep the socket path alive but avoid creating any popup/history UI.
-   * Print notifications to stderr instead. */
-  fprintf(stderr, "notification: %s\n%s\n",
-          n->summary && *n->summary ? n->summary : "(no summary)",
-          n->body && *n->body ? n->body : "(no body)");
-  notification_free(n);
-  return;
 
   /* Updates to an entry already in history stay in history. */
   for (p = notify_history_head; p; p = p->next) {
@@ -5598,205 +5984,1247 @@ static DBusHandlerResult notification_message(DBusConnection *conn,
   return DBUS_HANDLER_RESULT_HANDLED;
 }
 
-static void notification_draw_text(int x, int y, int width, int bottom,
-                                   const char *text) {
-  char line[512], *p, *start;
-  int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
-  unsigned int lines = 0;
-  if (!text || !*text)
-    return;
-  start = (char *)text;
-  while (*start && y < bottom - NOTIFY_TEXT_BOTTOM_GAP &&
-         lines < NOTIFY_BODY_MAX_LINES) {
-    p = strchr(start, '\n');
-    if (p) {
-      size_t len = MIN((size_t)(p - start), sizeof(line) - 1);
-      memcpy(line, start, len); line[len] = '\0';
-      start = p + 1;
-    } else {
-      strncpy(line, start, sizeof(line) - 1);
-      line[sizeof(line) - 1] = '\0';
-      start += strlen(start);
+/* Initialize FreeType and select the font already configured for the bar. */
+static int gl_font_init_ft(void) {
+  if (ft_lib)
+    return 1;
+  if (FT_Init_FreeType(&ft_lib)) {
+    fprintf(stderr, "AnDWM: cannot initialize FreeType for notifications\n");
+    return 0;
+  }
+  return 1;
+}
+
+static int notification_gl_init(unsigned int w, unsigned int h) {
+  int attrs[] = { GLX_X_RENDERABLE, True,
+                  GLX_DRAWABLE_TYPE, GLX_PBUFFER_BIT,
+                  GLX_RENDER_TYPE, GLX_RGBA_BIT,
+                  GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8,
+                  GLX_BLUE_SIZE, 8, GLX_ALPHA_SIZE, 8, None };
+  int pbuf_attrs[5];
+  int nconfigs = 0;
+  GLXFBConfig *configs;
+
+  w = MAX(w, 1U);
+  h = MAX(h, 1U);
+  if (!notify_gl_initialized) {
+    configs = glXChooseFBConfig(dpy, screen, attrs, &nconfigs);
+    if (!configs || nconfigs == 0) {
+      if (configs) XFree(configs);
+      fprintf(stderr, "AnDWM: GLX has no RGBA pbuffer configuration for notifications\n");
+      return 0;
     }
-    drw_text(drw, x, y, width, line_h, 8, line, 0);
-    y += line_h;
-    lines++;
-  }
-}
-
-static void notification_draw_marquee_line(int x, int y, int width, int height,
-                                           int lpad, const char *text,
-                                           const struct timespec *started,
-                                           int scroll) {
-  unsigned int textw;
-  double elapsed, distance, period, phase;
-  int offset;
-
-  if (!text || !*text || width <= 0)
-    return;
-  textw = notification_text_width(text);
-  if (!scroll || textw <= (unsigned int)width) {
-    drw_text(drw, x, y, width, height, lpad, text, 0);
-    return;
-  }
-  elapsed = notification_elapsed(started);
-  if (elapsed < 0.7) {
-    drw_text(drw, x, y, width, height, lpad, text, 0);
-    return;
-  }
-  distance = textw - width + 24;
-  period = 2.0 * distance / 35.0;
-  phase = fmod(elapsed - 0.7, period);
-  offset = (int)(phase <= period / 2.0
-                     ? phase * 35.0
-                     : (period - phase) * 35.0);
-  drw_text_scroll_progress(drw, x, y, width, height, lpad, text,
-                           offset, 24, 0, NULL, NULL, 0);
-}
-
-static void notification_draw_marquee_text(int x, int y, int width, int bottom,
-                                           const char *text,
-                                           const struct timespec *started,
-                                           int scroll) {
-  char line[512], *p, *start;
-  int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
-  unsigned int lines = 0;
-
-  if (!text || !*text)
-    return;
-  start = (char *)text;
-  while (*start && y < bottom - NOTIFY_TEXT_BOTTOM_GAP &&
-         lines < NOTIFY_BODY_MAX_LINES) {
-    p = strchr(start, '\n');
-    if (p) {
-      size_t len = MIN((size_t)(p - start), sizeof(line) - 1);
-      memcpy(line, start, len);
-      line[len] = '\0';
-      start = p + 1;
-    } else {
-      strncpy(line, start, sizeof(line) - 1);
-      line[sizeof(line) - 1] = '\0';
-      start += strlen(start);
+    notify_gl_fbconfig = configs[0];
+    notify_gl_ctx = glXCreateNewContext(dpy, notify_gl_fbconfig, GLX_RGBA_TYPE,
+                                        NULL, True);
+    XFree(configs);
+    if (!notify_gl_ctx) {
+      fprintf(stderr, "AnDWM: cannot create notification GLX context\n");
+      return 0;
     }
-    notification_draw_marquee_line(x, y, width, line_h, 8, line, started,
-                                   scroll);
-    y += line_h;
-    lines++;
+    notify_gl_initialized = 1;
+  }
+  if (!notify_gl_pbuffer || notify_gl_pbuffer_w != w ||
+      notify_gl_pbuffer_h != h) {
+    if (notify_gl_pbuffer) {
+      glXMakeCurrent(dpy, None, NULL);
+      glXDestroyPbuffer(dpy, notify_gl_pbuffer);
+    }
+    pbuf_attrs[0] = GLX_PBUFFER_WIDTH;
+    pbuf_attrs[1] = (int)w;
+    pbuf_attrs[2] = GLX_PBUFFER_HEIGHT;
+    pbuf_attrs[3] = (int)h;
+    pbuf_attrs[4] = None;
+    notify_gl_pbuffer = glXCreatePbuffer(dpy, notify_gl_fbconfig, pbuf_attrs);
+    if (!notify_gl_pbuffer) {
+      notify_gl_pbuffer_w = notify_gl_pbuffer_h = 0;
+      fprintf(stderr, "AnDWM: cannot create notification GLX pbuffer\n");
+      return 0;
+    }
+    notify_gl_pbuffer_w = w;
+    notify_gl_pbuffer_h = h;
+  }
+  if (!glXMakeCurrent(dpy, notify_gl_pbuffer, notify_gl_ctx)) {
+    fprintf(stderr, "AnDWM: cannot bind notification GLX pbuffer\n");
+    return 0;
+  }
+  if (!notify_gl_blend_func_separate)
+    notify_gl_blend_func_separate = (NotificationGLBlendFuncSeparate)
+        glXGetProcAddressARB((const GLubyte *)"glBlendFuncSeparate");
+  return 1;
+}
+
+static void notification_gl_blend_separate(void) {
+  if (notify_gl_blend_func_separate)
+    notify_gl_blend_func_separate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                  GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  else
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+static GLFont *gl_font_create(void) {
+  GLFont *font;
+  Fnt *f;
+  double pixel_size = drw && drw->fonts ? drw->fonts->h : 14;
+
+  if (!gl_font_init_ft())
+    return NULL;
+  font = calloc(1, sizeof(*font));
+  if (!font)
+    return NULL;
+  font->pixel_size = pixel_size;
+
+  /* Mirror config.h's fontset for GL text. Xft's resolved pattern provides
+   * the actual font file, face index, and configured size for each entry. */
+  for (f = drw ? drw->fonts : NULL; f; f = f->next) {
+    FcChar8 *file = NULL;
+    double face_pixel_size = pixel_size;
+    int index = 0;
+
+    if (!f->xfont || !f->xfont->pattern ||
+        FcPatternGetString(f->xfont->pattern, FC_FILE, 0, &file) !=
+            FcResultMatch)
+      continue;
+    FcPatternGetDouble(f->xfont->pattern, FC_PIXEL_SIZE, 0,
+                       &face_pixel_size);
+    FcPatternGetInteger(f->xfont->pattern, FC_INDEX, 0, &index);
+    if (!font->face_count)
+      font->pixel_size = face_pixel_size;
+    gl_font_add_face(font, (const char *)file, index, face_pixel_size);
+  }
+
+  /* Keep a local system-font fallback for unusual setups where none of the
+   * configured Xft fonts expose a file that FreeType can open. */
+  if (!font->face_count) {
+    static const char *fallbacks[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        NULL};
+    for (int i = 0; fallbacks[i]; i++) {
+      if (gl_font_add_face(font, fallbacks[i], 0, font->pixel_size) >= 0)
+        goto face_loaded;
+    }
+    fprintf(stderr, "AnDWM: cannot find a FreeType font for notifications\n");
+    free(font);
+    return NULL;
+  }
+face_loaded:
+  font->height = drw && drw->fonts ? (int)drw->fonts->h
+      : (int)(font->faces[0].face->size->metrics.height >> 6);
+  if (font->height <= 0)
+    font->height = (int)ceil(pixel_size);
+  return font;
+}
+
+static int gl_font_add_face(GLFont *font, const char *file, int index,
+                            double pixel_size) {
+  GLFontFace *font_face;
+  if (!font || !file)
+    return -1;
+  if (pixel_size <= 0)
+    pixel_size = font->pixel_size > 0 ? font->pixel_size : 14;
+  for (unsigned int i = 0; i < font->face_count; i++)
+    if (font->faces[i].index == index &&
+        font->faces[i].pixel_size == pixel_size &&
+        !strcmp(font->faces[i].file, file))
+      return (int)i;
+  if (font->face_count >= LENGTH(font->faces))
+    return -1;
+  font_face = &font->faces[font->face_count];
+  memset(font_face, 0, sizeof(*font_face));
+  font_face->file = strdup(file);
+  font_face->index = index;
+  font_face->pixel_size = pixel_size;
+  if (!font_face->file ||
+      FT_New_Face(ft_lib, file, index, &font_face->face) ||
+      FT_Set_Char_Size(font_face->face, 0,
+                       (FT_F26Dot6)lround(pixel_size * 64.0), 72, 72)) {
+    if (font_face->face)
+      FT_Done_Face(font_face->face);
+    free(font_face->file);
+    memset(font_face, 0, sizeof(*font_face));
+    return -1;
+  }
+  font_face->hb_font = hb_ft_font_create_referenced(font_face->face);
+  if (!font_face->hb_font) {
+    FT_Done_Face(font_face->face);
+    free(font_face->file);
+    memset(font_face, 0, sizeof(*font_face));
+    return -1;
+  }
+  font->face_count++;
+  return (int)(font->face_count - 1);
+}
+
+static uint32_t notification_utf8_next(const char **text) {
+  const unsigned char *s = (const unsigned char *)*text;
+  uint32_t c;
+  if (s[0] < 0x80) {
+    *text += 1;
+    return s[0];
+  }
+  if (s[0] >= 0xc2 && s[0] <= 0xdf &&
+      (s[1] & 0xc0) == 0x80) {
+    c = ((uint32_t)(s[0] & 0x1f) << 6) | (s[1] & 0x3f);
+    *text += 2;
+    return c;
+  }
+  if (s[0] >= 0xe0 && s[0] <= 0xef &&
+      (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80 &&
+      !(s[0] == 0xe0 && s[1] < 0xa0) &&
+      !(s[0] == 0xed && s[1] >= 0xa0)) {
+    c = ((uint32_t)(s[0] & 0x0f) << 12) |
+        ((uint32_t)(s[1] & 0x3f) << 6) | (s[2] & 0x3f);
+    *text += 3;
+    return c;
+  }
+  if (s[0] >= 0xf0 && s[0] <= 0xf4 &&
+      (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80 &&
+      (s[3] & 0xc0) == 0x80 &&
+      !(s[0] == 0xf0 && s[1] < 0x90) &&
+      !(s[0] == 0xf4 && s[1] > 0x8f)) {
+    c = ((uint32_t)(s[0] & 7) << 18) | ((uint32_t)(s[1] & 0x3f) << 12) |
+        ((uint32_t)(s[2] & 0x3f) << 6) | (s[3] & 0x3f);
+    *text += 4;
+    return c;
+  }
+  *text += 1;
+  return 0xfffd;
+}
+
+static int gl_font_face_for_codepoint(GLFont *font, uint32_t codepoint) {
+  FcPattern *pattern = NULL, *match = NULL;
+  FcCharSet *charset = NULL;
+  FcChar8 *file = NULL;
+  FcResult match_result;
+  int index = 0, face_index = -1;
+
+  if (!font || !codepoint)
+    return 0;
+  for (unsigned int i = 0; i < font->face_count; i++)
+    if (FT_Get_Char_Index(font->faces[i].face, codepoint))
+      return (int)i;
+
+  pattern = FcPatternCreate();
+  charset = FcCharSetCreate();
+  if (pattern && charset && FcCharSetAddChar(charset, codepoint) &&
+      FcPatternAddCharSet(pattern, FC_CHARSET, charset)) {
+    FcConfigSubstitute(NULL, pattern, FcMatchPattern);
+    FcDefaultSubstitute(pattern);
+    match = FcFontMatch(NULL, pattern, &match_result);
+  }
+  if (match && FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch) {
+    FcPatternGetInteger(match, FC_INDEX, 0, &index);
+    face_index = gl_font_add_face(font, (const char *)file, index,
+                                  font->pixel_size);
+    if (face_index >= 0 &&
+        !FT_Get_Char_Index(font->faces[face_index].face, codepoint))
+      face_index = -1;
+  }
+  if (match)
+    FcPatternDestroy(match);
+  if (pattern)
+    FcPatternDestroy(pattern);
+  if (charset)
+    FcCharSetDestroy(charset);
+  return face_index >= 0 ? face_index : 0;
+}
+
+static GLGlyph *gl_font_glyph(GLFont *font, unsigned int face_index,
+                              unsigned int glyph_index) {
+  GLGlyph *g = NULL;
+  FT_Face face;
+  FT_GlyphSlot slot;
+  unsigned char *bitmap;
+  int pitch, x, y;
+
+  if (!font || face_index >= font->face_count)
+    return NULL;
+  for (unsigned int i = 0; i < font->glyph_count; i++)
+    if (font->glyphs[i].face_index == face_index &&
+        font->glyphs[i].glyph_index == glyph_index)
+      return &font->glyphs[i];
+  if (font->glyph_count >= LENGTH(font->glyphs))
+    return NULL;
+
+  face = font->faces[face_index].face;
+  if (FT_Load_Glyph(face, glyph_index, FT_LOAD_RENDER))
+    return NULL;
+  slot = face->glyph;
+  g = &font->glyphs[font->glyph_count++];
+  memset(g, 0, sizeof(*g));
+  g->face_index = face_index;
+  g->glyph_index = glyph_index;
+  g->w = slot->bitmap.width;
+  g->h = slot->bitmap.rows;
+  g->bearing_x = slot->bitmap_left;
+  g->bearing_y = slot->bitmap_top;
+  g->advance = slot->advance.x >> 6;
+  g->loaded = 1;
+  if (!g->w || !g->h)
+    return g;
+
+  bitmap = calloc((size_t)g->w * g->h, 1);
+  if (!bitmap)
+    return g;
+  pitch = slot->bitmap.pitch;
+  for (y = 0; y < g->h; y++) {
+    const unsigned char *row = pitch >= 0
+        ? slot->bitmap.buffer + y * pitch
+        : slot->bitmap.buffer + (g->h - 1 - y) * -pitch;
+    for (x = 0; x < g->w; x++) {
+      if (slot->bitmap.pixel_mode == FT_PIXEL_MODE_MONO)
+        bitmap[y * g->w + x] = (row[x >> 3] & (0x80 >> (x & 7))) ? 255 : 0;
+      else
+        bitmap[y * g->w + x] = row[x];
+    }
+  }
+  glGenTextures(1, &g->tex_id);
+  glBindTexture(GL_TEXTURE_2D, g->tex_id);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, g->w, g->h, 0, GL_ALPHA,
+               GL_UNSIGNED_BYTE, bitmap);
+  free(bitmap);
+  return g;
+}
+
+static unsigned int gl_font_text_width(const char *text) {
+  int64_t width = 0;
+  const char *run_start, *p;
+  if (!text || !gl_font)
+    return 0;
+  p = text;
+  while (*p) {
+    const char *next = p;
+    unsigned int face_index;
+    hb_buffer_t *buffer;
+    hb_glyph_position_t *positions;
+    unsigned int count;
+
+    face_index = (unsigned int)gl_font_face_for_codepoint(
+        gl_font, notification_utf8_next(&next));
+    run_start = p;
+    p = next;
+    while (*p) {
+      next = p;
+      if ((unsigned int)gl_font_face_for_codepoint(
+              gl_font, notification_utf8_next(&next)) != face_index)
+        break;
+      p = next;
+    }
+    buffer = hb_buffer_create();
+    if (!buffer)
+      continue;
+    hb_buffer_add_utf8(buffer, run_start, (int)(p - run_start), 0,
+                       (int)(p - run_start));
+    hb_buffer_guess_segment_properties(buffer);
+    hb_shape(gl_font->faces[face_index].hb_font, buffer, NULL, 0);
+    positions = hb_buffer_get_glyph_positions(buffer, &count);
+    for (unsigned int i = 0; i < count; i++)
+      width += MAX(positions[i].x_advance, 0);
+    hb_buffer_destroy(buffer);
+  }
+  return (unsigned int)MAX((width + 63) / 64, 0);
+}
+
+static void gl_font_draw_text(const char *text, int x, int baseline,
+                              unsigned int max_width, float r, float g,
+                              float b) {
+  int64_t pen_x = (int64_t)x * 64;
+  const char *p = text;
+  if (!text || !gl_font)
+    return;
+  glEnable(GL_TEXTURE_2D);
+  glEnable(GL_BLEND);
+  notification_gl_blend_separate();
+  glColor4f(r, g, b, 1.0f);
+  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+  while (*p) {
+    const char *run_start = p, *next = p;
+    unsigned int face_index = (unsigned int)gl_font_face_for_codepoint(
+        gl_font, notification_utf8_next(&next));
+    hb_buffer_t *buffer;
+    hb_glyph_info_t *infos;
+    hb_glyph_position_t *positions;
+    unsigned int count;
+    int64_t run_x = pen_x;
+
+    p = next;
+    while (*p) {
+      next = p;
+      if ((unsigned int)gl_font_face_for_codepoint(
+              gl_font, notification_utf8_next(&next)) != face_index)
+        break;
+      p = next;
+    }
+    buffer = hb_buffer_create();
+    if (!buffer)
+      continue;
+    hb_buffer_add_utf8(buffer, run_start, (int)(p - run_start), 0,
+                       (int)(p - run_start));
+    hb_buffer_guess_segment_properties(buffer);
+    hb_shape(gl_font->faces[face_index].hb_font, buffer, NULL, 0);
+    infos = hb_buffer_get_glyph_infos(buffer, &count);
+    positions = hb_buffer_get_glyph_positions(buffer, &count);
+    for (unsigned int i = 0; i < count; i++) {
+      GLGlyph *glyph = gl_font_glyph(gl_font, face_index, infos[i].codepoint);
+      float pen = (float)(run_x + positions[i].x_offset) / 64.0f;
+      float x1, y1, x2, y2;
+      if ((uint64_t)MAX(run_x + positions[i].x_advance -
+                            (int64_t)x * 64, 0) >
+          (uint64_t)max_width * 64) {
+        hb_buffer_destroy(buffer);
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+        return;
+      }
+      if (glyph && glyph->tex_id && glyph->w > 0 && glyph->h > 0) {
+        x1 = pen + glyph->bearing_x;
+        y1 = baseline - glyph->bearing_y -
+             (float)positions[i].y_offset / 64.0f;
+        x2 = x1 + glyph->w;
+        y2 = y1 + glyph->h;
+        glBindTexture(GL_TEXTURE_2D, glyph->tex_id);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(x1, y1);
+        glTexCoord2f(1, 0); glVertex2f(x2, y1);
+        glTexCoord2f(1, 1); glVertex2f(x2, y2);
+        glTexCoord2f(0, 1); glVertex2f(x1, y2);
+        glEnd();
+      }
+      run_x += positions[i].x_advance;
+    }
+    pen_x = run_x;
+    hb_buffer_destroy(buffer);
+    if ((uint64_t)MAX(pen_x - (int64_t)x * 64, 0) >
+        (uint64_t)max_width * 64)
+      break;
+  }
+  glDisable(GL_BLEND);
+  glDisable(GL_TEXTURE_2D);
+}
+
+static void gl_font_free(GLFont *font) {
+  if (!font)
+    return;
+  for (unsigned int i = 0; i < font->glyph_count; i++)
+    if (font->glyphs[i].tex_id)
+      glDeleteTextures(1, &font->glyphs[i].tex_id);
+  for (unsigned int i = 0; i < font->face_count; i++) {
+    if (font->faces[i].hb_font)
+      hb_font_destroy(font->faces[i].hb_font);
+    if (font->faces[i].face)
+      FT_Done_Face(font->faces[i].face);
+    free(font->faces[i].file);
+  }
+  free(font);
+}
+
+static void notification_gl_draw_body(Notification *n, int x, int *baseline,
+                                      int line_h, unsigned int width,
+                                      unsigned int max_lines,
+                                      float r, float g, float b) {
+  unsigned int lines = notification_body_wrap(n, width, max_lines);
+
+  for (unsigned int i = 0; i < lines; i++) {
+    gl_font_draw_text(n->body_wrap_lines[i], x, *baseline, width, r, g, b);
+    *baseline += line_h;
   }
 }
 
-static void notification_dim_image(Picture image, int x, int y,
-                                   unsigned int w, unsigned int h) {
-  Picture overlay;
-  XRenderColor color = { 0, 0, 0, 0x4000 };
+static unsigned long notification_channel_pixel(unsigned long mask,
+                                                unsigned char value) {
+  unsigned int shift = 0;
+  unsigned long max;
+  if (!mask)
+    return 0;
+  while (!(mask & 1)) {
+    mask >>= 1;
+    shift++;
+  }
+  max = mask;
+  return ((((unsigned long)value * max + 127) / 255) << shift);
+}
 
-  /* Reuse drw->picture.  During the history foreground pass it is already
-   * bound to the temporary 32-bit ARGB pixmap; creating another picture from
-   * a visual can produce BadMatch when drawable depth and visual differ. */
-  if (!drw || !drw->picture || !image)
+static unsigned char notification_vertical_alpha(unsigned int y,
+                                                 unsigned int h) {
+  static const double stops[] = {0.0, 0.0, 0.1, 0.2, 0.3, 0.4,
+                                 0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+  /* Finder's accelerating curve, remapped from 100% at the top to 50% at
+   * the bottom while retaining the same transition profile. */
+  static const unsigned char alpha[] = {
+      255, 255, 254, 251, 246, 238, 228, 215, 200, 182, 162, 128};
+  double position = h > 1 ? (double)y / (double)(h - 1) : 0.0;
+
+  for (unsigned int i = 1; i < LENGTH(stops); i++) {
+    if (position <= stops[i]) {
+      double span = stops[i] - stops[i - 1];
+      double fraction = span > 0.0 ? (position - stops[i - 1]) / span : 0.0;
+      return (unsigned char)lround(alpha[i - 1] +
+                                   (alpha[i] - alpha[i - 1]) * fraction);
+    }
+  }
+  return alpha[LENGTH(alpha) - 1];
+}
+
+static void notification_present_gl(unsigned int w, unsigned int h,
+                                   Drawable target) {
+  unsigned char *pixels;
+  Visual *visual;
+  int depth;
+  XImage *image;
+  GC gc;
+  Pixmap pixmap;
+  Picture src = None, dest = None;
+  XRenderPictFormat *format, *visual_format;
+  unsigned long alpha_mask = 0;
+
+  /* History frames, including their per-pixel alpha, are uploaded directly
+   * into the reusable content pixmap. Scrolling then uses XCopyArea. */
+  if (target != None || (notify_history_active && selmon &&
+                         selmon->barcenterwin)) {
+    uint16_t endian_test = 1;
+    int native_byte_order = *(unsigned char *)&endian_test
+                                ? LSBFirst : MSBFirst;
+    unsigned char *row = NULL;
+    Drawable dest = target != None ? target : selmon->barcenterwin;
+
+    visual = finder_argb_visual ? finder_argb_visual
+                                : DefaultVisual(dpy, screen);
+    depth = finder_argb_visual ? finder_argb_depth
+                               : DefaultDepth(dpy, screen);
+    visual_format = XRenderFindVisualFormat(dpy, visual);
+    if (visual_format && visual_format->type == PictTypeDirect)
+      alpha_mask = (unsigned long)visual_format->direct.alphaMask
+                   << visual_format->direct.alpha;
+    image = XCreateImage(dpy, visual, (unsigned int)depth, ZPixmap, 0, NULL,
+                         w, h, 32, 0);
+    if (image && image->bits_per_pixel == 32 &&
+        image->byte_order == native_byte_order &&
+        image->bytes_per_line == (int)(w * 4U) &&
+        visual->red_mask == 0x00ff0000UL &&
+        visual->green_mask == 0x0000ff00UL &&
+        visual->blue_mask == 0x000000ffUL &&
+        (!alpha_mask || alpha_mask == 0xff000000UL)) {
+      image->data = calloc((size_t)image->bytes_per_line, h);
+      row = malloc((size_t)image->bytes_per_line);
+      if (image->data && row) {
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_BGRA,
+                     GL_UNSIGNED_BYTE, image->data);
+        /* Preserve transparent history foreground pixels so text and images
+         * can be composited above the separately-gradient-masked background.
+         * Popups use the gradient directly as one complete surface. */
+        for (unsigned int y = 0; y < h; y++) {
+          unsigned char opacity = target != None
+              ? 0 : notification_vertical_alpha(h - 1U - y, h);
+          for (unsigned int x = 0; x < w; x++) {
+            unsigned char *pixel = (unsigned char *)image->data +
+                (size_t)y * image->bytes_per_line + (size_t)x * 4U;
+            if (target == None)
+              pixel[3] = opacity;
+          }
+        }
+        for (unsigned int y = 0; y < h / 2; y++) {
+          unsigned char *top = (unsigned char *)image->data +
+                               (size_t)y * image->bytes_per_line;
+          unsigned char *bottom = (unsigned char *)image->data +
+                                  (size_t)(h - 1 - y) * image->bytes_per_line;
+          memcpy(row, top, (size_t)image->bytes_per_line);
+          memcpy(top, bottom, (size_t)image->bytes_per_line);
+          memcpy(bottom, row, (size_t)image->bytes_per_line);
+        }
+        gc = XCreateGC(dpy, dest, 0, NULL);
+        if (gc) {
+          XPutImage(dpy, dest, gc, image, 0, 0, 0, 0, w, h);
+          XFreeGC(dpy, gc);
+          free(row);
+          XDestroyImage(image);
+          return;
+        }
+      }
+      free(row);
+    }
+    if (image)
+      XDestroyImage(image);
+  }
+
+  pixels = calloc((size_t)w * h, 4);
+  if (!pixels)
     return;
-  overlay = XRenderCreateSolidFill(dpy, &color);
-  if (overlay)
-    /* Use the image alpha as the mask.  This darkens only visible pixels
-     * and leaves transparent pixels and the source alpha untouched. */
-    XRenderComposite(dpy, PictOpOver, overlay, image, drw->picture, 0, 0, 0,
-                     0, x, y, w, h);
-  if (overlay)
-    XRenderFreePicture(dpy, overlay);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+  visual = finder_argb_visual ? finder_argb_visual : DefaultVisual(dpy, screen);
+  depth = finder_argb_visual ? finder_argb_depth : DefaultDepth(dpy, screen);
+  visual_format = XRenderFindVisualFormat(dpy, visual);
+  if (visual_format && visual_format->type == PictTypeDirect)
+    alpha_mask = (unsigned long)visual_format->direct.alphaMask
+                 << visual_format->direct.alpha;
+  image = XCreateImage(dpy, visual, (unsigned int)depth, ZPixmap, 0, NULL,
+                       w, h, 32, 0);
+  if (!image) {
+    free(pixels);
+    return;
+  }
+  image->data = calloc((size_t)image->bytes_per_line, h);
+  if (!image->data) {
+    image->f.destroy_image(image);
+    free(pixels);
+    return;
+  }
+  for (unsigned int py = 0; py < h; py++)
+    for (unsigned int px = 0; px < w; px++) {
+      size_t src_offset = ((size_t)(h - 1 - py) * w + px) * 4;
+      unsigned char r = pixels[src_offset];
+      unsigned char g = pixels[src_offset + 1];
+      unsigned char b = pixels[src_offset + 2];
+      /* Both popup and history pixels remain transparent foreground. The
+       * viewport's fixed background gradient is composited separately. */
+      unsigned char a = pixels[src_offset + 3];
+      unsigned long pixel = notification_channel_pixel(visual->red_mask, r) |
+                            notification_channel_pixel(visual->green_mask, g) |
+                            notification_channel_pixel(visual->blue_mask, b) |
+                            notification_channel_pixel(alpha_mask, a);
+      XPutPixel(image, (int)px, (int)py, pixel);
+    }
+  free(pixels);
+
+  /* The history cache is a pixmap with the same depth as the bar window.
+   * Use the generic XImage conversion when the fast BGRA layout above is
+   * unavailable, rather than leaving the cache uninitialized. */
+  if (target != None) {
+    gc = XCreateGC(dpy, target, 0, NULL);
+    if (gc) {
+      XPutImage(dpy, target, gc, image, 0, 0, 0, 0, w, h);
+      XFreeGC(dpy, gc);
+    }
+    XDestroyImage(image);
+    return;
+  }
+
+  pixmap = XCreatePixmap(dpy, root, w, h, (unsigned int)depth);
+  if (!pixmap) {
+    XDestroyImage(image);
+    return;
+  }
+  gc = XCreateGC(dpy, pixmap, 0, NULL);
+  if (!gc) {
+    XFreePixmap(dpy, pixmap);
+    XDestroyImage(image);
+    return;
+  }
+  XPutImage(dpy, pixmap, gc, image, 0, 0, 0, 0, w, h);
+  format = XRenderFindStandardFormat(dpy, depth == 32 ? PictStandardARGB32
+                                                       : PictStandardRGB24);
+  if (format)
+    src = XRenderCreatePicture(dpy, pixmap, format, 0, NULL);
+  if (finder_argb_visual)
+    format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+  else
+    format = XRenderFindVisualFormat(dpy, visual);
+  if (format)
+    dest = XRenderCreatePicture(dpy, selmon->barcenterwin, format, 0, NULL);
+  if (src && dest && notification_history_background_create() &&
+      notification_history_mask_create(w, h)) {
+    XRenderColor transparent = {0, 0, 0, 0};
+    XRenderFillRectangle(dpy, PictOpSrc, dest, &transparent, 0, 0, w, h);
+    XRenderComposite(dpy, PictOpOver, notify_history_background_picture,
+                     notify_history_mask_picture, dest,
+                     0, 0, 0, 0, 0, 0, w, h);
+    XRenderComposite(dpy, PictOpOver, src, None, dest,
+                     0, 0, 0, 0, 0, 0, w, h);
+  } else if (src && dest) {
+    XRenderComposite(dpy, PictOpSrc, src, None, dest,
+                     0, 0, 0, 0, 0, 0, w, h);
+  }
+  if (src) XRenderFreePicture(dpy, src);
+  if (dest) XRenderFreePicture(dpy, dest);
+  XFreeGC(dpy, gc);
+  XFreePixmap(dpy, pixmap);
+  XDestroyImage(image);
+}
+
+/* Render the complete popup, including its image and text, on a dedicated
+ * GLX pbuffer.  It is then copied as one full-height image, never from dwm's
+ * bar-sized scratch drawable. */
+static uint64_t notification_hash_bytes(uint64_t hash, const void *data,
+                                       size_t len) {
+  const unsigned char *bytes = data;
+  for (size_t i = 0; i < len; i++) {
+    hash ^= bytes[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+static uint64_t notification_hash_string(uint64_t hash, const char *text) {
+  static const unsigned char null_marker = 0xff;
+  if (!text)
+    return notification_hash_bytes(hash, &null_marker, sizeof(null_marker));
+  hash = notification_hash_bytes(hash, text, strlen(text));
+  return notification_hash_bytes(hash, "\0", 1);
+}
+
+static uint64_t notification_hash_item(uint64_t hash, const Notification *n) {
+  hash = notification_hash_bytes(hash, &n->id, sizeof(n->id));
+  hash = notification_hash_string(hash, n->summary);
+  hash = notification_hash_string(hash, n->body);
+  hash = notification_hash_string(hash, n->input_text);
+  hash = notification_hash_string(hash, n->input_placeholder);
+  hash = notification_hash_bytes(hash, &n->img_pixels, sizeof(n->img_pixels));
+  hash = notification_hash_bytes(hash, &n->img_w, sizeof(n->img_w));
+  hash = notification_hash_bytes(hash, &n->img_h, sizeof(n->img_h));
+  hash = notification_hash_bytes(hash, &n->action_count,
+                                 sizeof(n->action_count));
+  hash = notification_hash_bytes(hash, &n->input_enabled,
+                                 sizeof(n->input_enabled));
+  hash = notification_hash_bytes(hash, &n->action_used,
+                                 sizeof(n->action_used));
+  for (unsigned int i = 0; n->actions && i < n->action_count; i++)
+    hash = notification_hash_string(hash, n->actions[i]);
+  return hash;
+}
+
+static uint64_t notification_frame_hash(int history) {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  Notification *n;
+  hash = notification_hash_bytes(hash, &history, sizeof(history));
+  hash = notification_hash_bytes(hash, &notify_width, sizeof(notify_width));
+  hash = notification_hash_bytes(hash, &notify_height, sizeof(notify_height));
+  if (history) {
+    hash = notification_hash_bytes(hash, &notify_history_count,
+                                   sizeof(notify_history_count));
+    hash = notification_hash_bytes(hash, &notify_history_hover_entry,
+                                   sizeof(notify_history_hover_entry));
+    hash = notification_hash_bytes(hash, &notify_history_hover_action,
+                                   sizeof(notify_history_hover_action));
+    hash = notification_hash_bytes(hash, &notify_history_input,
+                                   sizeof(notify_history_input));
+    for (n = notify_history_head; n; n = n->next)
+      hash = notification_hash_item(hash, n);
+  } else if (notify_current) {
+    hash = notification_hash_item(hash, notify_current);
+    hash = notification_hash_bytes(hash, &notify_hovered,
+                                   sizeof(notify_hovered));
+    hash = notification_hash_bytes(hash, &notify_hover, sizeof(notify_hover));
+    hash = notification_hash_bytes(hash, &notify_input_focus,
+                                   sizeof(notify_input_focus));
+    hash = notification_hash_bytes(hash, &notify_text_y, sizeof(notify_text_y));
+    hash = notification_hash_bytes(hash, &notify_image_y,
+                                   sizeof(notify_image_y));
+    hash = notification_hash_bytes(hash, &notify_input_x,
+                                   sizeof(notify_input_x));
+    hash = notification_hash_bytes(hash, &notify_input_y,
+                                   sizeof(notify_input_y));
+    hash = notification_hash_bytes(hash, &notify_input_w,
+                                   sizeof(notify_input_w));
+    hash = notification_hash_bytes(hash, &notify_input_h,
+                                   sizeof(notify_input_h));
+    hash = notification_hash_bytes(hash, notify_action_x,
+                                   sizeof(notify_action_x));
+    hash = notification_hash_bytes(hash, notify_action_w,
+                                   sizeof(notify_action_w));
+    hash = notification_hash_bytes(hash, &notify_action_y,
+                                   sizeof(notify_action_y));
+  }
+  return hash;
+}
+
+static int notification_frame_cached(int history) {
+  return notify_render_cache_valid &&
+         notify_render_cache_hash == notification_frame_hash(history);
 }
 
 static void notification_draw(void) {
-  return;
+  Notification *n = notify_current;
+  unsigned int w = notify_width, h = notify_height;
+  int pad = NOTIFY_PADDING, x = pad, baseline, line_h, ascender;
+  int body_line_h;
+  int img_w = 0, img_h = 0;
+  int text_x, text_width;
+
+  if (!n || !notify_active || !w || !h || !selmon || !selmon->barcenterwin)
+    return;
+  if (notification_frame_cached(0))
+    return;
+  if (!notification_gl_init(w, h))
+    return;
+  if (!gl_font)
+    gl_font = gl_font_create();
+  if (!gl_font)
+    return;
+  line_h = MAX(gl_font->height, 1);
+  body_line_h = MAX((int)ceil(gl_font->pixel_size) +
+                        NOTIFY_BODY_LINE_GAP,
+                    1);
+  ascender = MAX(1, (int)(gl_font->faces[0].face->size->metrics.ascender >> 6));
+  if (n->image && n->image_w && n->image_h) {
+    img_h = MIN((int)n->image_h, NOTIFY_IMAGE_MAX_H);
+    img_w = (int)((double)n->image_w * img_h / n->image_h);
+    if (img_w > 100) {
+      img_w = 100;
+      img_h = MAX(1, (int)((double)n->image_h * img_w / n->image_w));
+    }
+  }
+  text_x = pad + (img_w ? img_w + 12 : 0);
+  text_width = MAX(1, (int)w - text_x - pad);
+  baseline = pad + notify_text_y + ascender;
+
+  glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho(0, w, h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0, 0, 0, 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDisable(GL_TEXTURE_2D);
+
+  if (img_w > 0 && n->img_pixels && n->img_w > 0 && n->img_h > 0) {
+    notification_image_texture_create(n);
+    if (n->img_texture)
+      glBindTexture(GL_TEXTURE_2D, n->img_texture);
+    if (n->img_texture) {
+      glEnable(GL_TEXTURE_2D);
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      glColor4f(1, 1, 1, 1);
+      glBegin(GL_QUADS);
+      glTexCoord2f(0, 0); glVertex2f(x, pad + notify_image_y);
+      glTexCoord2f(1, 0); glVertex2f(x + img_w, pad + notify_image_y);
+      glTexCoord2f(1, 1); glVertex2f(x + img_w, pad + notify_image_y + img_h);
+      glTexCoord2f(0, 1); glVertex2f(x, pad + notify_image_y + img_h);
+      glEnd();
+      glDisable(GL_BLEND);
+      glDisable(GL_TEXTURE_2D);
+    }
+  }
+
+  if (n->summary && *n->summary) {
+    gl_font_draw_text(n->summary, text_x, baseline, text_width,
+                      1.0f, 1.0f, 1.0f);
+    baseline += line_h + 2;
+  }
+  if (n->body && *n->body)
+    notification_gl_draw_body(n, text_x, &baseline, body_line_h,
+                              text_width,
+                              notify_hovered
+                                  ? NOTIFY_POPUP_BODY_HOVER_MAX_LINES
+                                  : NOTIFY_POPUP_BODY_MAX_LINES,
+                              0.82f, 0.85f, 0.9f);
+
+  /* Controls are intentionally just text: their rows have hitboxes but no
+   * filled rectangles, borders, or other button/input backgrounds. */
+  if (n->input_enabled) {
+    const char *value = n->input_text && *n->input_text
+        ? n->input_text : n->input_placeholder;
+    const char *visible = value;
+    unsigned int max_width = (unsigned int)MAX(1, notify_input_w);
+    if (!value)
+      value = "";
+    visible = value;
+    if (n->input_text && *n->input_text) {
+      visible = n->input_text;
+      while (*visible && gl_font_text_width(visible) +
+             (notify_input_focus ? gl_font_text_width("|") : 0U) > max_width)
+        notification_utf8_next(&visible);
+    }
+    if (notify_input_focus) {
+      const char *typed = n->input_text && *n->input_text ? visible : "";
+      size_t len = strlen(typed);
+      char *with_cursor = malloc(len + 2);
+      if (with_cursor) {
+        memcpy(with_cursor, typed, len);
+        with_cursor[len] = '|';
+        with_cursor[len + 1] = '\0';
+        gl_font_draw_text(with_cursor, notify_input_x,
+                          notify_input_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                          max_width,
+                          1.0f, 1.0f, 1.0f);
+        if (!len && value && *value) {
+          unsigned int cursor_w = notification_text_width("|");
+          gl_font_draw_text(value, notify_input_x + cursor_w,
+                            notify_input_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                            max_width > cursor_w ? max_width - cursor_w : 0,
+                            0.58f, 0.61f, 0.66f);
+        }
+        free(with_cursor);
+      }
+    } else {
+      float r = n->input_text && *n->input_text ? 0.92f : 0.58f;
+      float g = n->input_text && *n->input_text ? 0.93f : 0.61f;
+      float b = n->input_text && *n->input_text ? 0.96f : 0.66f;
+      gl_font_draw_text(visible, notify_input_x,
+                        notify_input_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                        max_width, r, g, b);
+    }
+  }
+  for (unsigned int i = 0; notify_hovered && n->actions &&
+       i < MIN(n->action_count / 2, LENGTH(notify_action_x)); i++) {
+    const char *label = n->actions[i * 2 + 1];
+    unsigned int cell_w = (unsigned int)MAX(1, notify_action_w[i]);
+    unsigned int label_w = notification_text_width(label);
+    int label_x = notify_action_x[i] +
+        (int)(cell_w - MIN(label_w, cell_w));
+    int hovered = notify_hover == (int)i;
+    float r = hovered ? 1.0f : 0.82f;
+    float g = hovered ? 1.0f : 0.85f;
+    float b = hovered ? 1.0f : 0.9f;
+    gl_font_draw_text(label, label_x,
+                      notify_action_y + MAX(0, (NOTIFY_BUTTON_H - line_h) / 2) + ascender,
+                      cell_w, r, g, b);
+  }
+
+  notification_present_gl(w, h, None);
+  notify_render_cache_hash = notification_frame_hash(0);
+  notify_render_cache_valid = 1;
+}
+
+static unsigned int notification_history_surface_height(void) {
+  Notification *n;
+  unsigned int height = 2U * NOTIFY_PADDING;
+
+  for (n = notify_history_head; n; n = n->next)
+    height += notification_history_entry_height(n);
+  return MAX(height, notify_height);
+}
+
+static int notification_history_mask_create(unsigned int w,
+                                            unsigned int h) {
+  XRenderPictFormat *format;
+  Pixmap pixmap;
+  Picture picture;
+
+  if (notify_history_mask_picture && notify_history_mask_w == w &&
+      notify_history_mask_h == h)
+    return 1;
+  if (notify_history_mask_picture)
+    XRenderFreePicture(dpy, notify_history_mask_picture);
+  if (notify_history_mask_pixmap)
+    XFreePixmap(dpy, notify_history_mask_pixmap);
+  notify_history_mask_picture = None;
+  notify_history_mask_pixmap = None;
+  notify_history_mask_w = notify_history_mask_h = 0;
+
+  format = XRenderFindStandardFormat(dpy, PictStandardA8);
+  if (!format)
+    return 0;
+  pixmap = XCreatePixmap(dpy, root, w, h, 8);
+  if (!pixmap)
+    return 0;
+  picture = XRenderCreatePicture(dpy, pixmap, format, 0, NULL);
+  if (!picture) {
+    XFreePixmap(dpy, pixmap);
+    return 0;
+  }
+  for (unsigned int y = 0; y < h; y++) {
+    unsigned char opacity = notification_vertical_alpha(y, h);
+    XRenderColor color = {0, 0, 0, (unsigned short)(opacity * 257U)};
+    XRenderFillRectangle(dpy, PictOpSrc, picture, &color, 0, (int)y, w, 1);
+  }
+  notify_history_mask_pixmap = pixmap;
+  notify_history_mask_picture = picture;
+  notify_history_mask_w = w;
+  notify_history_mask_h = h;
+  return 1;
+}
+
+static int notification_history_background_create(void) {
+  XRenderPictFormat *format;
+  XRenderPictureAttributes attributes = {0};
+  XRenderColor color = {7864, 8519, 11141, 65535};
+  Pixmap pixmap;
+  Picture picture;
+
+  if (notify_history_background_picture)
+    return 1;
+  format = XRenderFindStandardFormat(dpy, PictStandardARGB32);
+  if (!format)
+    return 0;
+  pixmap = XCreatePixmap(dpy, root, 1, 1, 32);
+  if (!pixmap)
+    return 0;
+  attributes.repeat = True;
+  picture = XRenderCreatePicture(dpy, pixmap, format, CPRepeat, &attributes);
+  if (!picture) {
+    XFreePixmap(dpy, pixmap);
+    return 0;
+  }
+  XRenderFillRectangle(dpy, PictOpSrc, picture, &color, 0, 0, 1, 1);
+  notify_history_background_pixmap = pixmap;
+  notify_history_background_picture = picture;
+  return 1;
+}
+
+static int notification_history_cache_create(unsigned int w,
+                                             unsigned int h) {
+  XWindowAttributes attr;
+  Pixmap pixmap;
+  GC gc;
+  XRenderPictFormat *format;
+
+  if (!selmon || !selmon->barcenterwin || !w || !h ||
+      !XGetWindowAttributes(dpy, selmon->barcenterwin, &attr))
+    return 0;
+  pixmap = XCreatePixmap(dpy, selmon->barcenterwin, w, h,
+                         (unsigned int)attr.depth);
+  if (!pixmap)
+    return 0;
+  gc = XCreateGC(dpy, pixmap, 0, NULL);
+  if (!gc) {
+    XFreePixmap(dpy, pixmap);
+    return 0;
+  }
+  if (notify_history_gc)
+    XFreeGC(dpy, notify_history_gc);
+  if (notify_history_picture)
+    XRenderFreePicture(dpy, notify_history_picture);
+  if (notify_history_pixmap)
+    XFreePixmap(dpy, notify_history_pixmap);
+  notify_history_pixmap = pixmap;
+  notify_history_gc = gc;
+  format = XRenderFindStandardFormat(dpy, attr.depth == 32
+      ? PictStandardARGB32 : PictStandardRGB24);
+  notify_history_picture = format
+      ? XRenderCreatePicture(dpy, pixmap, format, 0, NULL) : None;
+  notify_history_pixmap_w = w;
+  notify_history_pixmap_h = h;
+  notify_render_cache_valid = 0;
+  return 1;
+}
+
+static void notification_history_present(void) {
+  unsigned int pad, content_h, content_src_y;
+  XWindowAttributes attr;
+  XRenderPictFormat *dest_format;
+
+  if (!notify_history_active || !notify_history_pixmap ||
+      !notify_history_gc || !selmon || !selmon->barcenterwin)
+    return;
+  if (notify_width > notify_history_pixmap_w ||
+      notify_history_scroll < 0)
+    return;
+
+  /* Keep the viewport padding fixed while only scrolling the content region.
+   * The old GL path used a scissor rectangle for exactly this clipping. */
+  pad = MIN((unsigned int)NOTIFY_PADDING, notify_height / 2U);
+  content_h = notify_height - 2U * pad;
+  content_src_y = pad + (unsigned int)notify_history_scroll;
+  if (notify_history_pixmap_h < content_src_y)
+    return;
+  content_h = MIN(content_h, notify_history_pixmap_h - content_src_y);
+  if (notify_history_dest_window != selmon->barcenterwin) {
+    if (notify_history_dest_picture)
+      XRenderFreePicture(dpy, notify_history_dest_picture);
+    notify_history_dest_picture = None;
+    notify_history_dest_window = selmon->barcenterwin;
+  }
+  if (notify_history_picture &&
+      notification_history_background_create() &&
+      notification_history_mask_create(notify_width, notify_height) &&
+      (notify_history_dest_picture ||
+       (XGetWindowAttributes(dpy, selmon->barcenterwin, &attr) &&
+        (dest_format = XRenderFindVisualFormat(dpy, attr.visual)) &&
+        (notify_history_dest_picture = XRenderCreatePicture(
+             dpy, selmon->barcenterwin, dest_format, 0, NULL))))) {
+    XRenderComposite(dpy, PictOpSrc, notify_history_background_picture,
+                     notify_history_mask_picture, notify_history_dest_picture,
+                     0, 0, 0, 0, 0, 0, notify_width, notify_height);
+    if (content_h)
+      XRenderComposite(dpy, PictOpOver, notify_history_picture, None,
+                       notify_history_dest_picture,
+                       0, (int)content_src_y, 0, (int)pad, 0, (int)pad,
+                       notify_width, content_h);
+    XFlush(dpy);
+    return;
+  }
+  if (pad) {
+    XCopyArea(dpy, notify_history_pixmap, selmon->barcenterwin,
+              notify_history_gc, 0, 0, notify_width, pad, 0, 0);
+    XCopyArea(dpy, notify_history_pixmap, selmon->barcenterwin,
+              notify_history_gc, 0, 0, notify_width, pad, 0,
+              (int)(notify_height - pad));
+  }
+  if (content_h)
+    XCopyArea(dpy, notify_history_pixmap, selmon->barcenterwin,
+              notify_history_gc, 0, (int)content_src_y, notify_width,
+              content_h, 0, (int)pad);
+  XFlush(dpy);
 }
 
 static void notification_history_draw(void) {
-  return;
-}
+  Notification *n;
+  unsigned int w = notify_width, h = notification_history_surface_height();
+  unsigned int pad = NOTIFY_PADDING, content_w;
+  int line_h, body_line_h, ascender, y;
 
-/* Render notification foreground separately, just like Finder.  The first
- * pass supplies the fading panel; this pass supplies real ARGB glyph/icon
- * pixels and is composited over it without any background halo. */
-static void notification_draw_foreground(int history)
-{
-  Drawable saved_drawable;
-  Picture saved_picture, picture, dest;
-  GC saved_gc, gc;
-  Visual *saved_visual;
-  Colormap saved_colormap;
-  int saved_no_background;
-  Pixmap pixmap;
-  XRenderPictFormat *format, *dest_format;
-  XRenderColor clear = { 0, 0, 0, 0 };
-
-  if (!finder_argb_visual || !notify_width || !notify_height)
+  if (!notify_history_active || !notify_history_count || !w || !h ||
+      !selmon || !selmon->barcenterwin)
     return;
-  format = XRenderFindStandardFormat(dpy, PictStandardARGB32);
-  dest_format = XRenderFindVisualFormat(dpy, finder_argb_visual);
-  if (!format || !dest_format)
+  if ((notify_history_pixmap_w != w || notify_history_pixmap_h != h ||
+       !notify_history_pixmap || !notify_history_gc) &&
+      !notification_history_cache_create(w, h))
     return;
-  pixmap = XCreatePixmap(dpy, root, notify_width, notify_height, 32);
-  if (!pixmap)
-    return;
-  gc = XCreateGC(dpy, pixmap, 0, NULL);
-  picture = XRenderCreatePicture(dpy, pixmap, format, 0, NULL);
-  dest = XRenderCreatePicture(dpy, selmon->barcenterwin, dest_format, 0, NULL);
-  if (!gc || !picture || !dest) {
-    if (dest) XRenderFreePicture(dpy, dest);
-    if (picture) XRenderFreePicture(dpy, picture);
-    if (gc) XFreeGC(dpy, gc);
-    XFreePixmap(dpy, pixmap);
+  if (notification_frame_cached(1)) {
+    notification_history_present();
     return;
   }
-  XRenderFillRectangle(dpy, PictOpSrc, picture, &clear, 0, 0,
-                       notify_width, notify_height);
-  saved_drawable = drw->drawable;
-  saved_picture = drw->picture;
-  saved_gc = drw->gc;
-  saved_visual = drw->visual;
-  saved_colormap = drw->colormap;
-  saved_no_background = drw->no_background;
-  drw->drawable = pixmap;
-  drw->picture = picture;
-  drw->gc = gc;
-  drw->visual = finder_argb_visual;
-  drw->colormap = finder_argb_colormap;
-  drw->no_background = 1;
-  notification_foreground_pass = 1;
+  if (!notification_gl_init(w, h))
+    return;
+  if (!gl_font)
+    gl_font = gl_font_create();
+  if (!gl_font)
+    return;
+  content_w = w > 2U * pad ? w - 2U * pad : 1U;
+  line_h = MAX(gl_font->height, 1);
+  body_line_h = MAX((int)ceil(gl_font->pixel_size) +
+                        NOTIFY_BODY_LINE_GAP,
+                    1);
+  ascender = MAX(1, (int)(gl_font->faces[0].face->size->metrics.ascender >> 6));
+
+  glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho(0, w, h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDisable(GL_TEXTURE_2D);
+  glEnable(GL_SCISSOR_TEST);
+  glScissor((GLint)pad, (GLint)pad, (GLsizei)content_w,
+            (GLsizei)(h - 2U * pad));
+
+  y = (int)pad;
+  for (n = notify_history_head; n; n = n->next) {
+    unsigned int entry_h = notification_history_entry_height(n);
+    unsigned int content_h = notification_history_content_height(n);
+    unsigned int img_w = 0, img_h = 0, body_w = content_w;
+    unsigned int body_lines = 0, text_h;
+    int has_summary = n->summary && *n->summary;
+    int has_body = n->body && *n->body;
+    int dimmed = n->action_used ||
+                 (n->action_count < 2 && !n->input_enabled);
+    int text_y, baseline, controls_y;
+
+    if (y + (int)entry_h <= (int)pad) {
+      y += (int)entry_h;
+      continue;
+    }
+    if (y >= (int)(h - pad))
+      break;
+
+    if (n->image && n->image_w && n->image_h) {
+      img_h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+      img_w = (unsigned int)((uint64_t)n->image_w * img_h / n->image_h);
+      if (img_w > 100) {
+        img_w = 100;
+        img_h = MAX(1U, (unsigned int)((uint64_t)n->image_h * img_w /
+                                       n->image_w));
+      }
+      body_w = body_w > img_w + 12 ? body_w - img_w - 12 : 1;
+    }
+    if (has_body)
+      body_lines = notification_body_wrap(n, body_w,
+                                          NOTIFY_HISTORY_BODY_MAX_LINES);
+    text_h = notification_text_block_height(has_summary, body_lines);
+    text_y = y + MAX(0, ((int)content_h - (int)text_h) / 2);
+    baseline = text_y + ascender;
+
+    if (img_w && n->img_pixels && n->img_w && n->img_h) {
+      notification_image_texture_create(n);
+      if (n->img_texture)
+        glBindTexture(GL_TEXTURE_2D, n->img_texture);
+      if (n->img_texture) {
+        glEnable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        notification_gl_blend_separate();
+        glColor4f(dimmed ? 0.68f : 1.0f,
+                  dimmed ? 0.70f : 1.0f,
+                  dimmed ? 0.73f : 1.0f, 1.0f);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f((float)pad, (float)y + (content_h - img_h) / 2.0f);
+        glTexCoord2f(1, 0); glVertex2f((float)pad + img_w, (float)y + (content_h - img_h) / 2.0f);
+        glTexCoord2f(1, 1); glVertex2f((float)pad + img_w, (float)y + (content_h + img_h) / 2.0f);
+        glTexCoord2f(0, 1); glVertex2f((float)pad, (float)y + (content_h + img_h) / 2.0f);
+        glEnd();
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+      }
+    }
+    if (has_summary) {
+      gl_font_draw_text(n->summary, (int)pad + (img_w ? (int)img_w + 12 : 0), baseline,
+                        body_w, dimmed ? 0.84f : 1.0f,
+                        dimmed ? 0.86f : 1.0f,
+                        dimmed ? 0.90f : 1.0f);
+      baseline += line_h + 2;
+    }
+    if (has_body)
+      notification_gl_draw_body(n,
+                                (int)pad + (img_w ? (int)img_w + 12 : 0),
+                                &baseline, body_line_h, body_w,
+                                NOTIFY_HISTORY_BODY_MAX_LINES,
+                                dimmed ? 0.56f : 0.82f,
+                                dimmed ? 0.58f : 0.85f,
+                                dimmed ? 0.61f : 0.9f);
+
+    controls_y = y + (int)content_h;
+    if (n->input_enabled) {
+      const char *value = n->input_text && *n->input_text
+          ? n->input_text : n->input_placeholder;
+      float r = n->input_text && *n->input_text ? 0.92f : 0.58f;
+      float g = n->input_text && *n->input_text ? 0.93f : 0.61f;
+      float b = n->input_text && *n->input_text ? 0.96f : 0.66f;
+      gl_font_draw_text(value ? value : "", (int)pad,
+                        controls_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                        content_w, r, g, b);
+      controls_y += NOTIFY_INPUT_ROW_H;
+    }
+    if (n->action_count >= 4) {
+      unsigned int actions = MIN(n->action_count / 2, 16U);
+      unsigned int cell_w = actions ? content_w / actions : content_w;
+      for (unsigned int i = 0; i < actions; i++) {
+        const char *label = n->actions[i * 2 + 1];
+        unsigned int label_w = notification_text_width(label);
+        int label_x = (int)pad +
+                      (int)((i + 1 == actions ? content_w : (i + 1) * cell_w)) -
+                      (int)MIN(label_w, cell_w);
+        int hovered = notify_history_hover_action == (int)i;
+        gl_font_draw_text(label, label_x,
+                          controls_y + MAX(0, (NOTIFY_BUTTON_H - line_h) / 2) + ascender,
+                          cell_w, hovered ? 1.0f : 0.82f,
+                          hovered ? 1.0f : 0.85f,
+                          hovered ? 1.0f : 0.9f);
+      }
+    }
+
+    y += (int)entry_h;
+  }
+  glDisable(GL_SCISSOR_TEST);
+  notification_present_gl(w, h, notify_history_pixmap);
+  notify_render_cache_hash = notification_frame_hash(1);
+  notify_render_cache_valid = 1;
+  notification_history_present();
+}
+
+static void notification_draw_foreground(int history) {
   if (history)
     notification_history_draw();
   else
     notification_draw();
-  notification_foreground_pass = 0;
-  drw->drawable = saved_drawable;
-  drw->picture = saved_picture;
-  drw->gc = saved_gc;
-  drw->visual = saved_visual;
-  drw->colormap = saved_colormap;
-  drw->no_background = saved_no_background;
-  XRenderComposite(dpy, PictOpOver, picture, None, dest, 0, 0, 0, 0,
-                    0, 0, notify_width, notify_height);
-  XRenderFreePicture(dpy, dest);
-  XRenderFreePicture(dpy, picture);
-  XFreeGC(dpy, gc);
-  XFreePixmap(dpy, pixmap);
 }
 
-/* Present the progressive background and transparent content layer without
- * blocking the X server.  A server grab/synchronous round trip here makes
- * marquee frames stall under load and prevents the compositor from keeping
- * up with the animation. */
-static void notification_present_layers(int history)
-{
-  (void)history;
-  return;
-}
-
-/* Marquee frames only change the notification center surface.  Avoid
- * rebuilding and remapping the tags, title, keyboard, and status surfaces
- * for every text-position update. */
-static void notification_redraw_center_only(void)
-{
-  return;
+static void notification_present_layers(int history) {
+  notification_draw_foreground(history);
 }
 
 static void notification_motion(XMotionEvent *ev) {
@@ -5830,50 +7258,165 @@ static void notification_motion(XMotionEvent *ev) {
 }
 
 static void notification_history_motion(XMotionEvent *ev) {
-  (void)ev;
+  Notification *n, *hovered = NULL;
+  int entry_y = NOTIFY_PADDING - notify_history_scroll;
+  int local_y = 0, action = -1;
+  unsigned int content_w = notify_width > 2U * NOTIFY_PADDING
+                               ? notify_width - 2U * NOTIFY_PADDING : 1U;
+
+  if (!notify_history_active)
+    return;
+  for (n = notify_history_head;
+       ev->y >= (int)NOTIFY_PADDING &&
+       ev->y < (int)(notify_height - NOTIFY_PADDING) && n; n = n->next) {
+    unsigned int entry_h = notification_history_entry_height(n);
+    if (ev->y >= entry_y &&
+        ev->y < entry_y + (int)notification_history_entry_content_height(n)) {
+      hovered = n;
+      local_y = ev->y - entry_y;
+      break;
+    }
+    entry_y += (int)entry_h;
+  }
+
+  if (hovered && hovered->action_count >= 4 &&
+      ev->x >= NOTIFY_PADDING && ev->x < (int)(NOTIFY_PADDING + content_w) &&
+      local_y >= (int)notification_history_content_height(hovered) +
+                     (hovered->input_enabled ? NOTIFY_INPUT_ROW_H : 0) &&
+      local_y < (int)notification_history_entry_height(hovered)) {
+    unsigned int count = MIN(hovered->action_count / 2, 16U);
+    unsigned int cell_w = count ? content_w / count : content_w;
+    action = MIN((int)((ev->x - (int)NOTIFY_PADDING) / MAX(cell_w, 1U)),
+                 (int)count - 1);
+  }
+  if (notify_history_hover_entry != hovered ||
+      notify_history_hover_action != action) {
+    notify_history_hover_entry = hovered;
+    notify_history_hover_action = action;
+    if (hovered)
+      clock_gettime(CLOCK_MONOTONIC, &notify_history_hover_started);
+    /* Hover only changes action-label color; history geometry is unchanged. */
+    drawbars();
+  }
 }
 
 static int notification_history_buttonpress(XButtonPressedEvent *ev) {
-  (void)ev;
-  return 0;
+  Notification *n;
+  int entry_y = NOTIFY_PADDING - notify_history_scroll;
+  unsigned int content_w = notify_width > 2U * NOTIFY_PADDING
+                               ? notify_width - 2U * NOTIFY_PADDING : 1U;
+
+  if (!notify_history_active)
+    return 0;
+  if (ev->button == Button4 || ev->button == Button5) {
+    int max_scroll = 0, old_target = notify_history_scroll_target;
+    int was_animating =
+        notify_history_scroll != notify_history_scroll_target;
+    int base_scroll = was_animating ? notify_history_scroll_target
+                                    : notify_history_scroll;
+    unsigned int total = 0;
+    unsigned int viewport_h = notify_height > 2U * NOTIFY_PADDING
+                                 ? notify_height - 2U * NOTIFY_PADDING : 0;
+    for (n = notify_history_head; n; n = n->next)
+      total += notification_history_entry_height(n);
+    if (total > viewport_h)
+      max_scroll = (int)(total - viewport_h);
+    notify_history_scroll_target = MAX(0, MIN(max_scroll,
+        base_scroll + (ev->button == Button4 ? -60 : 60)));
+    if (notify_history_scroll_target == old_target)
+      return 1;
+    if (!was_animating)
+      clock_gettime(CLOCK_MONOTONIC, &notify_history_scroll_started);
+    drawbars();
+    return 1;
+  }
+  if (ev->button != Button1)
+    return 1;
+  if (ev->x < (int)NOTIFY_PADDING ||
+      ev->x >= (int)(NOTIFY_PADDING + content_w) ||
+      ev->y < (int)NOTIFY_PADDING ||
+      ev->y >= (int)(notify_height - NOTIFY_PADDING))
+    return 1;
+
+  for (n = notify_history_head; n; n = n->next) {
+    unsigned int entry_h = notification_history_entry_height(n);
+    int local_y = ev->y - entry_y;
+    int controls_y = (int)notification_history_content_height(n);
+    if (ev->y >= entry_y && ev->y < entry_y + (int)entry_h) {
+      if (local_y >= (int)notification_history_entry_content_height(n))
+        return 1;
+      if (n->input_enabled && local_y >= controls_y &&
+          local_y < controls_y + NOTIFY_INPUT_ROW_H) {
+        notify_history_input = n;
+        notify_input_focus = 1;
+        XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent, CurrentTime);
+        drawbars();
+        return 1;
+      }
+      controls_y += n->input_enabled ? NOTIFY_INPUT_ROW_H : 0;
+      if (n->action_count >= 4 && local_y >= controls_y &&
+          local_y < controls_y + NOTIFY_BUTTON_H) {
+        unsigned int count = MIN(n->action_count / 2, 16U);
+        unsigned int cell_w = count ? MAX(content_w / count, 1U) : content_w;
+        unsigned int index = MIN((unsigned int)(ev->x - (int)NOTIFY_PADDING) /
+                                     cell_w,
+                                 count ? count - 1 : 0);
+        notification_emit_action(n, n->actions[index * 2]);
+        notification_emit_closed(n, 2);
+        notification_history_clear_controls(n);
+        if (notify_history_input == n)
+          notify_history_input = NULL;
+        notify_input_focus = 0;
+        notification_history_layout();
+        drawbars();
+        resizebarwin(selmon);
+        return 1;
+      }
+      if (n->action_count >= 2) {
+        notification_emit_action(n, n->actions[0]);
+        notification_emit_closed(n, 2);
+        notification_history_clear_controls(n);
+        notification_history_layout();
+        drawbars();
+        resizebarwin(selmon);
+      }
+      return 1;
+    }
+    entry_y += (int)entry_h;
+  }
+  return 1;
 }
 
 static int notification_history_tick(void) {
   struct timespec now;
-  double elapsed, progress, u, lo, hi, x;
-  int i;
+  double elapsed, fraction;
+  int delta, step;
 
   if (!notify_history_active ||
       notify_history_scroll == notify_history_scroll_target)
     return 0;
 
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  elapsed = (double)(now.tv_sec - notify_history_scroll_started.tv_sec) * 1000.0 +
-            (double)(now.tv_nsec - notify_history_scroll_started.tv_nsec) /
-            1000000.0;
-  progress = MIN(1.0, MAX(0.0, elapsed / NOTIFY_HISTORY_SCROLL_MS));
+  /* Mouse/event traffic can keep poll() returning immediately.  Rate-limit
+   * actual scroll frames here as well as bounding the idle poll timeout. */
+  if (notification_elapsed(&notify_history_scroll_started) <
+      1.0 / NOTIFY_HISTORY_FPS)
+    return 1;
 
-  /* cubic-bezier(0, .6, .4, 1). Solve the X component for the
-   * parametric position, then evaluate the Y component. */
-  lo = 0.0;
-  hi = 1.0;
-  for (i = 0; i < 16; i++) {
-    u = (lo + hi) / 2.0;
-    x = 3.0 * (1.0 - u) * u * u * 0.4 + u * u * u;
-    if (x < progress)
-      lo = u;
-    else
-      hi = u;
-  }
-  u = (lo + hi) / 2.0;
-  progress = 3.0 * (1.0 - u) * (1.0 - u) * u * 0.6 +
-             3.0 * (1.0 - u) * u * u + u * u * u;
-  notify_history_scroll = notify_history_scroll_start +
-                          (int)((notify_history_scroll_end -
-                                 notify_history_scroll_start) * progress);
-  if (elapsed >= NOTIFY_HISTORY_SCROLL_MS)
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  elapsed = (double)(now.tv_sec - notify_history_scroll_started.tv_sec) +
+            (double)(now.tv_nsec - notify_history_scroll_started.tv_nsec) /
+            1000000000.0;
+  notify_history_scroll_started = now;
+  fraction = 1.0 - exp(-MAX(0.0, elapsed) / 0.055);
+  delta = notify_history_scroll_target - notify_history_scroll;
+  step = (int)lround(delta * fraction);
+  if (!step && delta)
+    step = delta > 0 ? 1 : -1;
+  if (abs(delta) <= 1)
     notify_history_scroll = notify_history_scroll_target;
-  drawbars();
+  else
+    notify_history_scroll += step;
+  notification_history_present();
   return 1;
 }
 
@@ -5946,6 +7489,7 @@ static int notification_buttonpress(XButtonPressedEvent *ev) {
       notify_input_focus = 1;
       XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent, CurrentTime);
       XFlush(dpy);
+      drawbars();
     }
     return 1;
   }
@@ -6009,6 +7553,7 @@ static int notification_input_keypress(XKeyEvent *ev) {
       notify_history_input = NULL;
       notification_history_layout();
       drawbars();
+      resizebarwin(selmon);
     } else {
       notification_emit_closed(n, 2);
       notification_history_clear_controls(n);
@@ -6025,6 +7570,7 @@ static int notification_input_keypress(XKeyEvent *ev) {
       notify_history_input = NULL;
       notification_history_layout();
       drawbars();
+      resizebarwin(selmon);
     } else {
       notification_emit_closed(n, 2);
       notification_history_clear_controls(n);
@@ -6036,7 +7582,11 @@ static int notification_input_keypress(XKeyEvent *ev) {
   if (keysym == XK_BackSpace) {
     size_t length = n->input_text ? strlen(n->input_text) : 0;
     if (length) {
-      n->input_text[length - 1] = '\0';
+      do {
+        length--;
+      } while (length &&
+               (((unsigned char)n->input_text[length] & 0xc0) == 0x80));
+      n->input_text[length] = '\0';
       drawbars();
     }
     return 1;
@@ -6075,22 +7625,6 @@ static void notification_dispatch(void) {
 }
 
 static void notification_tick(void) {
-  if ((notify_history_active && notify_history_hover_entry) || notify_hovered) {
-    struct timespec now;
-    long elapsed_ms;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    elapsed_ms = (now.tv_sec - notify_marquee_last_draw.tv_sec) * 1000L +
-                 (now.tv_nsec - notify_marquee_last_draw.tv_nsec) / 1000000L;
-    if (!notify_marquee_last_draw.tv_sec ||
-        elapsed_ms >= 1000 / NOTIFY_MARQUEE_FPS) {
-      notify_marquee_last_draw = now;
-      notification_redraw_center_only();
-    }
-  } else {
-    notify_marquee_last_draw.tv_sec = 0;
-    notify_marquee_last_draw.tv_nsec = 0;
-  }
   if (notify_transition_pending &&
       notification_elapsed(&notify_transition_started) >=
           NOTIFY_TRANSITION_MS / 1000.0) {
@@ -6160,6 +7694,41 @@ static void notification_init(void) {
 
 static void notification_shutdown(void) {
   Notification *n, *next;
+  if (notify_history_gc) {
+    XFreeGC(dpy, notify_history_gc);
+    notify_history_gc = None;
+  }
+  if (notify_history_picture) {
+    XRenderFreePicture(dpy, notify_history_picture);
+    notify_history_picture = None;
+  }
+  if (notify_history_mask_picture) {
+    XRenderFreePicture(dpy, notify_history_mask_picture);
+    notify_history_mask_picture = None;
+  }
+  if (notify_history_dest_picture) {
+    XRenderFreePicture(dpy, notify_history_dest_picture);
+    notify_history_dest_picture = None;
+  }
+  if (notify_history_background_picture) {
+    XRenderFreePicture(dpy, notify_history_background_picture);
+    notify_history_background_picture = None;
+  }
+  if (notify_history_mask_pixmap) {
+    XFreePixmap(dpy, notify_history_mask_pixmap);
+    notify_history_mask_pixmap = None;
+  }
+  if (notify_history_background_pixmap) {
+    XFreePixmap(dpy, notify_history_background_pixmap);
+    notify_history_background_pixmap = None;
+  }
+  notify_history_mask_w = notify_history_mask_h = 0;
+  notify_history_dest_window = None;
+  if (notify_history_pixmap) {
+    XFreePixmap(dpy, notify_history_pixmap);
+    notify_history_pixmap = None;
+  }
+  notify_history_pixmap_w = notify_history_pixmap_h = 0;
   for (n = notify_current; n; n = next) {
     next = n->next;
     notification_free(n);
@@ -6181,6 +7750,33 @@ static void notification_shutdown(void) {
     dbus_connection_unref(notify_conn);
     notify_conn = NULL;
   }
+
+  /* Cleanup OpenGL font while the notification context is current. */
+  if (notify_gl_ctx != None && notify_gl_pbuffer != None)
+    glXMakeCurrent(dpy, notify_gl_pbuffer, notify_gl_ctx);
+  if (gl_font) {
+    gl_font_free(gl_font);
+    gl_font = NULL;
+  }
+
+  /* Cleanup FreeType */
+  if (ft_lib) {
+    FT_Done_FreeType(ft_lib);
+    ft_lib = NULL;
+  }
+
+  /* Cleanup OpenGL resources. */
+  if (notify_gl_ctx != None) {
+    glXMakeCurrent(dpy, None, NULL);
+    glXDestroyContext(dpy, notify_gl_ctx);
+    notify_gl_ctx = None;
+  }
+  if (notify_gl_pbuffer != None) {
+    glXDestroyPbuffer(dpy, notify_gl_pbuffer);
+    notify_gl_pbuffer = None;
+  }
+  notify_gl_pbuffer_w = notify_gl_pbuffer_h = 0;
+  notify_gl_initialized = 0;
 }
 
 void getkblayout(void) {
@@ -6608,19 +8204,24 @@ void drawbar(Monitor *m) {
                            finder_selected < finder_scroll + finder_rows
                              ? finder_selected - finder_scroll + 1 : 0);
           finder_dirty = 0;
-     } else if (finder_active && m == selmon) {
-       /* The Finder surface is already current. Keep its marker and backing
+      } else if (finder_active && m == selmon) {
+        notify_render_cache_valid = 0;
+        /* The Finder surface is already current. Keep its marker and backing
         * window untouched while the other bar sections continue updating. */
          finder_marker(m, finder_visible_count() > finder_scroll &&
                          finder_selected >= finder_scroll &&
                         finder_selected < finder_scroll + finder_rows
                            ? finder_selected - finder_scroll + 1 : 0);
-       } else if (notify_active && m == selmon) {
-        finder_marker(m, 0);
-       } else if (notify_history_active && m == selmon) {
-        finder_marker(m, 0);
-   } else {
-     finder_marker(m, 0);
+         } else if (notify_active && m == selmon) {
+          finder_marker(m, 0);
+          notification_present_layers(0);
+         } else if (notify_history_active && m == selmon) {
+         finder_marker(m, 0);
+         notification_present_layers(1);
+    } else {
+      if (m == selmon)
+        notify_render_cache_valid = 0;
+      finder_marker(m, 0);
     drw_setscheme(drw, scheme[m == selmon ? SchemeTitle : SchemeNorm]);
     drw_rect(drw, 0, borderpx, dcw, bh_n, 1, 1);
     drw_text(drw, dcw > tcw ? (int)((dcw - tcw) / 2) : 0,
@@ -7151,6 +8752,9 @@ void expose(XEvent *e) {
   XExposeEvent *ev = &e->xexpose;
 
   if (ev->count == 0 && (m = wintomon(ev->window))) {
+    if (m == selmon && ev->window == m->barcenterwin &&
+        (notify_active || notify_history_active))
+      notify_render_cache_valid = 0;
     drawbar(m);
     if (m == selmon)
       updatesystray();
@@ -9283,9 +10887,9 @@ void prepare_workspace_switch(Monitor *m, unsigned int oldtags, unsigned int new
 void run(void) {
   XEvent ev;
   int xfd = ConnectionNumber(dpy);
-  int timeout;
+  int timeout, pending_events;
   const int clockbar_timeout = 1000 / DRAW_FPS;
-  const int notify_marquee_timeout = 1000 / NOTIFY_MARQUEE_FPS;
+  const int history_scroll_timeout = 1000 / NOTIFY_HISTORY_FPS;
   time_t next_clock_update = 0;
   struct pollfd pfd[3] = {{.fd = xfd, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
@@ -9323,12 +10927,8 @@ void run(void) {
       timeout = NOTIFY_TRANSITION_MS;
     if (notify_history_active &&
         notify_history_scroll != notify_history_scroll_target &&
-        timeout > clockbar_timeout)
-      timeout = clockbar_timeout;
-    if ((notify_hovered ||
-         (notify_history_active && notify_history_hover_entry)) &&
-        timeout > notify_marquee_timeout)
-      timeout = notify_marquee_timeout;
+        timeout > history_scroll_timeout)
+      timeout = history_scroll_timeout;
     if (mpris_active && !fullscreen_st && timeout > clockbar_timeout)
       timeout = clockbar_timeout;
     if (hasurgentclients() && timeout > 300)
@@ -9401,8 +11001,12 @@ void run(void) {
 			mpris_scroll_clock_valid = 0;
 			mpris_scroll_accum_ns = 0;
 		}
-    while (XPending(dpy)) {
+    /* Do not let a sustained stream of pointer events starve animation ticks.
+     * Any remaining events stay queued and make the next poll return at once. */
+    pending_events = 0;
+    while (pending_events < 64 && XPending(dpy)) {
       XNextEvent(dpy, &ev);
+      pending_events++;
 
       /* Xkb StateNotify for Alt sidebar tracking */
       if (xkb_event_base && ev.type == xkb_event_base) {
