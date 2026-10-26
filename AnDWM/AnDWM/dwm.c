@@ -69,6 +69,7 @@
 #include <GL/glx.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_LCD_FILTER_H
 #include <hb.h>
 #include <hb-ft.h>
 
@@ -189,8 +190,10 @@ static volatile int clockbar_cx = 0, clockbar_by = 0, clockbar_bh = 0;
 static volatile int clockbar_cw = 0;
 static volatile float clockbar_peak = 0.0f; /* 0..1, written by on_process */
 static pthread_t clock_draw_thread;
-static volatile int clock_draw_running = 0;
-static volatile bool fullscreen_st; /* focused window is fullscreen */
+static _Atomic int clock_draw_running = 0;
+static _Atomic bool fullscreen_st; /* focused window is fullscreen */
+static pthread_mutex_t fullscreen_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fullscreen_cond = PTHREAD_COND_INITIALIZER;
 
 typedef struct Notification Notification;
 struct Notification {
@@ -305,6 +308,7 @@ typedef struct {
   unsigned int glyph_count;
   int height;
   double pixel_size;
+  int lcd_order;
 } GLFont;
 
 static FT_Library ft_lib = NULL;
@@ -709,6 +713,7 @@ static void finder_save_recent(void);
 static void status_start(void);
 static void status_stop(void);
 static void status_consume(void);
+static void sound_monitor_pause(int paused);
 static int update_mpris_scroll(void);
 static void mpris_load_art(unsigned int target_w, unsigned int target_h);
 static void mpris_panel_button(XButtonPressedEvent *ev);
@@ -1511,9 +1516,17 @@ static void *status_worker(void *arg) {
 	unsigned long long last_total = 0, last_active = 0;
 	(void)arg;
 	while (atomic_load_explicit(&status_running, memory_order_acquire)) {
-		/* The bar is covered by fullscreen clients.  Keep status alive, but
-		 * reduce hardware/DBus/MPRIS polling while it cannot be seen. */
-		struct timespec ts = { .tv_sec = fullscreen_st ? 5 : 1, .tv_nsec = 0 };
+		struct timespec deadline;
+		pthread_mutex_lock(&fullscreen_mutex);
+		while (atomic_load_explicit(&status_running, memory_order_acquire) &&
+		       fullscreen_st)
+			pthread_cond_wait(&fullscreen_cond, &fullscreen_mutex);
+		if (!atomic_load_explicit(&status_running, memory_order_acquire)) {
+			pthread_mutex_unlock(&fullscreen_mutex);
+			break;
+		}
+		pthread_mutex_unlock(&fullscreen_mutex);
+
 		status_make(local, sizeof local, local_mpris, sizeof local_mpris,
 		            local_service, sizeof local_service, local_art, sizeof local_art,
 		            &local_mpris_progress, &local_mpris_volume,
@@ -1550,7 +1563,16 @@ static void *status_worker(void *arg) {
 				break;
 			}
 		}
-		nanosleep(&ts, NULL);
+		/* Sleep between regular updates, but wake immediately on fullscreen
+		 * transitions so hidden status polling can stay completely paused. */
+		pthread_mutex_lock(&fullscreen_mutex);
+		if (atomic_load_explicit(&status_running, memory_order_acquire) &&
+		    !fullscreen_st) {
+			clock_gettime(CLOCK_REALTIME, &deadline);
+			deadline.tv_sec++;
+			pthread_cond_timedwait(&fullscreen_cond, &fullscreen_mutex, &deadline);
+		}
+		pthread_mutex_unlock(&fullscreen_mutex);
 	}
 	return NULL;
 }
@@ -1569,6 +1591,9 @@ static void status_start(void) {
 
 static void status_stop(void) {
 	if (!atomic_exchange(&status_running, 0)) return;
+	pthread_mutex_lock(&fullscreen_mutex);
+	pthread_cond_broadcast(&fullscreen_cond);
+	pthread_mutex_unlock(&fullscreen_mutex);
 	if (status_event_fd >= 0) { uint64_t one = 1; (void)write(status_event_fd, &one, sizeof one); }
 	pthread_join(status_thread, NULL);
 	if (status_event_fd >= 0) { close(status_event_fd); status_event_fd = -1; }
@@ -5658,6 +5683,12 @@ static void notification_queue(Notification *n) {
       return;
     }
   }
+  /* Preserve notifications for later review without showing popups over a
+   * fullscreen client. */
+  if (fullscreen_st) {
+    notification_history_add(n);
+    return;
+  }
   if (notify_count >= NOTIFY_MAX) {
     notification_free(n);
     return;
@@ -6062,9 +6093,19 @@ static void notification_gl_blend_separate(void) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
+static void notification_gl_blend_premultiplied(void) {
+  if (notify_gl_blend_func_separate)
+    notify_gl_blend_func_separate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                                  GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  else
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+}
+
 static GLFont *gl_font_create(void) {
   GLFont *font;
   Fnt *f;
+  int subpixel_order;
+  int have_fontconfig_order = 0;
   double pixel_size = drw && drw->fonts ? drw->fonts->h : 14;
 
   if (!gl_font_init_ft())
@@ -6073,6 +6114,17 @@ static GLFont *gl_font_create(void) {
   if (!font)
     return NULL;
   font->pixel_size = pixel_size;
+  switch (XRenderQuerySubpixelOrder(dpy, screen)) {
+  case SubPixelHorizontalRGB:
+    font->lcd_order = 1;
+    break;
+  case SubPixelHorizontalBGR:
+    font->lcd_order = 2;
+    break;
+  default:
+    font->lcd_order = 0;
+    break;
+  }
 
   /* Mirror config.h's fontset for GL text. Xft's resolved pattern provides
    * the actual font file, face index, and configured size for each entry. */
@@ -6085,6 +6137,26 @@ static GLFont *gl_font_create(void) {
         FcPatternGetString(f->xfont->pattern, FC_FILE, 0, &file) !=
             FcResultMatch)
       continue;
+    if (!have_fontconfig_order &&
+        FcPatternGetInteger(f->xfont->pattern, FC_RGBA, 0, &subpixel_order) ==
+            FcResultMatch) {
+      switch (subpixel_order) {
+      case FC_RGBA_RGB:
+        font->lcd_order = 1;
+        break;
+      case FC_RGBA_BGR:
+        font->lcd_order = 2;
+        break;
+      case FC_RGBA_NONE:
+      case FC_RGBA_VRGB:
+      case FC_RGBA_VBGR:
+        font->lcd_order = 0;
+        break;
+      default:
+        break;
+      }
+      have_fontconfig_order = 1;
+    }
     FcPatternGetDouble(f->xfont->pattern, FC_PIXEL_SIZE, 0,
                        &face_pixel_size);
     FcPatternGetInteger(f->xfont->pattern, FC_INDEX, 0, &index);
@@ -6092,6 +6164,10 @@ static GLFont *gl_font_create(void) {
       font->pixel_size = face_pixel_size;
     gl_font_add_face(font, (const char *)file, index, face_pixel_size);
   }
+
+  if (font->lcd_order &&
+      FT_Library_SetLcdFilter(ft_lib, FT_LCD_FILTER_DEFAULT))
+    font->lcd_order = 0;
 
   /* Keep a local system-font fallback for unusual setups where none of the
    * configured Xft fonts expose a file that FreeType can open. */
@@ -6153,6 +6229,10 @@ static int gl_font_add_face(GLFont *font, const char *file, int index,
     memset(font_face, 0, sizeof(*font_face));
     return -1;
   }
+  /* Keep Xft's slight-hinting metrics even when the outline is rasterized
+   * into horizontal LCD coverage below. */
+  hb_ft_font_set_load_flags(font_face->hb_font,
+                            FT_LOAD_DEFAULT | FT_LOAD_TARGET_LIGHT);
   font->face_count++;
   return (int)(font->face_count - 1);
 }
@@ -6236,7 +6316,8 @@ static GLGlyph *gl_font_glyph(GLFont *font, unsigned int face_index,
   GLGlyph *g = NULL;
   FT_Face face;
   FT_GlyphSlot slot;
-  unsigned char *bitmap;
+  unsigned char *pixels;
+  int lcd;
   int pitch, x, y;
 
   if (!font || face_index >= font->face_count)
@@ -6249,14 +6330,22 @@ static GLGlyph *gl_font_glyph(GLFont *font, unsigned int face_index,
     return NULL;
 
   face = font->faces[face_index].face;
-  if (FT_Load_Glyph(face, glyph_index, FT_LOAD_RENDER))
+  if (FT_Load_Glyph(face, glyph_index,
+                    FT_LOAD_DEFAULT | FT_LOAD_TARGET_LIGHT))
     return NULL;
   slot = face->glyph;
+  lcd = font->lcd_order != 0;
+  if (FT_Render_Glyph(slot, lcd ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_NORMAL)) {
+    if (!lcd || FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL))
+      return NULL;
+    lcd = 0;
+  }
   g = &font->glyphs[font->glyph_count++];
   memset(g, 0, sizeof(*g));
   g->face_index = face_index;
   g->glyph_index = glyph_index;
-  g->w = slot->bitmap.width;
+  g->w = slot->bitmap.pixel_mode == FT_PIXEL_MODE_LCD
+      ? (int)slot->bitmap.width / 3 : (int)slot->bitmap.width;
   g->h = slot->bitmap.rows;
   g->bearing_x = slot->bitmap_left;
   g->bearing_y = slot->bitmap_top;
@@ -6265,8 +6354,8 @@ static GLGlyph *gl_font_glyph(GLFont *font, unsigned int face_index,
   if (!g->w || !g->h)
     return g;
 
-  bitmap = calloc((size_t)g->w * g->h, 1);
-  if (!bitmap)
+  pixels = calloc((size_t)g->w * g->h, 4);
+  if (!pixels)
     return g;
   pitch = slot->bitmap.pitch;
   for (y = 0; y < g->h; y++) {
@@ -6274,22 +6363,35 @@ static GLGlyph *gl_font_glyph(GLFont *font, unsigned int face_index,
         ? slot->bitmap.buffer + y * pitch
         : slot->bitmap.buffer + (g->h - 1 - y) * -pitch;
     for (x = 0; x < g->w; x++) {
-      if (slot->bitmap.pixel_mode == FT_PIXEL_MODE_MONO)
-        bitmap[y * g->w + x] = (row[x >> 3] & (0x80 >> (x & 7))) ? 255 : 0;
-      else
-        bitmap[y * g->w + x] = row[x];
+      unsigned char r, green, b, alpha;
+      if (slot->bitmap.pixel_mode == FT_PIXEL_MODE_LCD && lcd) {
+        const unsigned char *sample = row + x * 3;
+        r = sample[font->lcd_order == 2 ? 2 : 0];
+        green = sample[1];
+        b = sample[font->lcd_order == 2 ? 0 : 2];
+        alpha = MAX(r, MAX(green, b));
+      } else {
+        unsigned char coverage = slot->bitmap.pixel_mode == FT_PIXEL_MODE_MONO
+            ? ((row[x >> 3] & (0x80 >> (x & 7))) ? 255 : 0)
+            : row[x];
+        r = green = b = alpha = coverage;
+      }
+      pixels[((size_t)y * g->w + x) * 4] = r;
+      pixels[((size_t)y * g->w + x) * 4 + 1] = green;
+      pixels[((size_t)y * g->w + x) * 4 + 2] = b;
+      pixels[((size_t)y * g->w + x) * 4 + 3] = alpha;
     }
   }
   glGenTextures(1, &g->tex_id);
   glBindTexture(GL_TEXTURE_2D, g->tex_id);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, g->w, g->h, 0, GL_ALPHA,
-               GL_UNSIGNED_BYTE, bitmap);
-  free(bitmap);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g->w, g->h, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, pixels);
+  free(pixels);
   return g;
 }
 
@@ -6341,7 +6443,7 @@ static void gl_font_draw_text(const char *text, int x, int baseline,
     return;
   glEnable(GL_TEXTURE_2D);
   glEnable(GL_BLEND);
-  notification_gl_blend_separate();
+  notification_gl_blend_premultiplied();
   glColor4f(r, g, b, 1.0f);
   glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
   while (*p) {
@@ -6747,6 +6849,8 @@ static void notification_draw(void) {
   int body_line_h;
   int img_w = 0, img_h = 0;
   int text_x, text_width;
+  unsigned int body_lines = 0, single_line_width = 0;
+  int has_summary;
 
   if (!n || !notify_active || !w || !h || !selmon || !selmon->barcenterwin)
     return;
@@ -6773,6 +6877,24 @@ static void notification_draw(void) {
   }
   text_x = pad + (img_w ? img_w + 12 : 0);
   text_width = MAX(1, (int)w - text_x - pad);
+  has_summary = n->summary && *n->summary;
+  if (n->body && *n->body)
+    body_lines = notification_body_wrap(
+        n, (unsigned int)text_width,
+        notify_hovered ? NOTIFY_POPUP_BODY_HOVER_MAX_LINES
+                       : NOTIFY_POPUP_BODY_MAX_LINES);
+  /* Keep a short, single-row text-only popup compact and center its text
+   * inside the existing content area. Multi-line text and controls retain
+   * their normal left alignment. */
+  if (!img_w && !n->input_enabled &&
+      !(notify_hovered && n->actions && n->action_count >= 2) &&
+      ((unsigned int)has_summary + body_lines == 1)) {
+    single_line_width = has_summary
+        ? notification_text_width(n->summary)
+        : gl_font_text_width(n->body_wrap_lines[0]);
+    if (single_line_width < (unsigned int)text_width)
+      text_x += (text_width - (int)single_line_width) / 2;
+  }
   baseline = pad + notify_text_y + ascender;
 
   glViewport(0, 0, (GLsizei)w, (GLsizei)h);
@@ -8770,7 +8892,7 @@ void write_fullscreen(int value) {
   fclose(f);
 }
 
-static volatile bool fullscreen_st = false;
+static _Atomic bool fullscreen_st = false;
 
 static void updatefullscreenstatus(Client *c) {
   bool isfullscreen = c && c->isfullscreen && !c->issticky;
@@ -8780,6 +8902,17 @@ static void updatefullscreenstatus(Client *c) {
 
   write_fullscreen(isfullscreen);
   fullscreen_st = isfullscreen;
+	/* Wake the status and clock workers to pause/resume their background work. */
+	pthread_mutex_lock(&fullscreen_mutex);
+	pthread_cond_broadcast(&fullscreen_cond);
+	pthread_mutex_unlock(&fullscreen_mutex);
+	if (isfullscreen) {
+		/* Keep incoming notifications in history, but never leave a popup over
+		 * fullscreen content. */
+		notification_clear_queue();
+		notify_transition_pending = 0;
+	}
+	sound_monitor_pause(isfullscreen);
 }
 
 void focus(Client *c) {
@@ -9880,8 +10013,19 @@ static void *clock_draw_loop(void *data) {
   struct timespec ts;
   uint64_t frame_ns = 1000000000ULL / DRAW_FPS;
 
-  clock_gettime(CLOCK_MONOTONIC, &ts);
   while (clock_draw_running) {
+	  pthread_mutex_lock(&fullscreen_mutex);
+	  while (clock_draw_running && fullscreen_st)
+		  pthread_cond_wait(&fullscreen_cond, &fullscreen_mutex);
+	  if (!clock_draw_running) {
+		  pthread_mutex_unlock(&fullscreen_mutex);
+		  break;
+	  }
+	  pthread_mutex_unlock(&fullscreen_mutex);
+
+    /* Rebase after a fullscreen pause rather than trying to catch up missed
+     * frames against an old absolute deadline. */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_nsec += frame_ns;
     while (ts.tv_nsec >= 1000000000L) {
       ts.tv_nsec -= 1000000000L;
@@ -10026,6 +10170,9 @@ static void sound_monitor_start(void) {
 static void sound_monitor_stop(void) {
   if (clock_draw_running) {
     clock_draw_running = 0;
+	pthread_mutex_lock(&fullscreen_mutex);
+	pthread_cond_broadcast(&fullscreen_cond);
+	pthread_mutex_unlock(&fullscreen_mutex);
     pthread_join(clock_draw_thread, NULL);
   }
   if (sound_loop) {
@@ -10038,6 +10185,18 @@ static void sound_monitor_stop(void) {
     pw_deinit();
     clockanim_running = 0;
   }
+}
+
+static void sound_monitor_pause(int paused) {
+  if (!sound_loop || !sound_stream)
+    return;
+
+  /* Stop receiving audio buffers while the visualizer is hidden.  PipeWire
+   * objects are synchronized through their thread loop. */
+  pw_thread_loop_lock(sound_loop);
+  if (sound_stream)
+    pw_stream_set_active(sound_stream, !paused);
+  pw_thread_loop_unlock(sound_loop);
 }
 
 void movemouse(const Arg *arg) {
@@ -10931,7 +11090,7 @@ void run(void) {
       timeout = history_scroll_timeout;
     if (mpris_active && !fullscreen_st && timeout > clockbar_timeout)
       timeout = clockbar_timeout;
-    if (hasurgentclients() && timeout > 300)
+    if (!fullscreen_st && hasurgentclients() && timeout > 300)
       timeout = 300;
     if (finder_active && (finder_loading || finder_icons_pending))
       timeout = 0;
@@ -10954,7 +11113,7 @@ void run(void) {
       int urgent_redraw = 0;
 
       clock_gettime(CLOCK_MONOTONIC, &now_mono);
-      if (hasurgentclients()) {
+      if (!fullscreen_st && hasurgentclients()) {
         long elapsed_ms = (now_mono.tv_sec - urgentflash_last.tv_sec) * 1000L +
                           (now_mono.tv_nsec - urgentflash_last.tv_nsec) / 1000000L;
         if (!urgentflash_last.tv_sec || elapsed_ms >= 300) {
