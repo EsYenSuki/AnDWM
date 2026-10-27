@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <poll.h>
@@ -64,6 +65,13 @@
 #include <dbus/dbus.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
+#include <GL/gl.h>
+#include <GL/glx.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_LCD_FILTER_H
+#include <hb.h>
+#include <hb-ft.h>
 
 #define SIDEBAR_WIDTH 64
 #define SIDEBAR_CLICK_THRESH 5
@@ -98,21 +106,160 @@ sendn(const char *msg)
 #define NOTIFY_TRANSITION_MS 500
 #define NOTIFY_TWO_CONTENT_H 70
 #define NOTIFY_MAX_W     300
-#define NOTIFY_IMAGE_RADIUS 8
+#define NOTIFY_PADDING   15
+#define NOTIFY_IMAGE_MAX_H 60
+#define NOTIFY_IMAGE_RADIUS 16
 #define NOTIFY_MAX_TEXT  4096
-#define NOTIFY_ACTION_H  30
-#define NOTIFY_INPUT_ROW_H 30
-#define NOTIFY_BUTTON_H (NOTIFY_ACTION_H - 6)
-#define NOTIFY_BUTTON_ROW_H NOTIFY_ACTION_H
-#define NOTIFY_BODY_LINE_GAP 1
+#define NOTIFY_INPUT_ROW_H 24
+#define NOTIFY_BUTTON_H 24
+#define NOTIFY_BODY_LINE_GAP 0
+#define NOTIFY_BODY_MAX_LINES 4
+#define NOTIFY_POPUP_BODY_MAX_LINES 2
+#define NOTIFY_POPUP_BODY_HOVER_MAX_LINES 4
+#define NOTIFY_HISTORY_BODY_MAX_LINES 2
+#define NOTIFY_HISTORY_TIME_GAP 8
+#define NOTIFY_HISTORY_TIME_SCALE 0.75
+#define NOTIFY_HISTORY_TIME_ROWS 5
+#define NOTIFY_HISTORY_TEXT_ONLY_OFFSET 5
+#define NOTIFY_BODY_LINE_BYTES 1024
+#define FINDER_TRANSLATE_MAX 8192
+#define FINDER_TRANSLATE_RESULT 2048
+#define NOTIFY_HISTORY_FPS 100
 #define NOTIFY_ACTION_X  12
 #define NOTIFY_TEXT_TOP_OFFSET 3
 #define NOTIFY_TEXT_BOTTOM_GAP 6
 #define NOTIFY_IMAGE_BUTTON_GAP 2
 #define NOTIFY_HISTORY_MAX     10
 #define NOTIFY_HISTORY_ENTRY_H 70
-#define NOTIFY_HISTORY_MAX_H   (NOTIFY_HISTORY_ENTRY_H * 5)
-#define NOTIFY_HISTORY_SCROLL_MS 500
+#define NOTIFY_HISTORY_MAX_H   400
+#define FINDER_MAX_APPS 512
+#define FINDER_MAX_TEXT 256
+#define FINDER_MAX_QUERY 2048
+#define FINDER_GL_TEXT_MAX 384
+#define FINDER_EDGE 15
+#define FINDER_ICON_GAP 8
+#define FINDER_ICON_SIZE 22
+#define FINDER_MARKER_WIDTH 270
+#define FINDER_CURSOR_BLINK_MS 500
+#define FINDER_FILTER_ANIM_MS 180
+#define FINDER_FILTER_ALPHA_DELAY_MS 50
+#define FINDER_TRANSLATE_FADE_MS 220
+#define FINDER_TRANSLATE_GLOW_FADE_MS 300
+#define FINDER_FILTER_TEXT_BLUR_MAX 2.0f
+#define FINDER_FILTER_IMAGE_BLUR_MAX 20.0f
+#define FINDER_FILTER_EASE_IN_OUT 0
+#define FINDER_FILTER_EASE_IN 1
+#define FINDER_FILTER_EASE_OUT 2
+
+typedef struct FinderApp FinderApp;
+struct FinderApp {
+  char name[FINDER_MAX_TEXT];
+  char exec[PATH_MAX];
+  char file[PATH_MAX];
+  char icon_name[FINDER_MAX_TEXT];
+  Picture icon;
+  unsigned char *icon_pixels;
+  GLuint icon_texture;
+  int icon_loaded;
+  int recent;
+  int score;
+};
+typedef struct FinderFilterAnim FinderFilterAnim;
+struct FinderFilterAnim {
+  float from_y, to_y;
+  float from_alpha, to_alpha;
+  float from_scale_x, to_scale_x;
+  float from_scale_y, to_scale_y;
+  float from_blur, to_blur;
+  int active;
+  int outgoing;
+  int easing;
+};
+static FinderApp finder_apps[FINDER_MAX_APPS];
+static unsigned int finder_app_count;
+static unsigned int finder_order[FINDER_MAX_APPS];
+static unsigned int finder_visible;
+static char finder_query[FINDER_MAX_QUERY];
+static char finder_math_result[64];
+static int finder_math_active;
+static int finder_math_help_active;
+static char finder_translate_result[FINDER_TRANSLATE_RESULT];
+static char finder_translate_response[FINDER_TRANSLATE_MAX];
+static size_t finder_translate_response_len;
+static int finder_translate_active;
+static int finder_translate_pending;
+static int finder_translate_target_en;
+static int finder_translate_fd = -1;
+static pid_t finder_translate_pid;
+static int finder_ocr_fd = -1;
+static pid_t finder_ocr_pid;
+static char finder_ocr_response[FINDER_TRANSLATE_MAX];
+static size_t finder_ocr_response_len;
+static int finder_ocr_mode;
+static uint64_t finder_translate_due_ms;
+static uint64_t finder_translate_started_ms;
+static uint64_t finder_translate_glow_fade_started_ms;
+static float finder_translate_glow_fade_from;
+static uint64_t finder_query_pose_started_ms;
+static float finder_query_pose_from, finder_query_pose_to, finder_query_pose;
+static int finder_query_pose_initialized, finder_query_pose_waiting;
+static uint64_t finder_translate_result_started_ms;
+static char finder_translate_outgoing[FINDER_TRANSLATE_RESULT];
+static uint64_t finder_translate_outgoing_started_ms;
+static uint64_t finder_math_result_started_ms;
+static const char *finder_math_help[] = {
+  "+ - * / % ^ ! ( )  f(x) f(a,b)",
+  "sqrt cbrt abs exp ln log2 log10",
+  "pow hypot mod atan2 min max",
+  "sin cos tan asin acos atan",
+  "floor ceil round trunc",
+  "gcd lcm fact",
+  "bitor bitand bitxor bitnot",
+  "shl shr deg rad",
+  "pi e tau phi epsilon",
+  "byte_max word_max dword_max",
+  "int_max int_min uint_max",
+  "kb mb gb tb true false",
+};
+static uint64_t finder_cursor_base_ms;
+static int finder_cursor_visible = 1;
+static size_t finder_cursor;
+static size_t finder_query_view_start;
+static unsigned int finder_query_view_width;
+static Fnt *finder_result_font;
+static int finder_active;
+static int finder_dirty;
+static int finder_loading;
+static int finder_icons_pending;
+static Visual *finder_argb_visual;
+static int finder_argb_depth;
+static Colormap finder_argb_colormap;
+static int finder_argb_create_failed;
+static int finder_selected;
+static int finder_scroll;
+static double finder_scroll_visual;
+static struct timespec finder_scroll_started;
+static FinderFilterAnim finder_filter_anim[FINDER_MAX_APPS];
+static float finder_filter_start_y[FINDER_MAX_APPS];
+static float finder_filter_start_alpha[FINDER_MAX_APPS];
+static float finder_filter_start_scale_x[FINDER_MAX_APPS];
+static float finder_filter_start_scale_y[FINDER_MAX_APPS];
+static float finder_filter_start_blur[FINDER_MAX_APPS];
+static unsigned char finder_filter_start_present[FINDER_MAX_APPS];
+static struct timespec finder_filter_started;
+static int finder_filter_animating;
+static int finder_filter_display_rows;
+static Pixmap finder_gl_pixmap;
+static Picture finder_gl_picture;
+static unsigned int finder_gl_pixmap_w, finder_gl_pixmap_h;
+static Pixmap finder_frame_pixmap;
+static Picture finder_frame_picture;
+static unsigned int finder_frame_pixmap_w, finder_frame_pixmap_h;
+static unsigned int finder_presented_w, finder_presented_h;
+static int finder_presented_x, finder_presented_y;
+static int finder_window_x, finder_window_y;
+static char finder_recent[10][PATH_MAX];
+static unsigned int finder_recent_count;
 
 static volatile int clockanim_running = 0;
 static volatile unsigned int clockbar_dynw = 0; /* 0 = use fixed clockwidth() */
@@ -121,8 +268,10 @@ static volatile int clockbar_cx = 0, clockbar_by = 0, clockbar_bh = 0;
 static volatile int clockbar_cw = 0;
 static volatile float clockbar_peak = 0.0f; /* 0..1, written by on_process */
 static pthread_t clock_draw_thread;
-static volatile int clock_draw_running = 0;
-static volatile bool fullscreen_st; /* focused window is fullscreen */
+static _Atomic int clock_draw_running = 0;
+static _Atomic bool fullscreen_st; /* focused window is fullscreen */
+static pthread_mutex_t fullscreen_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fullscreen_cond = PTHREAD_COND_INITIALIZER;
 
 typedef struct Notification Notification;
 struct Notification {
@@ -140,6 +289,14 @@ struct Notification {
   Picture image;
   unsigned int image_w, image_h;
   int image_hint;
+  uint32_t *img_pixels;
+  unsigned int img_w, img_h;
+  GLuint img_texture;
+  int action_used;
+  unsigned int body_wrap_width, body_wrap_count, body_wrap_max_lines;
+  int body_wrap_valid;
+  char body_wrap_lines[NOTIFY_BODY_MAX_LINES][NOTIFY_BODY_LINE_BYTES];
+  char received_time[9];
   struct timespec shown_at;
   Notification *next;
 };
@@ -153,20 +310,22 @@ static int notify_active;
 static int notify_transition_pending;
 static struct timespec notify_transition_started;
 static int notify_history_active;
+static int notify_image_y, notify_text_y;
 static int notify_clock_hovered;
 static unsigned int notify_width, notify_height;
 static unsigned int notify_count;
 static unsigned int notify_history_count;
 static int notify_history_scroll;
 static int notify_history_scroll_target;
-static int notify_history_scroll_start;
-static int notify_history_scroll_end;
 static struct timespec notify_history_scroll_started;
-static Clr notify_bg, notify_fg, notify_body;
+static Clr notify_bg, notify_fg, notify_body, finder_text_clr;
+static const char finder_text[] = "#B8B5C8";
 static Clr notify_summary_scheme[3], notify_body_scheme[3];
+static Clr notify_summary_dim_scheme[3], notify_body_dim_scheme[3];
 static Clr notify_control_scheme[3], notify_control_hover_scheme[3];
 static Clr notify_action_scheme[3], notify_action_hover_scheme[3];
 static int notify_action_x[16], notify_action_w[16];
+static int notify_action_y;
 static int notify_input_x, notify_input_y, notify_input_w, notify_input_h;
 static int notify_input_focus;
 static Notification *notify_history_input;
@@ -175,6 +334,132 @@ static int notify_hover = -1;
 static Notification *notify_history_hover_entry;
 static int notify_history_hover_action = -1;
 static struct timespec notify_hover_started;
+static struct timespec notify_history_hover_started;
+static uint64_t notify_render_cache_hash;
+static int notify_render_cache_valid;
+static Pixmap notify_history_pixmap;
+static GC notify_history_gc;
+static Picture notify_history_picture;
+static Picture notify_history_mask_picture;
+static Picture notify_history_dest_picture;
+static Picture notify_history_background_picture;
+static Pixmap notify_history_mask_pixmap;
+static Pixmap notify_history_background_pixmap;
+static Window notify_history_dest_window;
+static unsigned int notify_history_pixmap_w, notify_history_pixmap_h;
+static unsigned int notify_history_mask_w, notify_history_mask_h;
+
+/* OpenGL notification rendering */
+static GLXContext notify_gl_ctx = None;
+static GLXFBConfig notify_gl_fbconfig;
+static GLXPbuffer notify_gl_pbuffer = None;
+static unsigned int notify_gl_pbuffer_w, notify_gl_pbuffer_h;
+static int notify_gl_initialized = 0;
+typedef void (*NotificationGLBlendFuncSeparate)(GLenum, GLenum, GLenum,
+                                                GLenum);
+static NotificationGLBlendFuncSeparate notify_gl_blend_func_separate;
+
+/* Small shader/FBO cache used by Finder's waiting-text bloom.  The text is
+ * rasterized once into bloom_gl_source, then blurred with a few Kawase passes
+ * on the GPU instead of being drawn hundreds of times with CPU-side offsets. */
+#ifndef GL_FRAMEBUFFER
+#define GL_FRAMEBUFFER 0x8D40
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_FRAGMENT_SHADER 0x8B30
+#define GL_VERTEX_SHADER 0x8B31
+#define GL_COMPILE_STATUS 0x8B81
+#define GL_LINK_STATUS 0x8B82
+#define GL_INFO_LOG_LENGTH 0x8B84
+#define GL_TEXTURE0 0x84C0
+#endif
+typedef void (*FinderGLGenFramebuffers)(GLsizei, GLuint *);
+typedef void (*FinderGLBindFramebuffer)(GLenum, GLuint);
+typedef void (*FinderGLDeleteFramebuffers)(GLsizei, const GLuint *);
+typedef void (*FinderGLFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef GLenum (*FinderGLCheckFramebufferStatus)(GLenum);
+typedef GLuint (*FinderGLCreateShader)(GLenum);
+typedef void (*FinderGLShaderSource)(GLuint, GLsizei, const GLchar *const *, const GLint *);
+typedef void (*FinderGLCompileShader)(GLuint);
+typedef void (*FinderGLGetShaderiv)(GLuint, GLenum, GLint *);
+typedef void (*FinderGLGetShaderInfoLog)(GLuint, GLsizei, GLsizei *, GLchar *);
+typedef GLuint (*FinderGLCreateProgram)(void);
+typedef void (*FinderGLAttachShader)(GLuint, GLuint);
+typedef void (*FinderGLLinkProgram)(GLuint);
+typedef void (*FinderGLGetProgramiv)(GLuint, GLenum, GLint *);
+typedef void (*FinderGLGetProgramInfoLog)(GLuint, GLsizei, GLsizei *, GLchar *);
+typedef void (*FinderGLUseProgram)(GLuint);
+typedef void (*FinderGLDeleteShader)(GLuint);
+typedef void (*FinderGLDeleteProgram)(GLuint);
+typedef GLint (*FinderGLGetUniformLocation)(GLuint, const GLchar *);
+typedef void (*FinderGLUniform1i)(GLint, GLint);
+typedef void (*FinderGLUniform2f)(GLint, GLfloat, GLfloat);
+
+static FinderGLGenFramebuffers finder_gl_gen_framebuffers;
+static FinderGLBindFramebuffer finder_gl_bind_framebuffer;
+static FinderGLDeleteFramebuffers finder_gl_delete_framebuffers;
+static FinderGLFramebufferTexture2D finder_gl_framebuffer_texture_2d;
+static FinderGLCheckFramebufferStatus finder_gl_check_framebuffer_status;
+static FinderGLCreateShader finder_gl_create_shader;
+static FinderGLShaderSource finder_gl_shader_source;
+static FinderGLCompileShader finder_gl_compile_shader;
+static FinderGLGetShaderiv finder_gl_get_shader_iv;
+static FinderGLGetShaderInfoLog finder_gl_get_shader_info_log;
+static FinderGLCreateProgram finder_gl_create_program;
+static FinderGLAttachShader finder_gl_attach_shader;
+static FinderGLLinkProgram finder_gl_link_program;
+static FinderGLGetProgramiv finder_gl_get_program_iv;
+static FinderGLGetProgramInfoLog finder_gl_get_program_info_log;
+static FinderGLUseProgram finder_gl_use_program;
+static FinderGLDeleteShader finder_gl_delete_shader;
+static FinderGLDeleteProgram finder_gl_delete_program;
+static FinderGLGetUniformLocation finder_gl_get_uniform_location;
+static FinderGLUniform1i finder_gl_uniform1i;
+static FinderGLUniform2f finder_gl_uniform2f;
+
+static GLuint finder_bloom_source, finder_bloom_ping, finder_bloom_pong;
+static GLuint finder_bloom_fbo, finder_bloom_program;
+static GLint finder_bloom_texture_uniform, finder_bloom_texel_uniform;
+static GLint finder_bloom_mode_uniform;
+static unsigned int finder_bloom_w, finder_bloom_h;
+static int finder_bloom_ready;
+
+/* FreeType + OpenGL font rendering */
+typedef struct {
+  unsigned int tex_id;
+  unsigned int face_index;
+  unsigned int glyph_index;
+  int w, h;
+  int bearing_x, bearing_y;
+  int advance;
+  int loaded;
+} GLGlyph;
+
+#define GL_FONT_MAX_FACES 32
+#define GL_FONT_MAX_GLYPHS 2048
+typedef struct {
+  FT_Face face;
+  hb_font_t *hb_font;
+  char *file;
+  int index;
+  double pixel_size;
+} GLFontFace;
+
+typedef struct {
+  GLFontFace faces[GL_FONT_MAX_FACES];
+  unsigned int face_count;
+  GLGlyph glyphs[GL_FONT_MAX_GLYPHS];
+  unsigned int glyph_count;
+  int height;
+  double pixel_size;
+  int lcd_order;
+} GLFont;
+
+static FT_Library ft_lib = NULL;
+static GLFont *gl_font = NULL;
+static GLFont *notify_history_time_font = NULL;
+static GLFont *finder_query_gl_font = NULL;
+static GLFont *finder_result_gl_font = NULL;
 
 static struct pw_thread_loop *sound_loop = NULL;
 static struct pw_context *sound_context = NULL;
@@ -417,6 +702,7 @@ static void arrangemon(Monitor *m);
 static void attach(Client *c);
 static void attachstack(Client *c);
 static void buttonpress(XEvent *e);
+static void buttonrelease(XEvent *e);
 static void checkotherwm(void);
 static void cleanup(void);
 static void prepare_workspace_switch(Monitor *m, unsigned int oldtags, unsigned int newtags);
@@ -438,7 +724,11 @@ static Monitor *dirtomon(int dir);
 static void dragmfact(const Arg *arg);
 static void dragcfact(const Arg *arg);
 static void drawbar(Monitor *m);
+static int drawfinder_frame(Monitor *m);
+static void drawrightbar(Monitor *m, unsigned int rw);
+static void drawrightbar_only(void);
 static void drawbars(void);
+static int status_text_visible(const char *text);
 static int drawstatusbar(Monitor *m, int bh, char *text);
 static void drawtab(Monitor *m);
 static void drawtabs(void);
@@ -520,6 +810,9 @@ static void setnumdesktops(void);
 static void setup(void);
 static void setviewport(void);
 static void seturgent(Client *c, int urg);
+static int hasurgentclients(void);
+static void demandattention(Client *c);
+static void updateurgentborders(void);
 static void show(Client *c);
 static void showhide(Client *c);
 static void restorefullscreenhidden(Monitor *m);
@@ -554,11 +847,56 @@ static void updatepreview(void);
 static void updateclientlist(void);
 static void updateclock(void);
 static void updateclockbar(void);
+static void finder(const Arg *arg);
+static void finder_close(void);
+static int finder_pointer_inside(XButtonEvent *ev);
+static void finder_motion(XMotionEvent *ev);
+static void finder_focus_pointer(void);
+static int finder_keypress(XKeyEvent *ev);
+static int finder_buttonpress(XButtonPressedEvent *ev);
+static int finder_translation_max_lines(void);
+static int finder_translation_line_count(const char *text);
+static unsigned int finder_popup_width(void);
+static void finder_query_viewport(const char *text, Fnt *font,
+                                  unsigned int width, char *out,
+                                  size_t out_size, size_t *cursor_pos);
+static void finder_load_apps(void);
+static int finder_load_next_icon(void);
+static void finder_load_recent(void);
+static void finder_save_recent(void);
+static void finder_translation_update(void);
+static void finder_translation_start(void);
+static void finder_translation_cancel(void);
+static void finder_translation_read(void);
+static void finder_translation_tick(void);
+static void finder_ocr(const Arg *arg);
+static void finder_ocr_read(void);
+static void finder_ocr_finish(void);
+static uint64_t finder_monotonic_ms(void);
+static float finder_translation_glow_pulse(uint64_t now);
+static void finder_translation_glow_stop(void);
 static void status_start(void);
 static void status_stop(void);
 static void status_consume(void);
+static void sound_monitor_pause(int paused);
 static int update_mpris_scroll(void);
+static void mpris_load_art(unsigned int target_w, unsigned int target_h);
+static void mpris_panel_button(XButtonPressedEvent *ev);
+static void mpris_panel_motion(XMotionEvent *ev);
+static void mpris_panel_draw(Monitor *m, unsigned int w, unsigned int h);
+static void mpris_collapse_panel(void);
+static void mpris_volume_marker(Monitor *m, int x, int y,
+                                unsigned int width, unsigned int height);
+static void finder_marker(Monitor *m, int row);
+static int mpris_pointer_over_marker(Monitor *m);
+static int mpris_pointer_over_bar(Monitor *m);
 static int drag_next_event(XEvent *ev);
+/* These are defined with the other dwm globals below; the MPRIS helpers are
+ * kept near the status worker for readability. */
+static int bh;
+static Display *dpy;
+static Drw *drw;
+static Clr **scheme;
 
 #define STATUS_SLOTS 3
 #define STATUS_SIZE 1024
@@ -567,13 +905,25 @@ static int drag_next_event(XEvent *ev);
 #define MPRIS_SCROLL_PAD 8
 #define MPRIS_SCROLL_INTERVAL_NS 33333333ULL
 #define MPRIS_COMPLETE_THRESHOLD 0.995
+#define MPRIS_PANEL_MIN_WIDTH 320
+#define MPRIS_PANEL_HOVER_H 2
+#define MPRIS_VOLUME_CURVE 9.0
+#define MPRIS_VOLUME_MARKER_WIDTH 24
+#define MPRIS_VOLUME_MARKER_HOVER_WIDTH 32
+#define MPRIS_VOLUME_MARKER_HEIGHT 16
+#define MPRIS_VOLUME_MARKER_HOVER_HEIGHT 20
 enum status_slot_state { STATUS_FREE, STATUS_WRITING, STATUS_PUBLISHED,
                          STATUS_READING };
 typedef struct {
 	_Atomic int state;
 	char text[STATUS_SIZE];
 	char mpris[768];
+	char mpris_service[128];
+	char mpris_art[PATH_MAX];
 	double mpris_progress;
+	double mpris_volume;
+	int mpris_playing;
+	int mpris_present;
 } StatusSlot;
 static StatusSlot status_slots[STATUS_SLOTS];
 static pthread_t status_thread;
@@ -586,10 +936,23 @@ static struct timespec mpris_scroll_last;
 static uint64_t mpris_scroll_accum_ns;
 static int mpris_scroll_clock_valid;
 static int mpris_active;
+static int mpris_playing;
+static int mpris_present;
 static unsigned int mpris_scroll_text_width;
 static double mpris_progress = -1.0;
+static double mpris_volume = 1.0;
+static char mpris_service[128];
+static char mpris_art_url[PATH_MAX];
+static Picture mpris_art;
+static int mpris_art_w, mpris_art_h;
+static int mpris_hovered;
+static int mpris_marker_hovered;
+static int mpris_marker_pressed;
+static int mpris_volume_drag;
 static Clr mpris_scroll_bg_clr;
 static Clr mpris_progress_clr;
+static Clr mpris_volume_fill_clr;
+static Clr mpris_volume_empty_clr;
 static int bar_dirty;
 
 static int status_read_int(const char *path, int fallback) {
@@ -904,15 +1267,133 @@ static int status_dbus_property_int64(DBusConnection *connection, const char *se
 	return 1;
 }
 
+static int status_dbus_property_double(DBusConnection *connection, const char *service,
+                                       const char *property, double *out) {
+	DBusMessage *message, *reply;
+	DBusMessageIter iter, variant;
+	const char *interface = "org.mpris.MediaPlayer2.Player";
+	double value;
+
+	message = dbus_message_new_method_call(service, "/org/mpris/MediaPlayer2",
+	        "org.freedesktop.DBus.Properties", "Get");
+	if (!message) return 0;
+	dbus_message_append_args(message, DBUS_TYPE_STRING, &interface,
+	                         DBUS_TYPE_STRING, &property, DBUS_TYPE_INVALID);
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	if (!reply || !dbus_message_iter_init(reply, &iter) ||
+	    dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT) {
+		if (reply) dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_recurse(&iter, &variant);
+	if (dbus_message_iter_get_arg_type(&variant) != DBUS_TYPE_DOUBLE) {
+		dbus_message_unref(reply);
+		return 0;
+	}
+	dbus_message_iter_get_basic(&variant, &value);
+	*out = value;
+	dbus_message_unref(reply);
+	return 1;
+}
+
+static int mpris_method(const char *method) {
+	DBusConnection *connection;
+	DBusMessage *message, *reply;
+	if (!mpris_service[0]) return 0;
+	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
+	if (!connection) return 0;
+	message = dbus_message_new_method_call(mpris_service, "/org/mpris/MediaPlayer2",
+	        "org.mpris.MediaPlayer2.Player", method);
+	if (!message) {
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	reply = dbus_connection_send_with_reply_and_block(connection, message, 300, NULL);
+	dbus_message_unref(message);
+	if (reply) dbus_message_unref(reply);
+	dbus_connection_unref(connection);
+	return reply != NULL;
+}
+
+static int mpris_set_volume(double volume) {
+	DBusConnection *connection;
+	DBusMessage *message;
+	DBusMessageIter args, variant;
+	const char *interface = "org.mpris.MediaPlayer2.Player";
+	const char *property = "Volume";
+	const char *signature = "d";
+	if (!mpris_service[0]) return 0;
+	volume = MAX(0.0, MIN(1.0, volume));
+	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
+	if (!connection) return 0;
+	message = dbus_message_new_method_call(mpris_service, "/org/mpris/MediaPlayer2",
+	        "org.freedesktop.DBus.Properties", "Set");
+	if (!message) {
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	dbus_message_iter_init_append(message, &args);
+	dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &interface);
+	dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &property);
+	dbus_message_iter_open_container(&args, DBUS_TYPE_VARIANT, signature, &variant);
+	dbus_message_iter_append_basic(&variant, DBUS_TYPE_DOUBLE, &volume);
+	dbus_message_iter_close_container(&args, &variant);
+	/* Volume is changed from pointer-motion events.  Waiting for a synchronous
+	 * reply here can stall the main X event loop when another DBus client (for
+	 * example the notification service) is active.  Queue the Set request and
+	 * keep the local slider responsive instead. */
+	if (!dbus_connection_send(connection, message, NULL)) {
+		dbus_message_unref(message);
+		dbus_connection_unref(connection);
+		return 0;
+	}
+	dbus_connection_flush(connection);
+	dbus_message_unref(message);
+	dbus_connection_unref(connection);
+	mpris_volume = volume;
+	return 1;
+}
+
+/* Map the slider's linear position to a more useful, logarithmic volume
+ * response.  The inverse is used for drawing so the marker follows the same
+ * curve as the value sent to the player. */
+static double mpris_slider_volume(double position) {
+	position = MAX(0.0, MIN(1.0, position));
+	if (position <= 0.0)
+		return 0.0;
+	return expm1(position * log1p(MPRIS_VOLUME_CURVE)) /
+	       MPRIS_VOLUME_CURVE;
+}
+
+static double mpris_volume_position(double volume) {
+	volume = MAX(0.0, MIN(1.0, volume));
+	if (volume <= 0.0)
+		return 0.0;
+	return log1p(volume * MPRIS_VOLUME_CURVE) /
+	       log1p(MPRIS_VOLUME_CURVE);
+}
+
+static double mpris_volume_from_x(int x, int slider_x, int slider_w) {
+	double position;
+
+	/* The marker starts at the fill endpoint, so subtract half its width:
+	 * clicking the marker's center selects the current endpoint. */
+	position = (double)(x - slider_x - MPRIS_VOLUME_MARKER_WIDTH / 2) /
+	           MAX(1, slider_w);
+	return mpris_slider_volume(position);
+}
+
 static int status_mpris_metadata(DBusConnection *connection, const char *service,
                                  char *artist, size_t artistlen,
                                  char *title, size_t titlelen,
+                                 char *art, size_t artlen,
                                  int64_t *length_us) {
 	DBusMessage *message, *reply;
 	DBusMessageIter iter, variant, dict;
 	const char *interface = "org.mpris.MediaPlayer2.Player";
 	const char *property = "Metadata";
-	artist[0] = title[0] = '\0';
+	artist[0] = title[0] = art[0] = '\0';
 	*length_us = 0;
 	message = dbus_message_new_method_call(service, "/org/mpris/MediaPlayer2",
 	        "org.freedesktop.DBus.Properties", "Get");
@@ -965,6 +1446,11 @@ static int status_mpris_metadata(DBusConnection *connection, const char *service
 				if (unsigned_length <= INT64_MAX)
 					*length_us = (int64_t)unsigned_length;
 			}
+		} else if (!strcmp(key, "mpris:artUrl") &&
+		           dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_STRING) {
+			const char *s;
+			dbus_message_iter_get_basic(&value, &s);
+			snprintf(art, artlen, "%s", s ? s : "");
 		}
 next:
 		dbus_message_iter_next(&dict);
@@ -974,7 +1460,9 @@ next:
 }
 
 static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
-                        double *progress) {
+                        char *service_out, size_t service_len,
+                        char *art, size_t artlen, double *progress,
+                        double *volume, int *playing) {
 	DBusConnection *connection;
 	DBusMessage *reply;
 	DBusMessageIter iter, names;
@@ -982,6 +1470,7 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 	int64_t position_us = 0, length_us = 0;
 	char service[128] = "";
 	*progress = -1.0;
+	if (playing) *playing = 0;
 	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
 	if (!connection) return 0;
 	reply = status_dbus_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
@@ -999,7 +1488,9 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 		if (name && !strncmp(name, "org.mpris.MediaPlayer2.", 23)) {
 			snprintf(state, sizeof state, "Stopped");
 			if (status_dbus_property_string(connection, name, "PlaybackStatus",
-			                               state, sizeof state) && !strcmp(state, "Playing")) {
+			                               state, sizeof state) &&
+			    (!strcmp(state, "Playing") || !strcmp(state, "Paused"))) {
+				if (playing) *playing = !strcmp(state, "Playing");
 				snprintf(service, sizeof service, "%s", name);
 				break;
 			}
@@ -1008,10 +1499,13 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 	}
 	dbus_message_unref(reply);
 	if (!service[0] || !status_mpris_metadata(connection, service, artist, sizeof artist,
-	                                       title, sizeof title, &length_us)) {
+	                                       title, sizeof title, art, artlen, &length_us)) {
 		dbus_connection_unref(connection);
 		return 0;
 	}
+	snprintf(service_out, service_len, "%s", service);
+	*volume = 1.0;
+	(void)status_dbus_property_double(connection, service, "Volume", volume);
 	if (length_us > 0 && status_dbus_property_int64(connection, service,
 	                                                  "Position", &position_us)) {
 		if (position_us < 0) position_us = 0;
@@ -1028,9 +1522,15 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 	 * malformed players fall back to the normal status branch. */
 	if (raw && rawlen)
 		snprintf(raw, rawlen, "[%s]  %s", artist[0] ? artist : "UNKNOWN ARTIST", title);
-	snprintf(out, outlen,
-	         "^c#1E1D2D^ ^b#B8E9B4^ 󰎆^c#1E1D2D^ ^m^%s^M^^d^^c#96CDFB^",
-	         raw && rawlen ? raw : "");
+	/* Keep the player active while paused, but only expose the scrolling
+	 * title segment while playback is actually running. */
+	if (!playing || *playing) {
+		snprintf(out, outlen,
+		         "^c#1E1D2D^ ^b#B8E9B4^ 󰎆^c#1E1D2D^^m^ %s^M^^d^^c#96CDFB^",
+		         raw && rawlen ? raw : "");
+	} else if (out && outlen) {
+		out[0] = '\0';
+	}
 	dbus_connection_unref(connection);
 	return 1;
 }
@@ -1073,7 +1573,11 @@ static int status_fan(char *icon, size_t iconlen) {
 }
 
 static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_len,
-                        double *mpris_progress_out,
+                        char *mpris_service_out, size_t mpris_service_len,
+                        char *mpris_art_out, size_t mpris_art_len,
+                        double *mpris_progress_out, double *mpris_volume_out,
+                        int *mpris_playing_out,
+                        int *mpris_present_out,
                         unsigned long long *last_total, unsigned long long *last_active) {
 	unsigned long long total = 0, active = 0, used, memtotal;
 	int mempercent, cpu = 0, cap, charging, strength, temp;
@@ -1129,15 +1633,27 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 	if (!fan_st) fan[0] = '\0';
 	if (mpris_out && mpris_len) mpris_out[0] = '\0';
 	if (mpris_progress_out) *mpris_progress_out = -1.0;
+	if (mpris_service_out && mpris_service_len) mpris_service_out[0] = '\0';
+	if (mpris_art_out && mpris_art_len) mpris_art_out[0] = '\0';
+	if (mpris_volume_out) *mpris_volume_out = 1.0;
+	if (mpris_playing_out) *mpris_playing_out = 0;
+	if (mpris_present_out) *mpris_present_out = 0;
 	has_player = status_mpris(player, sizeof player, mpris_out, mpris_len,
-	                          mpris_progress_out);
+	                          mpris_service_out, mpris_service_len,
+	                          mpris_art_out, mpris_art_len,
+	                          mpris_progress_out, mpris_volume_out,
+	                          mpris_playing_out);
+	if (mpris_present_out) *mpris_present_out = has_player;
 	sav_icon[0] = '\0';
 	if (fan[0] || !strcmp(governor, "performance")) {
 		snprintf(sav_icon, sizeof sav_icon, "  %s%s%s", fan,
 		         fan[0] && !strcmp(governor, "performance") ? " " : "",
 		         !strcmp(governor, "performance") ? "" : "");
 	}
-	if (has_player) {
+	/* A paused player remains present for MPRIS interaction, but the
+	 * top-right bar should fall back to the regular status layout rather
+	 * than showing an empty player segment. */
+	if (has_player && (!mpris_playing_out || *mpris_playing_out)) {
 			snprintf(out, outlen,
 			"^c#a6e3a1^%s %s^c%s^ ^b#96CDFB^ %s ^d^"
 			"^c#1E1D2D^ ^b#96CDFB^ %s ^d^"
@@ -1155,16 +1671,32 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 }
 
 static void *status_worker(void *arg) {
-	char local[STATUS_SIZE], local_mpris[768];
+	char local[STATUS_SIZE], local_mpris[768], local_service[128], local_art[PATH_MAX];
 	char last_mpris[768] = "";
 	double local_mpris_progress;
+	double local_mpris_volume;
+	int local_mpris_playing;
+	int local_mpris_present;
 	double last_mpris_progress = -1.0;
 	unsigned long long last_total = 0, last_active = 0;
 	(void)arg;
 	while (atomic_load_explicit(&status_running, memory_order_acquire)) {
-		struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+		struct timespec deadline;
+		pthread_mutex_lock(&fullscreen_mutex);
+		while (atomic_load_explicit(&status_running, memory_order_acquire) &&
+		       fullscreen_st)
+			pthread_cond_wait(&fullscreen_cond, &fullscreen_mutex);
+		if (!atomic_load_explicit(&status_running, memory_order_acquire)) {
+			pthread_mutex_unlock(&fullscreen_mutex);
+			break;
+		}
+		pthread_mutex_unlock(&fullscreen_mutex);
+
 		status_make(local, sizeof local, local_mpris, sizeof local_mpris,
-		            &local_mpris_progress,
+		            local_service, sizeof local_service, local_art, sizeof local_art,
+		            &local_mpris_progress, &local_mpris_volume,
+		            &local_mpris_playing,
+		            &local_mpris_present,
 		            &last_total, &last_active);
 		/* Some browser players briefly omit Position while refreshing their
 		 * metadata. Keep the last known value for the same track instead of
@@ -1185,13 +1717,27 @@ static void *status_worker(void *arg) {
 				STATUS_WRITING, memory_order_acquire, memory_order_relaxed)) {
 				memcpy(status_slots[i].text, local, sizeof local);
 				memcpy(status_slots[i].mpris, local_mpris, sizeof local_mpris);
+				memcpy(status_slots[i].mpris_service, local_service, sizeof local_service);
+				memcpy(status_slots[i].mpris_art, local_art, sizeof local_art);
 				status_slots[i].mpris_progress = local_mpris_progress;
+				status_slots[i].mpris_volume = local_mpris_volume;
+				status_slots[i].mpris_playing = local_mpris_playing;
+				status_slots[i].mpris_present = local_mpris_present;
 				atomic_store_explicit(&status_slots[i].state, STATUS_PUBLISHED, memory_order_release);
 				if (status_event_fd >= 0) { uint64_t one = 1; (void)write(status_event_fd, &one, sizeof one); }
 				break;
 			}
 		}
-		nanosleep(&ts, NULL);
+		/* Sleep between regular updates, but wake immediately on fullscreen
+		 * transitions so hidden status polling can stay completely paused. */
+		pthread_mutex_lock(&fullscreen_mutex);
+		if (atomic_load_explicit(&status_running, memory_order_acquire) &&
+		    !fullscreen_st) {
+			clock_gettime(CLOCK_REALTIME, &deadline);
+			deadline.tv_sec++;
+			pthread_cond_timedwait(&fullscreen_cond, &fullscreen_mutex, &deadline);
+		}
+		pthread_mutex_unlock(&fullscreen_mutex);
 	}
 	return NULL;
 }
@@ -1210,6 +1756,9 @@ static void status_start(void) {
 
 static void status_stop(void) {
 	if (!atomic_exchange(&status_running, 0)) return;
+	pthread_mutex_lock(&fullscreen_mutex);
+	pthread_cond_broadcast(&fullscreen_cond);
+	pthread_mutex_unlock(&fullscreen_mutex);
 	if (status_event_fd >= 0) { uint64_t one = 1; (void)write(status_event_fd, &one, sizeof one); }
 	pthread_join(status_thread, NULL);
 	if (status_event_fd >= 0) { close(status_event_fd); status_event_fd = -1; }
@@ -1230,23 +1779,263 @@ static void status_consume(void) {
 				mpris_scroll_text_width = 0;
 				mpris_scroll_accum_ns = 0;
 				mpris_scroll_clock_valid = 0;
-				memcpy(mpris_text, status_slots[i].mpris, sizeof mpris_text);
-				mpris_text[sizeof mpris_text - 1] = '\0';
-				mpris_active = mpris_text[0] != '\0';
+			memcpy(mpris_text, status_slots[i].mpris, sizeof mpris_text);
+			mpris_text[sizeof mpris_text - 1] = '\0';
+			mpris_active = mpris_text[0] != '\0';
+			}
+			memcpy(mpris_service, status_slots[i].mpris_service, sizeof mpris_service);
+			mpris_service[sizeof mpris_service - 1] = '\0';
+			if (strcmp(mpris_art_url, status_slots[i].mpris_art)) {
+				memcpy(mpris_art_url, status_slots[i].mpris_art, sizeof mpris_art_url);
+				mpris_art_url[sizeof mpris_art_url - 1] = '\0';
+				/* The artwork is loaded by mpris_panel_draw with the actual
+				 * right-bar width.  Do not cache a placeholder-sized picture. */
+				if (mpris_art) {
+					XRenderFreePicture(dpy, mpris_art);
+					mpris_art = None;
+				}
+				mpris_art_w = mpris_art_h = 0;
 			}
 			mpris_progress = status_slots[i].mpris_progress;
+			mpris_volume = status_slots[i].mpris_volume;
+			mpris_playing = status_slots[i].mpris_playing;
+			mpris_present = status_slots[i].mpris_present;
+			/* Paused players have no scrolling title, but remain available to
+			 * keep the expanded panel and its playback controls alive. */
+			mpris_active = mpris_present;
+			/* A paused player remains active, so keep the expanded panel while
+			 * it is hovered.  If the player disappears, collapse immediately
+			 * regardless of where the pointer is. */
+			if (!mpris_active && (mpris_hovered || mpris_volume_drag ||
+			                     mpris_marker_hovered)) {
+				mpris_hovered = 0;
+				mpris_volume_drag = 0;
+				mpris_marker_hovered = 0;
+				mpris_marker_pressed = 0;
+				mpris_collapse_panel();
+			}
 			atomic_store_explicit(&status_slots[i].state, STATUS_FREE, memory_order_release);
-			bar_dirty = 1;
+			/* Fullscreen does not expose the bar, so defer repainting until it
+			 * ends while still consuming the newest status snapshot. */
+			if (!fullscreen_st)
+				bar_dirty = 1;
 			break;
 		}
 	}
 }
 
+static void mpris_load_art(unsigned int target_w, unsigned int target_h) {
+	Imlib_Image image;
+	const char *path = mpris_art_url;
+	DATA32 *data;
+	int w, h;
+	char file_path[PATH_MAX];
+
+	if (mpris_art)
+		XRenderFreePicture(dpy, mpris_art);
+	mpris_art = None;
+	mpris_art_w = mpris_art_h = 0;
+	if (!path[0])
+		return;
+	if (!strncmp(path, "file://", 7)) {
+		path += 7;
+		if (*path == '/') {
+			snprintf(file_path, sizeof file_path, "%s", path);
+			path = file_path;
+		}
+	} else if (path[0] != '/') {
+		/* Avoid blocking dwm on remote artwork URLs. */
+		return;
+	}
+	image = imlib_load_image(path);
+	if (!image)
+		return;
+	imlib_context_set_image(image);
+	w = imlib_image_get_width();
+	h = imlib_image_get_height();
+	data = imlib_image_get_data_for_reading_only();
+	if (data && w > 0 && h > 0)
+		mpris_art = drw_picture_create_cover(drw, (char *)data, w, h,
+		                                      target_w, target_h);
+	if (mpris_art) {
+		mpris_art_w = target_w;
+		mpris_art_h = target_h;
+	}
+	if (imlib_context_get_image())
+		imlib_free_image();
+}
+
+static void mpris_panel_button(XButtonPressedEvent *ev) {
+	int y = ev->y - bh;
+	int control_w = 34;
+	int slider_x = control_w + 12;
+	int slider_w = MAX(1, (int)statuswidth(stext) - slider_x - 120);
+	int volume_x = slider_x + slider_w + 6;
+	int previous_x = volume_x + 46;
+	int next_x = previous_x + control_w;
+	int marker_half_width = (mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_WIDTH : MPRIS_VOLUME_MARKER_WIDTH) / 2;
+	if (!mpris_active || y < 0 || y >= bh)
+		return;
+	/* Mouse buttons 4 and 5 are wheel-up and wheel-down in X11.  Handle
+	 * them independently of the pointer's horizontal position so scrolling
+	 * over any part of the expanded player changes volume in 5% steps. */
+	if (ev->button == Button4 || ev->button == Button5) {
+		mpris_set_volume(mpris_volume + (ev->button == Button4 ? 0.05 : -0.05));
+		bar_dirty = 1;
+		return;
+	}
+	if (ev->x < control_w) {
+		mpris_method("PlayPause");
+	} else if (ev->x >= slider_x - marker_half_width &&
+	           ev->x <= slider_x + slider_w + marker_half_width) {
+		mpris_volume_drag = 1;
+		mpris_set_volume(mpris_volume_from_x(ev->x, slider_x, slider_w));
+	} else if (ev->x >= previous_x && ev->x < next_x) {
+		mpris_method("Previous");
+	} else if (ev->x >= next_x && ev->x < next_x + control_w) {
+		mpris_method("Next");
+	}
+	bar_dirty = 1;
+}
+
+static void mpris_panel_motion(XMotionEvent *ev) {
+	int slider_x = 34 + 12;
+	int slider_w = MAX(1, (int)statuswidth(stext) - slider_x - 120);
+	int marker_half_width = (mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_WIDTH : MPRIS_VOLUME_MARKER_WIDTH) / 2;
+	if (mpris_volume_drag &&
+	    ev->x >= slider_x - marker_half_width &&
+	    ev->x <= slider_x + slider_w + marker_half_width)
+		mpris_set_volume(mpris_volume_from_x(ev->x, slider_x, slider_w));
+}
+
+static void mpris_panel_draw(Monitor *m, unsigned int w, unsigned int h) {
+	/* Cover the complete expanded bar, including the upper status half. */
+	unsigned int art_y = 0;
+	unsigned int panel_h = h ? h : 1;
+	int control_w = 34;
+	int slider_x = control_w + 12;
+	int slider_w;
+	int volume_x;
+	int previous_x;
+	int next_x;
+	int track_y;
+	int fill_w;
+	int knob_x;
+	int marker_width = mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_WIDTH : MPRIS_VOLUME_MARKER_WIDTH;
+	int marker_height = mpris_marker_hovered
+		? MPRIS_VOLUME_MARKER_HOVER_HEIGHT : MPRIS_VOLUME_MARKER_HEIGHT;
+	char volume[16];
+	static const char *controls[] = {"", ""};
+	const char *playback = mpris_playing ? controls[0] : "";
+	(void)m;
+	slider_w = MAX(1, (int)w - slider_x - 120);
+	volume_x = slider_x + slider_w + 6;
+	previous_x = volume_x + 46;
+	next_x = previous_x + control_w;
+	track_y = bh + bh / 2 - 2;
+	fill_w = (int)(slider_w * mpris_volume_position(mpris_volume) + 0.5);
+	/* The marker's left edge starts exactly at the filled track's right edge. */
+	knob_x = slider_x + fill_w;
+	if (knob_x < slider_x)
+		knob_x = slider_x;
+	if (knob_x > slider_x + slider_w)
+		knob_x = slider_x + slider_w;
+	/* Keep the marker center fixed while it grows on hover. */
+	if (mpris_marker_hovered)
+		knob_x -= (MPRIS_VOLUME_MARKER_HOVER_WIDTH -
+		           MPRIS_VOLUME_MARKER_WIDTH) / 2;
+	/* Always make the cached picture match the actual expanded bar size.  The
+	 * status update can load a small placeholder before rw is known; using that
+	 * size for the panel would leave the thumbnail narrower than the bar. */
+	if (mpris_art_url[0] &&
+	    (!mpris_art || mpris_art_w != (int)w || mpris_art_h != (int)panel_h))
+		mpris_load_art(w, panel_h);
+
+	XSetForeground(drw->dpy, drw->gc, scheme[SchemeNorm][ColBg].pixel);
+	XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, art_y, w, panel_h);
+	if (mpris_art)
+		drw_pic(drw, 0, art_y, w, panel_h, mpris_art);
+	/* Use one continuous gradient instead of stacked strips, which avoids
+	 * visible horizontal banding in the artwork. */
+	{
+		XFixed stops[] = { XDoubleToFixed(0.0), XDoubleToFixed(0.25),
+		                  XDoubleToFixed(1.0) };
+		XRenderColor colors[] = {
+			{ scheme[SchemeNorm][ColBg].color.red,
+			  scheme[SchemeNorm][ColBg].color.green,
+			  scheme[SchemeNorm][ColBg].color.blue, 0xFFFF },
+			{ scheme[SchemeNorm][ColBg].color.red,
+			  scheme[SchemeNorm][ColBg].color.green,
+			  scheme[SchemeNorm][ColBg].color.blue, 0xFFFF },
+			{ scheme[SchemeNorm][ColBg].color.red,
+			  scheme[SchemeNorm][ColBg].color.green,
+			  scheme[SchemeNorm][ColBg].color.blue, 0x0000 }
+		};
+		XLinearGradient linear = {
+			{ 0, 0 }, { 0, XDoubleToFixed(panel_h) }
+		};
+		Picture overlay = XRenderCreateLinearGradient(dpy, &linear, stops,
+		                                             colors, LENGTH(stops));
+		if (overlay) {
+			XRenderComposite(dpy, PictOpOver, overlay, None, drw->picture,
+			                 0, 0, 0, 0, 0, art_y, w, panel_h);
+			XRenderFreePicture(dpy, overlay);
+		}
+	}
+
+	/* Draw the transport glyphs without clearing their rectangles, so the
+	 * artwork remains visible beneath and between the controls. */
+	drw_setscheme(drw, scheme[SchemeTitle]);
+	drw_text_transparent(drw, 10, bh + 4, 28, MAX(1, bh - 8), 0,
+	                     playback);
+	drw_text_transparent(drw, previous_x, bh + 4, 28, MAX(1, bh - 8), 0,
+	                     controls[1]);
+	drw_text_transparent(drw, next_x, bh + 4, 28, MAX(1, bh - 8), 0, "");
+	drw_setscheme(drw, scheme[SchemeNorm]);
+	XSetForeground(drw->dpy, drw->gc, mpris_volume_empty_clr.pixel);
+	XFillRectangle(drw->dpy, drw->drawable, drw->gc, slider_x, track_y,
+	               slider_w, 4);
+	if (fill_w > 0) {
+		XSetForeground(drw->dpy, drw->gc, mpris_volume_fill_clr.pixel);
+		XFillRectangle(drw->dpy, drw->drawable, drw->gc, slider_x, track_y,
+		               fill_w, 4);
+	}
+	/* Connect the filled endpoint to the center of the separate marker. */
+	XSetForeground(drw->dpy, drw->gc, mpris_volume_fill_clr.pixel);
+	XFillRectangle(drw->dpy, drw->drawable, drw->gc,
+	               slider_x + fill_w, track_y + 1, marker_width / 2, 2);
+	/* Center the marker vertically on the 4-pixel track. */
+	mpris_volume_marker(m, knob_x, track_y + 2 - marker_height / 2,
+	                    marker_width, marker_height);
+	snprintf(volume, sizeof volume, "%d%%", (int)(mpris_volume * 100.0 + 0.5));
+	drw_setscheme(drw, scheme[SchemeTitle]);
+	drw_text_transparent(drw, volume_x, bh + 4, 38, MAX(1, bh - 8), 0, volume);
+}
+
 static void notification_init(void);
 static void notification_shutdown(void);
+static int notification_gl_init(unsigned int w, unsigned int h);
+static GLFont *gl_font_create(void);
+static GLFont *gl_font_create_scaled(double scale);
+static int gl_font_add_face(GLFont *font, const char *file, int index,
+                            double pixel_size);
+static unsigned int gl_font_text_width(const char *text);
+static unsigned int gl_font_text_width_for(GLFont *font, const char *text);
 static void notification_dispatch(void);
 static void notification_tick(void);
+static double notification_elapsed(const struct timespec *started);
 static void notification_draw(void);
+static void notification_draw_foreground(int history);
+static void notification_present_layers(int history);
+static int notification_history_background_create(void);
+static int notification_history_mask_create(unsigned int w, unsigned int h);
+static void map_center_window(Window win, int x, int y, unsigned int w,
+                              unsigned int h, int fade);
+static int notification_foreground_pass;
+static int notification_background_only;
 static void notification_advance(void);
 static void notification_clear_queue(void);
 static void notification_emit_closed(Notification *n, uint32_t reason);
@@ -1255,6 +2044,7 @@ static void notification_emit_input(Notification *n);
 static int notification_buttonpress(XButtonPressedEvent *ev);
 static int notification_input_keypress(XKeyEvent *ev);
 static void notification_update_layout(Notification *n);
+static uint32_t notification_utf8_next(const char **text);
 static void notification_motion(XMotionEvent *ev);
 static void notification_history_motion(XMotionEvent *ev);
 static void notification_history_draw(void);
@@ -1263,7 +2053,8 @@ static void notification_history_add(Notification *n);
 static void notification_history_show(void);
 static void notification_history_hide(void);
 static int notification_center_active(void);
-static void notification_update_wm_class(Window win, int active, int history);
+static void notification_update_wm_class(Window win, int active, int history,
+                                         int finder);
 static int notification_history_buttonpress(XButtonPressedEvent *ev);
 static int notification_history_tick(void);
 static void leavenotify(XEvent *e);
@@ -1299,12 +2090,13 @@ static int screen;
 static int sw, sh; /* X display screen geometry width, height */
 static int bh;     /* bar height */
 static int th = 0; /* tab bar geometry */
-static int lrpad;  /* sum of left and right padding for text */
+static int lrpad;  /* sum of left and right  for text */
 static int (*xerrorxlib)(Display *, XErrorEvent *);
 static unsigned int numlockmask = 0;
 static Time last_ev_time;
 static void (*handler[LASTEvent])(XEvent *) = {
     [ButtonPress] = buttonpress,
+    [ButtonRelease] = buttonrelease,
     [ClientMessage] = clientmessage,
     [ConfigureRequest] = configurerequest,
     [ConfigureNotify] = configurenotify,
@@ -1324,6 +2116,8 @@ static void (*handler[LASTEvent])(XEvent *) = {
     [UnmapNotify] = unmapnotify};
 static Atom wmatom[WMLast], netatom[NetLast], xatom[XLast];
 static int running = 1;
+static int urgentflash = 1;
+static struct timespec urgentflash_last;
 static int xkb_event_base = 0;
 static int alt_held = 0;
 /* Client currently being dragged; used to keep it visible across tag views. */
@@ -1339,6 +2133,13 @@ static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
 
+static void mpris_collapse_panel(void) {
+	if (!selmon)
+		return;
+	drawbars();
+	resizebarwin(selmon);
+}
+
 static int update_mpris_scroll(void) {
 	struct timespec now_mono;
 	unsigned int textw;
@@ -1346,7 +2147,7 @@ static int update_mpris_scroll(void) {
 	uint64_t elapsed_ns = 0;
 	uint64_t steps;
 
-	if (!mpris_active) {
+  if (fullscreen_st || !mpris_active) {
 		mpris_scroll_clock_valid = 0;
 		mpris_scroll_accum_ns = 0;
 		return 0;
@@ -1411,10 +2212,14 @@ static int drag_next_event(XEvent *ev) {
 	updateclockbar();
 	redraw = bar_dirty;
 	bar_dirty = 0;
-	if (update_mpris_scroll())
-		redraw = 1;
-	if (redraw)
-		drawbars();
+  if (update_mpris_scroll())
+    redraw = 1;
+  if (redraw) {
+    if (finder_active)
+      drawrightbar_only();
+    else
+      drawbars();
+  }
 	if (!XPending(dpy) && !(pfd[0].revents & POLLIN))
 		return 0;
 	XNextEvent(dpy, ev);
@@ -1461,6 +2266,12 @@ struct Monitor {
   Window barcenterwin;
   Window barkbwin;
   Window barrightwin;
+  Window mpris_volume_markerwin;
+  Window finder_markerwin;
+  int finder_marker_mapped;
+  int finder_marker_stacked;
+  int finder_marker_x;
+  int finder_marker_y;
   Window tabwin;
   Window tagwin;
   Window sidebarwin;
@@ -1475,6 +2286,143 @@ struct Monitor {
   const Layout *lt[2];
   Pertag *pertag;
 };
+
+/* Keep the volume position as a separate top-level X11 window.  It is placed
+ * above the bar for compositors while forwarding its mouse input to the bar. */
+static void mpris_volume_marker(Monitor *m, int x, int y,
+                                unsigned int width, unsigned int height) {
+  Window child;
+  int root_x, root_y;
+  XWindowChanges wc = {0};
+  XClassHint marker_ch = {
+    "dwm-mpris-volume-marker",
+    mpris_marker_hovered ? "dwm-mpris-volume-marker-larg"
+                         : "dwm-mpris-volume-marker"
+  };
+
+  if (!m->mpris_volume_markerwin || !mpris_hovered || !mpris_active)
+    return;
+  XTranslateCoordinates(dpy, m->barrightwin, root, 0, 0,
+                        &root_x, &root_y, &child);
+  /* Set the compositor-visible class before changing geometry, so a class
+   * rule for the previous hover state cannot be applied to the new frame. */
+  XSetClassHint(dpy, m->mpris_volume_markerwin, &marker_ch);
+  /* Apply the complete geometry in one X request so a resize never becomes
+   * visible before its matching position update. */
+  wc.x = root_x + x;
+  wc.y = root_y + y;
+  wc.width = width;
+  wc.height = height;
+  wc.sibling = m->barrightwin;
+  wc.stack_mode = Above;
+  XConfigureWindow(dpy, m->mpris_volume_markerwin,
+                   CWX | CWY | CWWidth | CWHeight | CWSibling | CWStackMode,
+                   &wc);
+  {
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(dpy, m->mpris_volume_markerwin, &wa) &&
+        wa.map_state != IsViewable)
+      XMapWindow(dpy, m->mpris_volume_markerwin);
+  }
+}
+
+static void finder_marker(Monitor *m, int row) {
+  Window child;
+  int root_x, root_y;
+  XWindowChanges wc = {0};
+
+  if (!m->finder_markerwin)
+    return;
+  if (!finder_active || m != selmon || row <= 0) {
+    if (m->finder_marker_mapped) {
+      XUnmapWindow(dpy, m->finder_markerwin);
+      m->finder_marker_mapped = 0;
+    }
+    m->finder_marker_stacked = 0;
+    return;
+  }
+  XTranslateCoordinates(dpy, m->barcenterwin, root, 0, 0,
+                        &root_x, &root_y, &child);
+  wc.x = root_x + ((int)finder_popup_width() - FINDER_MARKER_WIDTH) / 2;
+  wc.y = root_y + row * bh;
+  wc.width = FINDER_MARKER_WIDTH;
+  wc.height = 38;
+  if (!m->finder_marker_mapped || m->finder_marker_x != wc.x ||
+      m->finder_marker_y != wc.y) {
+    XConfigureWindow(dpy, m->finder_markerwin,
+                     CWX | CWY | CWWidth | CWHeight, &wc);
+    m->finder_marker_x = wc.x;
+    m->finder_marker_y = wc.y;
+  }
+  if (!m->finder_marker_mapped) {
+    /* Raise only on the hidden -> visible transition. Repeatedly raising an
+     * opaque root-level sibling on every draw causes visible flashes without
+     * a compositor. */
+    XMapRaised(dpy, m->finder_markerwin);
+    m->finder_marker_mapped = 1;
+    m->finder_marker_stacked = 1;
+  } else if (!m->finder_marker_stacked) {
+    XRaiseWindow(dpy, m->finder_markerwin);
+    m->finder_marker_stacked = 1;
+  }
+}
+
+/* The clock animation normally raises the center bar as it grows.  During
+ * the expanded MPRIS panel, keep the right bar above it instead. */
+static void
+restack_mpris_panel(Monitor *m)
+{
+	XWindowChanges wc = {0};
+
+	if (!m || m != selmon || !mpris_hovered || !mpris_active ||
+	    !m->barrightwin)
+		return;
+	if (m->barcenterwin) {
+		wc.sibling = m->barcenterwin;
+		wc.stack_mode = Above;
+		XConfigureWindow(dpy, m->barrightwin, CWSibling | CWStackMode, &wc);
+	} else {
+		XRaiseWindow(dpy, m->barrightwin);
+	}
+}
+
+static int mpris_pointer_over_marker(Monitor *m) {
+  XWindowAttributes wa;
+  Window root_return, child_return;
+  unsigned int mask;
+  int pointer_x, pointer_y, window_x, window_y;
+
+  if (!m->mpris_volume_markerwin ||
+      !XGetWindowAttributes(dpy, m->mpris_volume_markerwin, &wa) ||
+      wa.map_state != IsViewable)
+    return 0;
+  if (!XQueryPointer(dpy, root, &root_return, &child_return,
+                     &pointer_x, &pointer_y, &window_x, &window_y, &mask))
+    return 0;
+  XTranslateCoordinates(dpy, m->mpris_volume_markerwin, root, 0, 0,
+                        &window_x, &window_y, &child_return);
+  return pointer_x >= window_x && pointer_x < window_x + wa.width &&
+         pointer_y >= window_y && pointer_y < window_y + wa.height;
+}
+
+static int mpris_pointer_over_bar(Monitor *m) {
+  XWindowAttributes wa;
+  Window root_return, child_return;
+  unsigned int mask;
+  int pointer_x, pointer_y, window_x, window_y;
+
+  if (!m->barrightwin ||
+      !XGetWindowAttributes(dpy, m->barrightwin, &wa) ||
+      wa.map_state != IsViewable)
+    return 0;
+  if (!XQueryPointer(dpy, root, &root_return, &child_return,
+                     &pointer_x, &pointer_y, &window_x, &window_y, &mask))
+    return 0;
+  XTranslateCoordinates(dpy, m->barrightwin, root, 0, 0,
+                        &window_x, &window_y, &child_return);
+  return pointer_x >= window_x && pointer_x < window_x + wa.width &&
+         pointer_y >= window_y && pointer_y < window_y + wa.height;
+}
 
 #include "movestack.c"
 #include "shiftview.c"
@@ -1659,6 +2607,28 @@ void attachstack(Client *c) {
   c->mon->stack = c;
 }
 
+static void buttonrelease(XEvent *e) {
+  XButtonEvent *ev = &e->xbutton;
+
+  if (mpris_volume_drag || ev->window == selmon->barrightwin ||
+      ev->window == selmon->mpris_volume_markerwin)
+    mpris_volume_drag = 0;
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    mpris_marker_pressed = 0;
+    if (mpris_pointer_over_marker(selmon)) {
+      mpris_marker_hovered = 1;
+      drawbars();
+    }
+  }
+  if (!mpris_volume_drag && mpris_hovered &&
+      !mpris_pointer_over_bar(selmon) &&
+      !mpris_pointer_over_marker(selmon)) {
+    mpris_hovered = 0;
+    drawbars();
+    resizebarwin(selmon);
+  }
+}
+
 void buttonpress(XEvent *e) {
   unsigned int i, x, click;
   int clientbinding;
@@ -1667,6 +2637,46 @@ void buttonpress(XEvent *e) {
   Client *c;
   Monitor *m;
   XButtonPressedEvent *ev = &e->xbutton;
+
+  /* Finder is modal.  A click on a client or another bar section must not
+   * be handled by the normal click bindings while the Finder is open. */
+  if (finder_active) {
+    if (ev->window == selmon->barcenterwin) {
+      finder_buttonpress(ev);
+      return;
+    }
+    if (finder_pointer_inside(ev)) {
+      XButtonPressedEvent inside = *ev;
+      XWindowAttributes attr;
+      if (XGetWindowAttributes(dpy, selmon->barcenterwin, &attr)) {
+        inside.window = selmon->barcenterwin;
+        inside.x = ev->x_root - attr.x;
+        inside.y = ev->y_root - attr.y;
+        finder_buttonpress(&inside);
+      }
+    } else {
+      finder_close();
+      finder_focus_pointer();
+    }
+    return;
+  }
+
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    /* Keep the marker compact during a click/drag. */
+    mpris_marker_pressed = 1;
+    if (mpris_marker_hovered) {
+      mpris_marker_hovered = 0;
+      drawbars();
+    }
+    XButtonPressedEvent forwarded = *ev;
+    Window child;
+    XTranslateCoordinates(dpy, root, selmon->barrightwin,
+                          ev->x_root, ev->y_root, &forwarded.x,
+                          &forwarded.y, &child);
+    forwarded.window = selmon->barrightwin;
+    mpris_panel_button(&forwarded);
+    return;
+  }
 
   click = ClkRootWin;
   /* focus monitor if necessary */
@@ -1709,8 +2719,16 @@ void buttonpress(XEvent *e) {
     /* the remaining area of the title bar is the app icon + app name */
     click = ClkWinTitle;
   } else if (ev->window == selmon->barrightwin) {
+    if (mpris_hovered && mpris_active && ev->y >= bh) {
+      mpris_panel_button(ev);
+      return;
+    }
     click = ClkStatusText;
   } else if (ev->window == selmon->barcenterwin) {
+    if (finder_active) {
+      finder_buttonpress(ev);
+      return;
+    }
     /* While a notification is visible, the center window belongs entirely
      * to it.  Do not let clicks which miss a control fall through to the
      * normal root/bar bindings; those bindings may change focus or reload
@@ -1847,7 +2865,10 @@ void cleanup(void) {
     free(scheme[i]);
   free(scheme);
   XDestroyWindow(dpy, wmcheckwin);
+  drw_fontset_free(finder_result_font);
   drw_free(drw);
+  if (finder_argb_colormap)
+    XFreeColormap(dpy, finder_argb_colormap);
   XFlush(dpy);
   XSetInputFocus(dpy, PointerRoot, RevertToPointerRoot, CurrentTime);
   XDeleteProperty(dpy, root, netatom[NetActiveWindow]);
@@ -1878,6 +2899,16 @@ void cleanupmon(Monitor *mon) {
   XDestroyWindow(dpy, mon->barkbwin);
   XUnmapWindow(dpy, mon->barrightwin);
   XDestroyWindow(dpy, mon->barrightwin);
+  if (mon->mpris_volume_markerwin) {
+    XUnmapWindow(dpy, mon->mpris_volume_markerwin);
+    XDestroyWindow(dpy, mon->mpris_volume_markerwin);
+  }
+    if (mon->finder_markerwin) {
+      XUnmapWindow(dpy, mon->finder_markerwin);
+      mon->finder_marker_mapped = 0;
+      mon->finder_marker_stacked = 0;
+      XDestroyWindow(dpy, mon->finder_markerwin);
+  }
   XUnmapWindow(dpy, mon->tabwin);
   XDestroyWindow(dpy, mon->tabwin);
   XUnmapWindow(dpy, mon->tagwin);
@@ -1966,8 +2997,8 @@ void clientmessage(XEvent *e) {
                         || (cme->data.l[0] == 2 /* _NET_WM_STATE_TOGGLE */ &&
                             !c->isfullscreen)));
   } else if (cme->message_type == netatom[NetActiveWindow]) {
-    if (c != selmon->sel && !c->isurgent)
-      seturgent(c, 1);
+    if (c != selmon->sel)
+      demandattention(c);
   }
 }
 
@@ -2225,11 +3256,38 @@ unsigned int statuswidth(char *stext) {
     isCode = 0;
   free(p);
 
-  return w + horizpadbar;
+	if (mpris_hovered && mpris_active)
+		w = MAX(w, MPRIS_PANEL_MIN_WIDTH);
+	return w + horizpadbar;
+}
+
+static int
+status_text_visible(const char *text)
+{
+	if (!text)
+		return 0;
+	while (*text == ' ' || *text == '\t')
+		text++;
+	return *text != '\0';
+}
+
+static int
+status_next_is_scroll(const char *code)
+{
+	const char *end = strchr(code, '^');
+
+	return end && end[1] == '^' && end[2] == 'm' && end[3] == '^';
 }
 
 int drawstatusbar(Monitor *m, int bh, char *stext) {
   int i, w, x, len;
+  int expanded = mpris_hovered && mpris_active;
+  int content_h = expanded ? bh / 2 : bh;
+  int paired_bg = expanded && !mpris_playing;
+  int bg_segment = -1;
+  int bg_width;
+  int text_bg = 0;
+  int joins_scroll = 0;
   short isCode = 0;
   short isScroll = 0;
   char *text;
@@ -2244,13 +3302,20 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
   w = statuswidth(stext);
   x = horizpadbar / 2;
 
-  XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, w, bh);
-
-  drw_setscheme(drw, scheme[LENGTH(colors)]);
-  drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
-  drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
-  drw_rect(drw, 0, borderpx, w, bh, 1, 1);
+  if (!expanded) {
+    XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
+    XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, w, content_h);
+    drw_setscheme(drw, scheme[LENGTH(colors)]);
+    drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
+    drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
+    drw_rect(drw, 0, borderpx, w, content_h, 1, 1);
+  } else {
+    /* The artwork is already behind this pass.  Do not paint a bar-wide
+     * background; only an explicit ^b field gets a background below. */
+    drw_setscheme(drw, scheme[LENGTH(colors)]);
+    drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
+    drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
+  }
 
   /* process status text */
   i = -1;
@@ -2259,8 +3324,9 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
       isCode = 1;
 
       text[i] = '\0';
+      joins_scroll = status_next_is_scroll(text + i + 1);
        w = isScroll ? mpris_field_width(text) : TEXTW(text) - lrpad;
-        if (isScroll) {
+         if (isScroll) {
           double progress = mpris_progress;
           unsigned int progressw = 0;
           if (progress >= 0.0) {
@@ -2268,16 +3334,47 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
             if (progress >= MPRIS_COMPLETE_THRESHOLD) progress = 1.0;
             progressw = (unsigned int)(progress * w + 0.5);
           }
-          mpris_scroll_text_width = drw_text_scroll_progress(
-              drw, x, borderpx + vertpadbar / 2, w,
-              bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
-              MPRIS_SCROLL_GAP, 0, &mpris_scroll_bg_clr,
+           if (expanded && text_bg && status_text_visible(text)) {
+             XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+              bg_width = MAX(1, w +
+                               (paired_bg && !(bg_segment & 1) ? lrpad + 1 : 0) -
+                                (expanded && bg_segment >= 0 &&
+                                 !isScroll &&
+                                 !joins_scroll &&
+                                 (!paired_bg || (bg_segment & 1)) ? 2 : 0));
+              XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+                             borderpx + vertpadbar / 2, bg_width,
+                             bh - vertpadbar);
+            }
+            mpris_scroll_text_width = drw_text_scroll_progress(
+                drw, x, borderpx + vertpadbar / 2, w,
+                 bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
+               MPRIS_SCROLL_GAP, 0,
+               expanded && (!text_bg || !status_text_visible(text))
+                   ? (const Clr *)-1 : &mpris_scroll_bg_clr,
               progress >= 0.0 ? &mpris_progress_clr : NULL,
               progressw);
         }
-       else
-         drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text,
-                  0);
+        else {
+          if (expanded && text_bg && status_text_visible(text)) {
+            XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+            bg_width = MAX(1, w +
+                             (paired_bg && !(bg_segment & 1) ? lrpad + 1 : 0) -
+                              (expanded && bg_segment >= 0 &&
+                               !isScroll &&
+                               !joins_scroll &&
+                               (!paired_bg || (bg_segment & 1)) ? 2 : 0));
+            XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+                            borderpx + vertpadbar / 2, bg_width,
+                            bh - vertpadbar);
+          }
+          if (expanded)
+            drw_text_transparent(drw, x, borderpx + vertpadbar / 2, w,
+                                 bh - vertpadbar, 0, text);
+          else
+            drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar,
+                     0, text, 0);
+        }
 
       x += w;
 
@@ -2293,11 +3390,14 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
           char buf[8];
           memcpy(buf, (char *)text + i + 1, 7);
           buf[7] = '\0';
-          drw_clr_create(drw, &drw->scheme[ColBg], buf);
-          i += 7;
+           drw_clr_create(drw, &drw->scheme[ColBg], buf);
+           text_bg = 1;
+           bg_segment++;
+           i += 7;
         } else if (text[i] == 'd') {
           drw->scheme[ColFg] = scheme[SchemeNorm][ColFg];
           drw->scheme[ColBg] = scheme[SchemeNorm][ColBg];
+          text_bg = 0;
         } else if (text[i] == 'r') {
           int rx = atoi(text + ++i);
           while (text[++i] != ',')
@@ -2336,15 +3436,39 @@ int drawstatusbar(Monitor *m, int bh, char *stext) {
         if (progress >= MPRIS_COMPLETE_THRESHOLD) progress = 1.0;
         progressw = (unsigned int)(progress * w + 0.5);
       }
-      mpris_scroll_text_width = drw_text_scroll_progress(
-          drw, x, borderpx + vertpadbar / 2, w,
-          bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
-          MPRIS_SCROLL_GAP, 0, &mpris_scroll_bg_clr,
+      if (expanded && text_bg && status_text_visible(text)) {
+        XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+         bg_width = MAX(1, w +
+                          (paired_bg && !(bg_segment & 1) ? lrpad + 1 : 0) -
+                          (expanded && bg_segment >= 0 &&
+                           (!paired_bg || (bg_segment & 1)) ? 2 : 0));
+         XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+             borderpx + vertpadbar / 2, bg_width,
+            bh - vertpadbar);
+      }
+       mpris_scroll_text_width = drw_text_scroll_progress(
+           drw, x, borderpx + vertpadbar / 2, w,
+            bh - vertpadbar, MPRIS_SCROLL_PAD, text, mpris_scroll_px,
+          MPRIS_SCROLL_GAP, 0,
+          expanded && (!text_bg || !status_text_visible(text))
+              ? (const Clr *)-1 : &mpris_scroll_bg_clr,
           progress >= 0.0 ? &mpris_progress_clr : NULL,
           progressw);
     }
-    else
-      drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0, text, 0);
+    else {
+      if (expanded && text_bg && status_text_visible(text)) {
+        XSetForeground(drw->dpy, drw->gc, drw->scheme[ColBg].pixel);
+        XFillRectangle(drw->dpy, drw->drawable, drw->gc, x,
+                       borderpx + vertpadbar / 2, w + lrpad + 1,
+                       bh - vertpadbar);
+      }
+      if (expanded)
+         drw_text_transparent(drw, x, borderpx + vertpadbar / 2, w,
+                              bh - vertpadbar, 0, text);
+      else
+        drw_text(drw, x, borderpx + vertpadbar / 2, w, bh - vertpadbar, 0,
+                 text, 0);
+    }
   }
 
   drw_setscheme(drw, scheme[SchemeNorm]);
@@ -2685,14 +3809,2160 @@ unsigned int clockwidth(void) {
   return TEXTW(clockstr) - lrpad + 2 * clockpad;
 }
 
+static void finder_expand_path(const char *path, char *out, size_t size) {
+  const char *home = getenv("HOME");
+  if (path[0] == '~' && path[1] == '/' && home)
+    snprintf(out, size, "%s/%s", home, path + 2);
+  else
+    snprintf(out, size, "%s", path);
+}
+
+static void finder_math_skip(const char **input) {
+  while (isspace((unsigned char)**input))
+    (*input)++;
+}
+
+static int finder_math_expression(const char **input, double *value);
+static int finder_math_unary(const char **input, double *value);
+
+static int finder_math_identifier(const char **input, char *name, size_t size) {
+  const char *start = *input;
+  size_t len;
+
+  if (!isalpha((unsigned char)**input) && **input != '_')
+    return 0;
+  (*input)++;
+  while (isalnum((unsigned char)**input) || **input == '_')
+    (*input)++;
+  len = (size_t)(*input - start);
+  if (len >= size)
+    return 0;
+  memcpy(name, start, len);
+  name[len] = '\0';
+  return 1;
+}
+
+/* Keep calculator input out of translation mode, including an optional '='
+ * typed as the conventional end-of-expression marker. */
+static int finder_query_is_numeric_expression(void) {
+  int has_digit = 0;
+  int has_operator = 0;
+
+  for (const unsigned char *p = (const unsigned char *)finder_query; *p; p++) {
+    if (isdigit(*p)) {
+      has_digit = 1;
+    } else if (*p == '+' || *p == '-' || *p == '*' || *p == '/' ||
+               *p == '%' || *p == '^' || *p == '!' || *p == '(' ||
+               *p == ')' || *p == '=') {
+      has_operator = 1;
+    } else if (*p != '.' && !isspace(*p)) {
+      return 0;
+    }
+  }
+  return has_digit && has_operator;
+}
+
+/* Parse a parenthesised argument list.  Commas separate arguments, but they
+ * are not expression operators, so the normal expression parser stops at the
+ * next comma or closing parenthesis. */
+static int finder_math_args(const char **input, double *args, int max,
+                            int *count) {
+  finder_math_skip(input);
+  if (**input != '(')
+    return 0;
+  (*input)++;
+  *count = 0;
+  finder_math_skip(input);
+  if (**input == ')') {
+    (*input)++;
+    return 1;
+  }
+  while (*count < max) {
+    if (!finder_math_expression(input, &args[*count]))
+      return 0;
+    (*count)++;
+    finder_math_skip(input);
+    if (**input == ',') {
+      (*input)++;
+      continue;
+    }
+    if (**input == ')') {
+      (*input)++;
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* Bit operations use exact non-negative integers up to 2^53. */
+static int finder_math_u64(double value, unsigned long long *out) {
+  if (!isfinite(value) || value < 0.0 || value > 9007199254740992.0 ||
+      floor(value) != value)
+    return 0;
+  *out = (unsigned long long)value;
+  return 1;
+}
+
+static int finder_math_i64(double value, long long *out) {
+  if (!isfinite(value) || value < -9007199254740992.0 ||
+      value > 9007199254740992.0 || floor(value) != value)
+    return 0;
+  *out = (long long)value;
+  return 1;
+}
+
+static int finder_math_apply(const char *name, const double *args, int count,
+                             double *value) {
+  double v, a, b;
+  int i;
+
+  if (count == 1) {
+    v = args[0];
+    if (!strcasecmp(name, "sqrt")) {
+      if (v < 0.0)
+        return 0;
+      *value = sqrt(v);
+    } else if (!strcasecmp(name, "cbrt")) {
+      *value = cbrt(v);
+    } else if (!strcasecmp(name, "abs")) {
+      *value = fabs(v);
+    } else if (!strcasecmp(name, "exp")) {
+      *value = exp(v);
+    } else if (!strcasecmp(name, "ln") || !strcasecmp(name, "log")) {
+      if (v <= 0.0)
+        return 0;
+      *value = log(v);
+    } else if (!strcasecmp(name, "log2")) {
+      if (v <= 0.0)
+        return 0;
+      *value = log2(v);
+    } else if (!strcasecmp(name, "log10")) {
+      if (v <= 0.0)
+        return 0;
+      *value = log10(v);
+    } else if (!strcasecmp(name, "sin")) {
+      *value = sin(v);
+    } else if (!strcasecmp(name, "cos")) {
+      *value = cos(v);
+    } else if (!strcasecmp(name, "tan")) {
+      *value = tan(v);
+    } else if (!strcasecmp(name, "asin")) {
+      if (v < -1.0 || v > 1.0)
+        return 0;
+      *value = asin(v);
+    } else if (!strcasecmp(name, "acos")) {
+      if (v < -1.0 || v > 1.0)
+        return 0;
+      *value = acos(v);
+    } else if (!strcasecmp(name, "atan")) {
+      *value = atan(v);
+    } else if (!strcasecmp(name, "floor")) {
+      *value = floor(v);
+    } else if (!strcasecmp(name, "ceil")) {
+      *value = ceil(v);
+    } else if (!strcasecmp(name, "round")) {
+      *value = round(v);
+    } else if (!strcasecmp(name, "trunc")) {
+      *value = trunc(v);
+    } else if (!strcasecmp(name, "deg")) {
+      *value = v * 180.0 / 3.14159265358979323846;
+    } else if (!strcasecmp(name, "rad")) {
+      *value = v * 3.14159265358979323846 / 180.0;
+    } else if (!strcasecmp(name, "fact")) {
+      if (v < 0.0 || v > 170.0 || floor(v) != v)
+        return 0;
+      *value = 1.0;
+      for (i = 2; i <= (int)v; i++)
+        *value *= i;
+    } else if (!strcasecmp(name, "bitnot")) {
+      long long n;
+      if (!finder_math_i64(v, &n))
+        return 0;
+      *value = (double)(~n);
+    } else {
+      return 0;
+    }
+    return isfinite(*value);
+  }
+
+  if (count != 2)
+    return 0;
+  a = args[0];
+  b = args[1];
+  if (!strcasecmp(name, "pow")) {
+    *value = pow(a, b);
+  } else if (!strcasecmp(name, "hypot")) {
+    *value = hypot(a, b);
+  } else if (!strcasecmp(name, "mod")) {
+    if (b == 0.0)
+      return 0;
+    *value = fmod(a, b);
+  } else if (!strcasecmp(name, "atan2")) {
+    *value = atan2(a, b);
+  } else if (!strcasecmp(name, "min")) {
+    *value = MIN(a, b);
+  } else if (!strcasecmp(name, "max")) {
+    *value = MAX(a, b);
+  } else if (!strcasecmp(name, "gcd")) {
+    unsigned long long x, y, t;
+    if (!finder_math_u64(a, &x) || !finder_math_u64(b, &y))
+      return 0;
+    while (y) {
+      t = x % y;
+      x = y;
+      y = t;
+    }
+    *value = (double)x;
+  } else if (!strcasecmp(name, "lcm")) {
+    unsigned long long x, y, t, g;
+    if (!finder_math_u64(a, &x) || !finder_math_u64(b, &y))
+      return 0;
+    if (x == 0 || y == 0) {
+      *value = 0.0;
+      return 1;
+    }
+    {
+      unsigned long long xx = x, yy = y;
+      while (yy) {
+        t = xx % yy;
+        xx = yy;
+        yy = t;
+      }
+      g = xx;
+    }
+    if ((double)(x / g) * (double)y > 9007199254740992.0)
+      return 0;
+    *value = (double)((x / g) * y);
+  } else if (!strcasecmp(name, "bitor") ||
+             !strcasecmp(name, "bitand") ||
+             !strcasecmp(name, "bitxor")) {
+    long long x, y;
+    if (!finder_math_i64(a, &x) || !finder_math_i64(b, &y))
+      return 0;
+    if (!strcasecmp(name, "bitor"))
+      *value = (double)(x | y);
+    else if (!strcasecmp(name, "bitand"))
+      *value = (double)(x & y);
+    else
+      *value = (double)(x ^ y);
+  } else if (!strcasecmp(name, "shl") || !strcasecmp(name, "shr")) {
+    long long x, n;
+    if (!finder_math_i64(a, &x) || !finder_math_i64(b, &n) ||
+        n < 0 || n > 62)
+      return 0;
+    if (!strcasecmp(name, "shl"))
+      *value = (double)((unsigned long long)x << (unsigned int)n);
+    else
+      *value = (double)((unsigned long long)x >> (unsigned int)n);
+  } else {
+    return 0;
+  }
+  return isfinite(*value);
+}
+
+static int finder_math_constant(const char *name, double *value) {
+  if (!strcasecmp(name, "pi"))
+    *value = 3.14159265358979323846;
+  else if (!strcasecmp(name, "e"))
+    *value = 2.71828182845904523536;
+  else if (!strcasecmp(name, "tau"))
+    *value = 6.28318530717958647692;
+  else if (!strcasecmp(name, "phi"))
+    *value = 1.61803398874989484820;
+  else if (!strcasecmp(name, "epsilon"))
+    *value = 2.22044604925031308085e-16;
+  else if (!strcasecmp(name, "byte_max"))
+    *value = 255.0;
+  else if (!strcasecmp(name, "word_max"))
+    *value = 65535.0;
+  else if (!strcasecmp(name, "dword_max"))
+    *value = 4294967295.0;
+  else if (!strcasecmp(name, "int_max"))
+    *value = 2147483647.0;
+  else if (!strcasecmp(name, "int_min"))
+    *value = -2147483648.0;
+  else if (!strcasecmp(name, "uint_max"))
+    *value = 4294967295.0;
+  else if (!strcasecmp(name, "kb"))
+    *value = 1024.0;
+  else if (!strcasecmp(name, "mb"))
+    *value = 1048576.0;
+  else if (!strcasecmp(name, "gb"))
+    *value = 1073741824.0;
+  else if (!strcasecmp(name, "tb"))
+    *value = 1099511627776.0;
+  else if (!strcasecmp(name, "true"))
+    *value = 1.0;
+  else if (!strcasecmp(name, "false"))
+    *value = 0.0;
+  else
+    return 0;
+  return 1;
+}
+
+static int finder_math_primary(const char **input, double *value) {
+  char name[32];
+  char *end;
+  double number, args[2];
+  int count;
+
+  finder_math_skip(input);
+  if (**input == '(') {
+    (*input)++;
+    if (!finder_math_expression(input, value))
+      return 0;
+    finder_math_skip(input);
+    if (**input != ')')
+      return 0;
+    (*input)++;
+    return 1;
+  }
+  if (isalpha((unsigned char)**input) || **input == '_') {
+    if (!finder_math_identifier(input, name, sizeof(name)))
+      return 0;
+    finder_math_skip(input);
+    if (**input == '(') {
+      if (!finder_math_args(input, args, (int)LENGTH(args), &count))
+        return 0;
+      return finder_math_apply(name, args, count, value);
+    }
+    return finder_math_constant(name, value);
+  }
+  errno = 0;
+  number = strtod(*input, &end);
+  if (end == *input || errno == ERANGE || !isfinite(number))
+    return 0;
+  *input = end;
+  *value = number;
+  return 1;
+}
+
+static int finder_math_postfix(const char **input, double *value) {
+  double fact;
+  int i;
+
+  if (!finder_math_primary(input, value))
+    return 0;
+  for (;;) {
+    finder_math_skip(input);
+    if (**input != '!')
+      return 1;
+    (*input)++;
+    if (!isfinite(*value) || *value < 0.0 || *value > 170.0 ||
+        floor(*value) != *value)
+      return 0;
+    fact = 1.0;
+    for (i = 2; i <= (int)*value; i++)
+      fact *= i;
+    *value = fact;
+  }
+}
+
+static int finder_math_power(const char **input, double *value) {
+  double rhs;
+
+  if (!finder_math_postfix(input, value))
+    return 0;
+  finder_math_skip(input);
+  if (**input == '^') {
+    (*input)++;
+    if (!finder_math_unary(input, &rhs))
+      return 0;
+    *value = pow(*value, rhs);
+    if (!isfinite(*value))
+      return 0;
+  }
+  return 1;
+}
+
+static int finder_math_unary(const char **input, double *value) {
+  finder_math_skip(input);
+  if (**input == '+') {
+    (*input)++;
+    return finder_math_unary(input, value);
+  }
+  if (**input == '-') {
+    (*input)++;
+    if (!finder_math_unary(input, value))
+      return 0;
+    *value = -*value;
+    return 1;
+  }
+  return finder_math_power(input, value);
+}
+
+static int finder_math_term(const char **input, double *value) {
+  double rhs;
+  char op;
+
+  if (!finder_math_unary(input, value))
+    return 0;
+  for (;;) {
+    finder_math_skip(input);
+    op = **input;
+    if (op != '*' && op != '/' && op != '%')
+      return 1;
+    (*input)++;
+    if (!finder_math_unary(input, &rhs))
+      return 0;
+    if (op == '*') {
+      *value *= rhs;
+    } else {
+      if (rhs == 0.0)
+        return 0;
+      if (op == '/')
+        *value /= rhs;
+      else
+        *value = fmod(*value, rhs);
+    }
+    if (!isfinite(*value))
+      return 0;
+  }
+}
+
+static int finder_math_expression(const char **input, double *value) {
+  double rhs;
+  char op;
+
+  if (!finder_math_term(input, value))
+    return 0;
+  for (;;) {
+    finder_math_skip(input);
+    op = **input;
+    if (op != '+' && op != '-')
+      return 1;
+    (*input)++;
+    if (!finder_math_term(input, &rhs))
+      return 0;
+    if (op == '+')
+      *value += rhs;
+    else
+      *value -= rhs;
+    if (!isfinite(*value))
+      return 0;
+  }
+}
+
+static void finder_update_math(void) {
+  char expression[FINDER_MAX_QUERY];
+  const char *input;
+  double value;
+  size_t len;
+
+  snprintf(expression, sizeof(expression), "%s", finder_query);
+  len = strlen(expression);
+  while (len && isspace((unsigned char)expression[len - 1]))
+    expression[--len] = '\0';
+  if (len && expression[len - 1] == '=')
+    expression[--len] = '\0';
+  input = expression;
+
+  int has_operator = strpbrk(expression, "+-*/%^!()") != NULL;
+
+  finder_math_active = 0;
+  finder_math_help_active = 0;
+  finder_math_result[0] = '\0';
+  if (!expression[0])
+    return;
+  if (!strcasecmp(expression, "math")) {
+    finder_math_help_active = 1;
+    return;
+  }
+  if (!has_operator) {
+    char name[32];
+
+    finder_math_skip(&input);
+    if (finder_math_identifier(&input, name, sizeof(name))) {
+      finder_math_skip(&input);
+      if (*input == '\0' && finder_math_constant(name, &value)) {
+        snprintf(finder_math_result, sizeof(finder_math_result), "%.15g",
+                 value);
+        finder_math_active = 1;
+      }
+    }
+    return;
+  }
+  if (!finder_math_expression(&input, &value))
+    return;
+  finder_math_skip(&input);
+  if (*input != '\0')
+    return;
+  snprintf(finder_math_result, sizeof(finder_math_result), "%.15g", value);
+  finder_math_active = 1;
+}
+
+static int finder_json_string(char **input, char *out, size_t size) {
+  char *p = *input;
+  size_t used = 0;
+
+  if (*p++ != '"')
+    return 0;
+  while (*p && *p != '"') {
+    unsigned int cp;
+    unsigned char ch = (unsigned char)*p++;
+
+    if (ch == '\\') {
+      ch = (unsigned char)*p++;
+      if (!ch)
+        return 0;
+      if (ch == 'u') {
+        cp = 0;
+        for (int i = 0; i < 4; i++) {
+          unsigned char hex = (unsigned char)*p++;
+          if (!isxdigit(hex))
+            return 0;
+          cp = cp * 16 + (unsigned int)(isdigit(hex) ? hex - '0' :
+                 tolower(hex) - 'a' + 10);
+        }
+        if (cp >= 0xd800 && cp <= 0xdbff && p[0] == '\\' && p[1] == 'u') {
+          unsigned int low = 0;
+          p += 2;
+          for (int i = 0; i < 4; i++) {
+            unsigned char hex = (unsigned char)*p++;
+            if (!isxdigit(hex))
+              return 0;
+            low = low * 16 + (unsigned int)(isdigit(hex) ? hex - '0' :
+                   tolower(hex) - 'a' + 10);
+          }
+          if (low >= 0xdc00 && low <= 0xdfff)
+            cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+        }
+        if (cp < 0x80) {
+          if (used + 1 >= size) break;
+          out[used++] = (char)cp;
+        } else if (cp < 0x800) {
+          if (used + 2 >= size) break;
+          out[used++] = (char)(0xc0 | (cp >> 6));
+          out[used++] = (char)(0x80 | (cp & 0x3f));
+        } else if (cp < 0x10000) {
+          if (used + 3 >= size) break;
+          out[used++] = (char)(0xe0 | (cp >> 12));
+          out[used++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+          out[used++] = (char)(0x80 | (cp & 0x3f));
+        } else {
+          if (used + 4 >= size) break;
+          out[used++] = (char)(0xf0 | (cp >> 18));
+          out[used++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+          out[used++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+          out[used++] = (char)(0x80 | (cp & 0x3f));
+        }
+        continue;
+      }
+      switch (ch) {
+      case '"': case '\\': case '/': break;
+      case 'b': ch = '\b'; break;
+      case 'f': ch = '\f'; break;
+      case 'n': ch = '\n'; break;
+      case 'r': ch = '\r'; break;
+      case 't': ch = '\t'; break;
+      default: return 0;
+      }
+    }
+    if (used + 1 >= size)
+      break;
+    out[used++] = (char)ch;
+  }
+  if (*p != '"')
+    return 0;
+  p++;
+  out[used] = '\0';
+  *input = p;
+  return 1;
+}
+
+static int finder_json_skip(char **input) {
+  char *p = *input;
+  while (isspace((unsigned char)*p)) p++;
+  if (*p == '"') {
+    p++;
+    while (*p) {
+      if (*p++ == '\\') {
+        if (*p == 'u') p += 5;
+        else if (*p) p++;
+      } else if (p[-1] == '"') {
+        *input = p;
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (*p == '[' || *p == '{') {
+    char close = *p++ == '[' ? ']' : '}';
+    while (*p) {
+      while (isspace((unsigned char)*p) || *p == ',' || *p == ':') p++;
+      if (*p == close) {
+        *input = p + 1;
+        return 1;
+      }
+      if (!finder_json_skip(&p))
+        return 0;
+    }
+    return 0;
+  }
+  while (*p && !isspace((unsigned char)*p) && *p != ',' &&
+         *p != ']' && *p != '}') p++;
+  if (p == *input)
+    return 0;
+  *input = p;
+  return 1;
+}
+
+static int finder_translation_parse(char *out, size_t size) {
+  char *p = finder_translate_response;
+  size_t used = 0;
+
+  while (isspace((unsigned char)*p)) p++;
+  if (p[0] != '[' || p[1] != '[')
+    return 0;
+  p += 2;
+  while (isspace((unsigned char)*p)) p++;
+  /* The Chrome endpoint returns [["translation","source"]], while the
+   * older single endpoint returned an extra array layer around each part. */
+  if (*p == '"') {
+    if (!finder_json_string(&p, out, size))
+      return 0;
+    return out[0] != '\0';
+  }
+  while (*p && *p != ']') {
+    char part[FINDER_TRANSLATE_RESULT];
+    size_t len;
+    while (isspace((unsigned char)*p) || *p == ',') p++;
+    if (*p != '[')
+      break;
+    p++;
+    while (isspace((unsigned char)*p)) p++;
+    if (!finder_json_string(&p, part, sizeof(part)))
+      return 0;
+    len = strlen(part);
+    if (len >= size - used)
+      len = size - used - 1;
+    memcpy(out + used, part, len);
+    used += len;
+    while (*p && *p != ']') {
+      while (isspace((unsigned char)*p) || *p == ',') p++;
+      if (*p == ']') break;
+      if (!finder_json_skip(&p))
+        return 0;
+    }
+    if (*p != ']')
+      return 0;
+    p++;
+  }
+  out[used] = '\0';
+  return used != 0;
+}
+
+static int finder_query_has_thai(void) {
+  const unsigned char *p = (const unsigned char *)finder_query;
+  while (*p) {
+    if (p[0] == 0xe0 && p[1] && (p[1] == 0xb8 || p[1] == 0xb9) &&
+        p[2] && (p[2] & 0xc0) == 0x80)
+      return 1;
+    p++;
+  }
+  return 0;
+}
+
+static float finder_translation_glow_pulse(uint64_t now) {
+  double phase;
+
+  if (!finder_translate_pending || !finder_translate_started_ms ||
+      now < finder_translate_started_ms)
+    return 0.0f;
+  phase = (double)(now - finder_translate_started_ms) *
+          (2.0 * M_PI / 1400.0);
+  return (float)(0.5 - 0.5 * cos(phase));
+}
+
+static float finder_query_pose_update(uint64_t now) {
+  int waiting = finder_translate_pending || finder_math_active ||
+                finder_query_is_numeric_expression();
+
+  if (!finder_query_pose_initialized) {
+    finder_query_pose_initialized = 1;
+    finder_query_pose_waiting = waiting;
+    finder_query_pose_from = 0.0f;
+    finder_query_pose_to = waiting ? 1.0f : 0.0f;
+    finder_query_pose = 0.0f;
+    finder_query_pose_started_ms = now;
+  } else {
+    if (waiting != finder_query_pose_waiting) {
+      finder_query_pose_waiting = waiting;
+      finder_query_pose_from = finder_query_pose;
+      finder_query_pose_to = waiting ? 1.0f : 0.0f;
+      finder_query_pose_started_ms = now;
+    }
+    if (now >= finder_query_pose_started_ms) {
+      float t = MIN(1.0f, (float)(now - finder_query_pose_started_ms) / 180.0f);
+      float eased = t * t * (3.0f - 2.0f * t);
+
+      finder_query_pose = finder_query_pose_from +
+                          (finder_query_pose_to - finder_query_pose_from) *
+                              eased;
+    }
+  }
+  return finder_query_pose;
+}
+
+static void finder_translation_glow_stop(void) {
+  uint64_t now;
+
+  if (!finder_translate_pending || !finder_translate_started_ms)
+    return;
+  now = finder_monotonic_ms();
+  finder_translate_glow_fade_from = finder_translation_glow_pulse(now);
+  finder_translate_glow_fade_started_ms = now;
+}
+
+static void finder_translation_cancel(void) {
+  finder_translation_glow_stop();
+  if (finder_translate_active && finder_translate_result[0]) {
+    snprintf(finder_translate_outgoing, sizeof(finder_translate_outgoing),
+             "%s", finder_translate_result);
+    finder_translate_outgoing_started_ms = finder_monotonic_ms();
+  }
+  if (finder_translate_fd >= 0) {
+    close(finder_translate_fd);
+    finder_translate_fd = -1;
+  }
+  if (finder_translate_pid > 0) {
+    kill(finder_translate_pid, SIGTERM);
+    while (waitpid(finder_translate_pid, NULL, 0) < 0 && errno == EINTR)
+      ;
+    finder_translate_pid = 0;
+  }
+  finder_translate_due_ms = 0;
+  finder_translate_started_ms = 0;
+  finder_translate_active = 0;
+  finder_translate_pending = 0;
+  finder_translate_result[0] = '\0';
+  finder_translate_result_started_ms = 0;
+  finder_translate_response_len = 0;
+  finder_translate_response[0] = '\0';
+}
+
+static void finder_translation_update(void) {
+  finder_translation_cancel();
+  if (!finder_active || finder_math_active || finder_math_help_active ||
+      finder_query_is_numeric_expression() || !finder_query[0] ||
+      (!finder_ocr_mode && finder_visible != 0))
+    return;
+  finder_translate_active = 1;
+  finder_translate_pending = 1;
+  finder_translate_glow_fade_started_ms = 0;
+  finder_translate_glow_fade_from = 0.0f;
+  finder_translate_target_en = finder_query_has_thai();
+  finder_translate_result[0] = '\0';
+  finder_translate_started_ms = finder_monotonic_ms();
+  finder_translate_due_ms = finder_translate_started_ms + 500;
+}
+
+static void finder_translation_start(void) {
+  int pipes[2];
+  pid_t pid;
+  char queryarg[FINDER_MAX_QUERY + 3];
+
+  snprintf(queryarg, sizeof(queryarg), "q=%s", finder_query);
+  if (pipe(pipes) < 0)
+    goto failed;
+  pid = fork();
+  if (pid < 0) {
+    close(pipes[0]);
+    close(pipes[1]);
+    goto failed;
+  }
+  if (pid == 0) {
+    close(pipes[0]);
+    if (dup2(pipes[1], STDOUT_FILENO) < 0)
+      _exit(127);
+    close(pipes[1]);
+    execlp("curl", "curl", "--silent", "--fail", "--max-time", "8",
+           "--user-agent", "Mozilla/5.0", "--get",
+           "--data-urlencode", "client=dict-chrome-ex",
+           "--data-urlencode", "sl=auto",
+           "--data-urlencode", finder_translate_target_en ? "tl=en" : "tl=th",
+           "--data-urlencode", queryarg,
+           "https://clients5.google.com/translate_a/t", (char *)NULL);
+    _exit(127);
+  }
+  close(pipes[1]);
+  fcntl(pipes[0], F_SETFL, fcntl(pipes[0], F_GETFL) | O_NONBLOCK);
+  finder_translate_fd = pipes[0];
+  finder_translate_pid = pid;
+  finder_translate_response_len = 0;
+  finder_translate_response[0] = '\0';
+  finder_translate_due_ms = 0;
+  return;
+
+failed:
+  finder_translation_glow_stop();
+  finder_translate_due_ms = 0;
+  finder_translate_started_ms = 0;
+  finder_translate_pending = 0;
+  snprintf(finder_translate_result, sizeof(finder_translate_result),
+           "Translation unavailable (curl required)");
+  finder_translate_result_started_ms = finder_monotonic_ms();
+  finder_dirty = 1;
+}
+
+static void finder_translation_read(void) {
+  char chunk[1024];
+  ssize_t n;
+  int eof = 0;
+
+  if (finder_translate_fd < 0)
+    return;
+  while ((n = read(finder_translate_fd, chunk, sizeof(chunk))) > 0) {
+    size_t copy = MIN((size_t)n,
+                      sizeof(finder_translate_response) -
+                        finder_translate_response_len - 1);
+    memcpy(finder_translate_response + finder_translate_response_len,
+           chunk, copy);
+    finder_translate_response_len += copy;
+    finder_translate_response[finder_translate_response_len] = '\0';
+  }
+  if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+    eof = 1;
+  if (!eof)
+    return;
+  close(finder_translate_fd);
+  finder_translate_fd = -1;
+  if (finder_translate_pid > 0) {
+    while (waitpid(finder_translate_pid, NULL, 0) < 0 && errno == EINTR)
+      ;
+    finder_translate_pid = 0;
+  }
+  finder_translation_glow_stop();
+  finder_translate_pending = 0;
+  /* The response can span many reads for long OCR input.  Parse the complete
+   * accumulated response, not the final chunk (which may only contain the
+   * tail of the JSON document). */
+  if (!finder_translation_parse(finder_translate_result,
+                                sizeof(finder_translate_result)))
+    snprintf(finder_translate_result, sizeof(finder_translate_result),
+             "Translation unavailable");
+  finder_translate_result_started_ms = finder_monotonic_ms();
+  finder_dirty = 1;
+}
+
+static void finder_translation_tick(void) {
+  if (finder_translate_active && finder_translate_due_ms &&
+      finder_monotonic_ms() >= finder_translate_due_ms)
+    finder_translation_start();
+}
+
+static int finder_translation_anim_tick(void) {
+  uint64_t now = finder_monotonic_ms();
+  int animating = 0;
+  int changed = 0;
+
+  if (!finder_active) {
+    finder_translate_glow_fade_started_ms = 0;
+    finder_translate_glow_fade_from = 0.0f;
+    finder_translate_result_started_ms = 0;
+    finder_translate_outgoing_started_ms = 0;
+    finder_translate_outgoing[0] = '\0';
+    return 0;
+  }
+  if (finder_translate_pending) {
+    /* Keep repainting the waiting-query bloom so its pulse can loop until the
+     * translation response arrives. */
+    animating = 1;
+  }
+  if (finder_translate_glow_fade_started_ms) {
+    if (now - finder_translate_glow_fade_started_ms <
+        FINDER_TRANSLATE_GLOW_FADE_MS)
+      animating = 1;
+    else {
+      finder_translate_glow_fade_started_ms = 0;
+      finder_translate_glow_fade_from = 0.0f;
+      changed = 1;
+    }
+  }
+  if (finder_translate_result_started_ms) {
+    if (now - finder_translate_result_started_ms < FINDER_TRANSLATE_FADE_MS)
+      animating = 1;
+    else {
+      finder_translate_result_started_ms = 0;
+      changed = 1;
+    }
+  }
+  if (finder_translate_outgoing_started_ms) {
+    if (now - finder_translate_outgoing_started_ms < FINDER_TRANSLATE_FADE_MS)
+      animating = 1;
+    else {
+      finder_translate_outgoing_started_ms = 0;
+      finder_translate_outgoing[0] = '\0';
+      changed = 1;
+    }
+  }
+  if (finder_math_result_started_ms) {
+    if (now - finder_math_result_started_ms < FINDER_TRANSLATE_FADE_MS)
+      animating = 1;
+    else {
+      finder_math_result_started_ms = 0;
+      changed = 1;
+    }
+  }
+  if (animating || changed)
+    finder_dirty = 1;
+  return animating;
+}
+
+static uint64_t finder_monotonic_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void finder_cursor_reset(void) {
+  finder_cursor_base_ms = finder_monotonic_ms();
+  finder_cursor_visible = 1;
+}
+
+static int finder_cursor_state(void) {
+  uint64_t elapsed = finder_monotonic_ms() - finder_cursor_base_ms;
+  return ((elapsed / FINDER_CURSOR_BLINK_MS) & 1ULL) == 0;
+}
+
+static size_t finder_cursor_prev(const char *text, size_t pos) {
+  if (pos == 0)
+    return 0;
+  pos--;
+  while (pos > 0 && ((unsigned char)text[pos] & 0xc0) == 0x80)
+    pos--;
+  return pos;
+}
+
+static size_t finder_cursor_next(const char *text, size_t pos) {
+  size_t len = strlen(text);
+  if (pos >= len)
+    return len;
+  pos++;
+  while (pos < len && ((unsigned char)text[pos] & 0xc0) == 0x80)
+    pos++;
+  return pos;
+}
+
+static int finder_matches(const FinderApp *app) {
+  if (finder_math_active || finder_math_help_active)
+    return 0;
+  if (!finder_query[0])
+    return 1;
+  return strcasestr(app->name, finder_query) ||
+         strcasestr(app->exec, finder_query);
+}
+
+static int finder_cmp(const void *a, const void *b) {
+  const FinderApp *aa = a, *bb = b;
+  if (aa->recent != bb->recent)
+    return bb->recent - aa->recent;
+  return strcasecmp(aa->name, bb->name);
+}
+
+/* Rank how closely an application name matches the query.  A complete or
+ * prefix match is more relevant than a match at a word boundary, which in
+ * turn is more relevant than an arbitrary substring.  Command-only matches
+ * stay visible but sort below every name match. */
+static int finder_name_score(const char *name) {
+  const char *match;
+  size_t qlen = strlen(finder_query);
+  int score;
+
+  if (strcasecmp(name, finder_query) == 0)
+    return 100000;
+  if (strncasecmp(name, finder_query, qlen) == 0)
+    return 90000;
+  match = strcasestr(name, finder_query);
+  if (!match)
+    return 0;
+  score = (match > name && !isalnum((unsigned char)match[-1])) ? 70000 : 50000;
+  return score - (int)(match - name) * 10;
+}
+
+static int finder_match_score(const FinderApp *app) {
+  int score;
+
+  if (!finder_query[0])
+    return 0;
+  if ((score = finder_name_score(app->name)) != 0)
+    return score;
+  return strcasestr(app->exec, finder_query) ? 10000 : 0;
+}
+
+static int finder_rank_cmp(const void *a, const void *b) {
+  const FinderApp *aa = &finder_apps[*(const unsigned int *)a];
+  const FinderApp *bb = &finder_apps[*(const unsigned int *)b];
+
+  if (aa->score != bb->score)
+    return bb->score - aa->score;
+  if (aa->recent != bb->recent)
+    return bb->recent - aa->recent;
+  return strcasecmp(aa->name, bb->name);
+}
+
+/* Build the visible result order.  Without a query this preserves the
+ * recents-first list; while searching, textual relevance wins and recency is
+ * only used to break ties. */
+static void finder_rank(void) {
+  finder_visible = 0;
+  for (unsigned int i = 0; i < finder_app_count; i++) {
+    if (!finder_matches(&finder_apps[i]))
+      continue;
+    finder_apps[i].score = finder_match_score(&finder_apps[i]);
+    finder_order[finder_visible++] = i;
+  }
+  qsort(finder_order, finder_visible, sizeof(finder_order[0]),
+        finder_rank_cmp);
+}
+
+static void finder_icon_path(const FinderApp *app, char *out, size_t size) {
+  const char *home = getenv("HOME");
+  const char *name = app->icon_name;
+  static const char *roots[] = {
+    "/usr/local/share/icons", "/usr/share/icons", NULL
+  };
+  static const char *sizes[] = {
+    "scalable", "512x512", "384x384", "256x256", "192x192",
+    "128x128", "96x96", "64x64", "48x48", "32x32", "24x24",
+    "22x22", "16x16", "512", "384", "256", "192", "128", "96",
+    "64", "48", "32", "24", "22", "16", NULL
+  };
+  static const char *extensions[] = {"png", "svg", "xpm", NULL};
+  char root[PATH_MAX], candidate[PATH_MAX];
+  DIR *dir;
+  struct dirent *entry;
+  unsigned int i, j;
+
+  out[0] = '\0';
+  if (!name[0])
+    return;
+  if (name[0] == '/') {
+    snprintf(out, size, "%s", name);
+    return;
+  }
+  /* An Icon= value may already include an extension, but most desktop files
+   * contain a theme icon name without one. */
+  if (strchr(name, '.')) {
+    if (home) {
+      snprintf(candidate, sizeof(candidate), "%s/.local/share/icons/%s", home, name);
+      if (access(candidate, R_OK) == 0) {
+        snprintf(out, size, "%s", candidate);
+        return;
+      }
+    }
+    for (i = 0; roots[i]; i++) {
+      snprintf(candidate, sizeof(candidate), "%s/%s", roots[i], name);
+      if (access(candidate, R_OK) == 0) {
+        snprintf(out, size, "%s", candidate);
+        return;
+      }
+    }
+    snprintf(candidate, sizeof(candidate), "/usr/share/pixmaps/%s", name);
+    if (access(candidate, R_OK) == 0) {
+      snprintf(out, size, "%s", candidate);
+      return;
+    }
+  }
+
+  /* Check every installed icon theme, not only hicolor.  Themes such as
+   * Papirus and Breeze commonly store the application icons there. */
+  for (i = 0; roots[i] || (home && i == 0); i++) {
+    const char *base = roots[i];
+    if (i == 0 && home) {
+      snprintf(root, sizeof(root), "%s/.local/share/icons", home);
+      base = root;
+    }
+    if (!base)
+      continue;
+    dir = opendir(base);
+    if (!dir)
+      continue;
+    while ((entry = readdir(dir))) {
+      if (entry->d_name[0] == '.')
+        continue;
+      for (j = 0; sizes[j]; j++) {
+        unsigned int k;
+        for (k = 0; extensions[k]; k++) {
+          snprintf(candidate, sizeof(candidate), "%s/%s/%s/apps/%s.%s",
+                   base, entry->d_name, sizes[j], name, extensions[k]);
+          if (access(candidate, R_OK) == 0) {
+            snprintf(out, size, "%s", candidate);
+            closedir(dir);
+            return;
+          }
+        }
+      }
+    }
+    closedir(dir);
+  }
+
+  for (i = 0; extensions[i]; i++) {
+    snprintf(candidate, sizeof(candidate), "/usr/share/pixmaps/%s.%s",
+             name, extensions[i]);
+    if (access(candidate, R_OK) == 0) {
+      snprintf(out, size, "%s", candidate);
+      return;
+    }
+  }
+}
+
+static unsigned char *finder_icon_pixels(Imlib_Image source, int srcw,
+                                         int srch) {
+  Imlib_Image scaled, cropped = NULL;
+  DATA32 *pixels;
+  unsigned char *copy = NULL;
+  unsigned int scaled_w = FINDER_ICON_SIZE;
+  unsigned int scaled_h, crop_x, crop_y;
+
+  if (!source || srcw <= 0 || srch <= 0)
+    return NULL;
+  scaled_h = (unsigned int)(((uint64_t)srch * scaled_w + srcw - 1) / srcw);
+  if (scaled_h < FINDER_ICON_SIZE) {
+    scaled_h = FINDER_ICON_SIZE;
+    scaled_w = (unsigned int)(((uint64_t)srcw * scaled_h + srch - 1) / srch);
+  }
+  imlib_context_set_image(source);
+  imlib_image_set_has_alpha(1);
+  scaled = imlib_create_cropped_scaled_image(0, 0, srcw, srch,
+                                              scaled_w, scaled_h);
+  if (!scaled)
+    return NULL;
+  if (scaled_w != FINDER_ICON_SIZE || scaled_h != FINDER_ICON_SIZE) {
+    unsigned int max_crop_y;
+    crop_x = scaled_w > FINDER_ICON_SIZE
+                 ? (scaled_w - FINDER_ICON_SIZE) / 2 : 0;
+    max_crop_y = scaled_h > FINDER_ICON_SIZE
+                     ? scaled_h - FINDER_ICON_SIZE : 0;
+    crop_y = max_crop_y / 2;
+    crop_y = crop_y > 9 ? crop_y - 9 : 0;
+    imlib_context_set_image(scaled);
+    cropped = imlib_create_cropped_image(crop_x, crop_y,
+                                          FINDER_ICON_SIZE,
+                                          FINDER_ICON_SIZE);
+    imlib_free_image();
+    if (!cropped)
+      return NULL;
+    scaled = cropped;
+  }
+  imlib_context_set_image(scaled);
+  imlib_image_set_has_alpha(1);
+  pixels = imlib_image_get_data_for_reading_only();
+  if (pixels) {
+    copy = malloc(FINDER_ICON_SIZE * FINDER_ICON_SIZE * sizeof(*pixels));
+    if (copy)
+      memcpy(copy, pixels,
+             FINDER_ICON_SIZE * FINDER_ICON_SIZE * sizeof(*pixels));
+  }
+  imlib_free_image();
+  imlib_context_set_image(source);
+  return copy;
+}
+
+static void finder_load_icon(FinderApp *app) {
+  char path[PATH_MAX];
+  Imlib_Image image;
+  DATA32 *data;
+  int w, h;
+
+  finder_icon_path(app, path, sizeof(path));
+  if (!path[0] || !(image = imlib_load_image(path)))
+    return;
+  imlib_context_set_image(image);
+  w = imlib_image_get_width();
+  h = imlib_image_get_height();
+  app->icon_pixels = finder_icon_pixels(image, w, h);
+  imlib_context_set_image(image);
+  data = imlib_image_get_data_for_reading_only();
+  if (data && w > 0 && h > 0)
+    /* Always run icon data through the Imlib2 scaling path.  The fast path in
+     * drw_picture_create_resized assumes the source stride/format matches an
+     * XImage exactly, which is not true for all PNG/SVG loaders and results
+     * in an empty ARGB picture for many desktop icons. */
+    app->icon = drw_picture_create_cover(drw, (char *)data, w, h,
+                                         FINDER_ICON_SIZE, FINDER_ICON_SIZE);
+  if (image) {
+    imlib_context_set_image(image);
+    imlib_free_image();
+  }
+}
+
+static void finder_free_icons(void) {
+  int have_gl = notify_gl_ctx != None && notify_gl_pbuffer != None &&
+                glXMakeCurrent(dpy, notify_gl_pbuffer, notify_gl_ctx);
+  for (unsigned int i = 0; i < finder_app_count; i++) {
+    if (finder_apps[i].icon)
+      XRenderFreePicture(dpy, finder_apps[i].icon);
+    finder_apps[i].icon = None;
+    free(finder_apps[i].icon_pixels);
+    finder_apps[i].icon_pixels = NULL;
+    if (have_gl && finder_apps[i].icon_texture)
+      glDeleteTextures(1, &finder_apps[i].icon_texture);
+    finder_apps[i].icon_texture = 0;
+  }
+}
+
+/* The application list itself is rebuilt from the XDG desktop directories,
+ * but the recent order is learned state and should survive restarting dwm or
+ * logging in again. */
+static int finder_recent_path(char *path, size_t size, int create_dirs) {
+  const char *state = getenv("XDG_STATE_HOME");
+  const char *home = getenv("HOME");
+  char dir[PATH_MAX];
+
+  if (state && state[0] == '/') {
+    snprintf(dir, sizeof(dir), "%s/dwm", state);
+  } else if (home && home[0]) {
+    snprintf(dir, sizeof(dir), "%s/.local/state/dwm", home);
+    if (create_dirs) {
+      char local[PATH_MAX], state_dir[PATH_MAX];
+      snprintf(local, sizeof(local), "%s/.local", home);
+      snprintf(state_dir, sizeof(state_dir), "%s/.local/state", home);
+      (void)mkdir(local, 0700);
+      (void)mkdir(state_dir, 0700);
+    }
+  } else {
+    return 0;
+  }
+  if (create_dirs)
+    (void)mkdir(dir, 0700);
+  return snprintf(path, size, "%s/finder-recent", dir) < (int)size;
+}
+
+static void finder_load_recent(void) {
+  char path[PATH_MAX], line[PATH_MAX];
+  FILE *fp;
+
+  finder_recent_count = 0;
+  if (!finder_recent_path(path, sizeof(path), 0) ||
+      !(fp = fopen(path, "r")))
+    return;
+  while (finder_recent_count < LENGTH(finder_recent) &&
+         fgets(line, sizeof(line), fp)) {
+    line[strcspn(line, "\r\n")] = '\0';
+    if (!line[0])
+      continue;
+    snprintf(finder_recent[finder_recent_count],
+             sizeof(finder_recent[finder_recent_count]), "%s", line);
+    finder_recent_count++;
+  }
+  fclose(fp);
+}
+
+static void finder_save_recent(void) {
+  char path[PATH_MAX], temp[PATH_MAX];
+  FILE *fp;
+
+  if (!finder_recent_path(path, sizeof(path), 1))
+    return;
+  if (snprintf(temp, sizeof(temp), "%s.tmp", path) >= (int)sizeof(temp))
+    return;
+  if (!(fp = fopen(temp, "w")))
+    return;
+  for (unsigned int i = 0; i < finder_recent_count; i++)
+    fprintf(fp, "%s\n", finder_recent[i]);
+  if (fclose(fp) == 0)
+    (void)rename(temp, path);
+  else
+    (void)unlink(temp);
+}
+
+static void finder_load_apps(void) {
+  unsigned int i;
+  finder_free_icons();
+  finder_app_count = 0;
+  for (i = 0; finder_app_dirs[i] && finder_app_count < FINDER_MAX_APPS; i++) {
+    char dirpath[PATH_MAX];
+    DIR *dir;
+    struct dirent *entry;
+    finder_expand_path(finder_app_dirs[i], dirpath, sizeof(dirpath));
+    if (!(dir = opendir(dirpath)))
+      continue;
+    while ((entry = readdir(dir)) && finder_app_count < FINDER_MAX_APPS) {
+      char path[PATH_MAX], line[PATH_MAX + 32], *value;
+      FILE *fp;
+      FinderApp *app;
+      if (!strstr(entry->d_name, ".desktop"))
+        continue;
+      snprintf(path, sizeof(path), "%s/%s", dirpath, entry->d_name);
+      if (!(fp = fopen(path, "r")))
+        continue;
+      app = &finder_apps[finder_app_count];
+      memset(app, 0, sizeof(*app));
+      while (fgets(line, sizeof(line), fp)) {
+        if (!strncmp(line, "Name=", 5) && !app->name[0])
+          snprintf(app->name, sizeof(app->name), "%s", line + 5);
+        else if (!strncmp(line, "Exec=", 5) && !app->exec[0])
+          snprintf(app->exec, sizeof(app->exec), "%s", line + 5);
+        else if (!strncmp(line, "Icon=", 5) && !app->icon_name[0])
+          snprintf(app->icon_name, sizeof(app->icon_name), "%s", line + 5);
+        else if (!strncmp(line, "NoDisplay=true", 15) ||
+                 !strncmp(line, "Hidden=true", 11))
+          app->name[0] = '\0';
+      }
+      fclose(fp);
+      if (!app->name[0] || !app->exec[0])
+        continue;
+      app->name[strcspn(app->name, "\r\n")] = '\0';
+      app->exec[strcspn(app->exec, "\r\n")] = '\0';
+      app->icon_name[strcspn(app->icon_name, "\r\n")] = '\0';
+      /* Desktop field codes are not useful for a launcher without files. */
+      while ((value = strchr(app->exec, '%')))
+        memmove(value, value + ((value[1] && strchr("fFuUdiCk", value[1])) ? 2 : 1),
+                strlen(value + ((value[1] && strchr("fFuUdiCk", value[1])) ? 2 : 1)) + 1);
+      snprintf(app->file, sizeof(app->file), "%s", path);
+      for (unsigned int r = 0; r < finder_recent_count; r++)
+        if (!strcmp(finder_recent[r], app->file)) {
+          app->recent = (int)(finder_recent_count - r);
+          break;
+        }
+       finder_app_count++;
+    }
+    closedir(dir);
+  }
+  qsort(finder_apps, finder_app_count, sizeof(*finder_apps), finder_cmp);
+  finder_rank();
+}
+
+/* Decode at most one visible icon per event-loop pass.  Icon lookup can walk
+ * several theme directories and image decoding can be expensive, so neither
+ * should delay the first Finder frame or a keypress. */
+static int finder_load_next_icon(void) {
+  int first = MAX(0, (int)floor(finder_scroll_visual));
+  /* Include the partially visible row below the viewport as well. */
+  int end = MIN((int)finder_visible,
+                (int)ceil(finder_scroll_visual + finder_rows) + 1);
+
+  for (int i = first; i < end; i++) {
+    FinderApp *app = &finder_apps[finder_order[i]];
+    if (app->icon_loaded)
+      continue;
+    app->icon_loaded = 1;
+    finder_load_icon(app);
+    return 1;
+  }
+  return 0;
+}
+
+static int finder_visible_count(void) {
+  return (int)finder_visible;
+}
+
+static double finder_filter_progress(void) {
+  double progress;
+
+  if (!finder_filter_animating)
+    return 1.0;
+  progress = notification_elapsed(&finder_filter_started) /
+             ((double)FINDER_FILTER_ANIM_MS / 1000.0);
+  return MAX(0.0, MIN(1.0, progress));
+}
+
+/* Cubic ease-out for Finder row movement. */
+static float finder_filter_move_ease(double progress) {
+  double inverse = 1.0 - progress;
+
+  return (float)(1.0 - inverse * inverse * inverse);
+}
+
+static void finder_filter_eval(const FinderFilterAnim *anim, double progress,
+                               float *y, float *alpha, float *scale_x,
+                               float *scale_y, float *blur) {
+  float eased = (float)progress;
+  float alpha_eased;
+  float move_eased = finder_filter_move_ease(progress);
+  double alpha_progress =
+      (progress * FINDER_FILTER_ANIM_MS - FINDER_FILTER_ALPHA_DELAY_MS) /
+      (double)(FINDER_FILTER_ANIM_MS - FINDER_FILTER_ALPHA_DELAY_MS);
+
+  alpha_progress = MAX(0.0, MIN(1.0, alpha_progress));
+  alpha_eased = (float)alpha_progress;
+
+  if (anim->easing == FINDER_FILTER_EASE_IN)
+    eased = eased * eased * eased;
+  else if (anim->easing == FINDER_FILTER_EASE_OUT) {
+    float inverse = 1.0f - eased;
+    eased = 1.0f - inverse * inverse * inverse;
+  } else
+    eased = eased * eased * (3.0f - 2.0f * eased);
+
+  if (anim->easing == FINDER_FILTER_EASE_IN)
+    alpha_eased = alpha_eased * alpha_eased * alpha_eased;
+  else if (anim->easing == FINDER_FILTER_EASE_OUT) {
+    float inverse = 1.0f - alpha_eased;
+    alpha_eased = 1.0f - inverse * inverse * inverse;
+  } else
+    alpha_eased = alpha_eased * alpha_eased * (3.0f - 2.0f * alpha_eased);
+
+  *y = anim->from_y + (anim->to_y - anim->from_y) * move_eased;
+  *alpha = anim->from_alpha +
+           (anim->to_alpha - anim->from_alpha) * alpha_eased;
+  *scale_x = anim->from_scale_x +
+             (anim->to_scale_x - anim->from_scale_x) * eased;
+  *scale_y = anim->from_scale_y +
+             (anim->to_scale_y - anim->from_scale_y) * eased;
+  *blur = anim->from_blur + (anim->to_blur - anim->from_blur) * eased;
+}
+
+/* Capture where each currently visible app is on screen before ranking the
+ * edited query. This also samples an in-flight transition, so fast typing
+ * retargets smoothly instead of jumping back to an earlier frame. */
+static void finder_filter_prepare(void) {
+  double progress = finder_filter_progress();
+
+  memset(finder_filter_start_present, 0,
+         sizeof(finder_filter_start_present));
+  for (unsigned int app_index = 0; app_index < finder_app_count; app_index++) {
+    FinderFilterAnim *anim = &finder_filter_anim[app_index];
+    float y, alpha, scale_x, scale_y, blur;
+
+    if (!finder_filter_animating || !anim->active || !anim->outgoing)
+      continue;
+    finder_filter_eval(anim, progress, &y, &alpha, &scale_x, &scale_y, &blur);
+    if (alpha <= 0.001f || y < -1.0f || y > finder_rows)
+      continue;
+    finder_filter_start_y[app_index] = y;
+    finder_filter_start_alpha[app_index] = alpha;
+    finder_filter_start_scale_x[app_index] = scale_x;
+    finder_filter_start_scale_y[app_index] = scale_y;
+    finder_filter_start_blur[app_index] = blur;
+    finder_filter_start_present[app_index] = 1;
+  }
+  for (unsigned int rank = 0; rank < finder_visible; rank++) {
+    unsigned int app_index = finder_order[rank];
+    FinderFilterAnim *anim = &finder_filter_anim[app_index];
+    float y, alpha, scale_x, scale_y, blur;
+
+    if (finder_filter_animating && anim->active)
+      finder_filter_eval(anim, progress, &y, &alpha, &scale_x, &scale_y,
+                         &blur);
+    else {
+      y = (float)((double)rank - finder_scroll_visual);
+      alpha = 1.0f;
+      scale_x = 1.0f;
+      scale_y = 1.0f;
+      blur = 0.0f;
+    }
+    if (alpha <= 0.001f || y < -1.0f || y > finder_rows)
+      continue;
+    finder_filter_start_y[app_index] = y;
+    finder_filter_start_alpha[app_index] = alpha;
+    finder_filter_start_scale_x[app_index] = scale_x;
+    finder_filter_start_scale_y[app_index] = scale_y;
+    finder_filter_start_blur[app_index] = blur;
+    finder_filter_start_present[app_index] = 1;
+  }
+  memset(finder_filter_anim, 0, sizeof(finder_filter_anim));
+  finder_filter_animating = 0;
+}
+
+/* Start one transition from the captured positions to the newly ranked list.
+ * Apps no longer in the visible result set remain briefly as outgoing rows. */
+static void finder_filter_start(void) {
+  int target_rows = MIN((int)finder_visible, finder_rows);
+
+  for (unsigned int rank = 0; rank < finder_visible &&
+                               rank < (unsigned int)finder_rows; rank++) {
+    unsigned int app_index = finder_order[rank];
+    FinderFilterAnim *anim = &finder_filter_anim[app_index];
+
+    anim->from_y = finder_filter_start_present[app_index]
+                       ? finder_filter_start_y[app_index]
+                       : (float)rank + 0.35f;
+    anim->to_y = (float)rank;
+    anim->from_alpha = finder_filter_start_present[app_index]
+                           ? finder_filter_start_alpha[app_index] : 0.0f;
+    anim->to_alpha = 1.0f;
+    anim->from_scale_x = finder_filter_start_present[app_index]
+                             ? finder_filter_start_scale_x[app_index] : 0.9f;
+    anim->to_scale_x = 1.0f;
+    anim->from_scale_y = finder_filter_start_present[app_index]
+                             ? finder_filter_start_scale_y[app_index] : 0.7f;
+    anim->to_scale_y = 1.0f;
+    anim->from_blur = finder_filter_start_present[app_index]
+                          ? finder_filter_start_blur[app_index]
+                           : FINDER_FILTER_TEXT_BLUR_MAX;
+    anim->to_blur = 0.0f;
+    anim->easing = FINDER_FILTER_EASE_IN_OUT;
+    anim->active = 1;
+    anim->outgoing = 0;
+  }
+  for (unsigned int app_index = 0; app_index < finder_app_count; app_index++) {
+    FinderFilterAnim *anim = &finder_filter_anim[app_index];
+    float y;
+
+    if (anim->active || !finder_filter_start_present[app_index])
+      continue;
+    y = finder_filter_start_y[app_index];
+    anim->from_y = anim->to_y = y;
+    anim->from_alpha = finder_filter_start_alpha[app_index];
+    anim->to_alpha = 0.0f;
+    anim->from_scale_x = finder_filter_start_scale_x[app_index];
+    anim->to_scale_x = 1.1f;
+    anim->from_scale_y = finder_filter_start_scale_y[app_index];
+    anim->to_scale_y = 1.3f;
+    anim->from_blur = finder_filter_start_blur[app_index];
+    anim->to_blur = FINDER_FILTER_TEXT_BLUR_MAX;
+    anim->active = anim->outgoing = 1;
+    anim->easing = FINDER_FILTER_EASE_IN_OUT;
+  }
+  /* Retain enough rows for outgoing apps to finish their fade before shrinking. */
+  finder_filter_display_rows = target_rows;
+  for (unsigned int app_index = 0; app_index < finder_app_count; app_index++) {
+    FinderFilterAnim *anim = &finder_filter_anim[app_index];
+    if (anim->active && anim->outgoing)
+      finder_filter_display_rows = MAX(
+          finder_filter_display_rows,
+          MIN(finder_rows, (int)ceilf(MAX(0.0f, anim->from_y) + 1.0f)));
+  }
+  finder_scroll = 0;
+  finder_scroll_visual = 0.0;
+  finder_scroll_started.tv_sec = finder_scroll_started.tv_nsec = 0;
+  clock_gettime(CLOCK_MONOTONIC, &finder_filter_started);
+  finder_filter_animating = 1;
+}
+
+static int finder_filter_tick(void) {
+  if (!finder_active || !finder_filter_animating)
+    return 0;
+  if (notification_elapsed(&finder_filter_started) * 1000.0 <
+      FINDER_FILTER_ANIM_MS) {
+    finder_dirty = 1;
+    return 1;
+  }
+  finder_filter_animating = 0;
+  finder_filter_display_rows = 0;
+  finder_dirty = 1;
+  return 1;
+}
+
+/* One row is always reserved for the query.  The remaining rows follow the
+ * number of matching applications, up to the configured maximum. */
+static int finder_display_rows(void) {
+  if (finder_math_active)
+    return 2;
+  if (finder_math_help_active)
+    return 1 + (int)LENGTH(finder_math_help);
+  int rows = finder_visible_count() - finder_scroll;
+  int app_rows = finder_translate_active ? 0 : MAX(0, MIN(finder_rows, rows));
+  /* The translation replaces the application list. Size its result area to
+   * the wrapped text, retaining the old height while a previous result fades. */
+  if (finder_translate_active) {
+    app_rows = MAX(app_rows, finder_translation_line_count(
+                                  finder_translate_result));
+    app_rows = MAX(app_rows, finder_translation_line_count(
+                                  finder_translate_outgoing));
+  }
+  if (finder_filter_animating)
+    app_rows = MAX(app_rows, finder_filter_display_rows);
+  return 1 + app_rows;
+}
+
+/* Result lines use a slightly tightened renderer height, rather than the bar
+ * row height or Xft's padded font height, so wrapped translation text has no
+ * extra vertical gap. */
+static unsigned int finder_result_line_height(void) {
+  Fnt *font = finder_result_font ? finder_result_font : drw->fonts;
+  int line_height;
+
+  if (finder_result_gl_font)
+    line_height = finder_result_gl_font->height;
+  else
+    line_height = font ? font->h : (int)bh;
+  return (unsigned int)MAX(line_height - 5, 1);
+}
+
+static unsigned int finder_popup_height(void) {
+  if (finder_translate_active)
+    return bh + finder_result_line_height() *
+               (unsigned int)MAX(0, finder_display_rows() - 1) + FINDER_EDGE;
+  return bh * (unsigned int)finder_display_rows() + FINDER_EDGE;
+}
+
+static int finder_set_scroll(int scroll) {
+  int maxscroll = MAX(0, finder_visible_count() - finder_rows);
+  int was_moving = fabs(finder_scroll_visual - finder_scroll) >= 0.001;
+
+  scroll = MAX(0, MIN(maxscroll, scroll));
+  if (scroll == finder_scroll)
+    return 0;
+  if (finder_filter_animating) {
+    finder_filter_animating = 0;
+    finder_filter_display_rows = 0;
+    memset(finder_filter_anim, 0, sizeof(finder_filter_anim));
+  }
+  finder_scroll = scroll;
+  /* Keep the last animation tick when the wheel changes direction. Resetting
+   * this timestamp on every event makes each reversal wait for a fresh frame. */
+  if (!was_moving)
+    clock_gettime(CLOCK_MONOTONIC, &finder_scroll_started);
+  return 1;
+}
+
+static int finder_scroll_tick(void) {
+  struct timespec now;
+  double elapsed, fraction, delta;
+
+  if (!finder_active || fabs(finder_scroll_visual - finder_scroll) < 0.001)
+    return 0;
+  if (notification_elapsed(&finder_scroll_started) <
+      1.0 / NOTIFY_HISTORY_FPS)
+    return 0;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  elapsed = (double)(now.tv_sec - finder_scroll_started.tv_sec) +
+            (double)(now.tv_nsec - finder_scroll_started.tv_nsec) /
+                1000000000.0;
+  finder_scroll_started = now;
+  /* A shorter time constant keeps the easing smooth but lets quick reversals
+   * catch up promptly instead of continuously trailing the wheel target. */
+  fraction = 1.0 - exp(-MAX(0.0, elapsed) / 0.025);
+  delta = (double)finder_scroll - finder_scroll_visual;
+  finder_scroll_visual += delta * fraction;
+  if (fabs((double)finder_scroll - finder_scroll_visual) < 0.01)
+    finder_scroll_visual = finder_scroll;
+  finder_icons_pending = 1;
+  finder_dirty = 1;
+  return 1;
+}
+
+static FinderApp *finder_selected_app(void) {
+  if (finder_selected < 0 || (unsigned int)finder_selected >= finder_visible)
+    return NULL;
+  return &finder_apps[finder_order[finder_selected]];
+}
+
+static void finder_close(void) {
+  finder_translation_cancel();
+  finder_translate_outgoing[0] = '\0';
+  finder_translate_outgoing_started_ms = 0;
+  finder_active = 0;
+  finder_ocr_mode = 0;
+  finder_loading = 0;
+  finder_icons_pending = 0;
+  finder_dirty = 1;
+  finder_query[0] = '\0';
+  finder_math_active = 0;
+  finder_math_help_active = 0;
+  finder_math_result[0] = '\0';
+  finder_math_result_started_ms = 0;
+  finder_cursor = 0;
+  finder_query_view_start = 0;
+  finder_cursor_reset();
+  finder_selected = 0;
+  finder_scroll = 0;
+  finder_scroll_visual = 0.0;
+  finder_scroll_started.tv_sec = finder_scroll_started.tv_nsec = 0;
+  finder_filter_animating = 0;
+  finder_filter_display_rows = 0;
+  memset(finder_filter_anim, 0, sizeof(finder_filter_anim));
+  finder_presented_w = finder_presented_h = 0;
+  finder_visible = 0;
+  XUngrabPointer(dpy, CurrentTime);
+  XUngrabKeyboard(dpy, CurrentTime);
+  XSetInputFocus(dpy, root, RevertToParent, CurrentTime);
+  resizebarwin(selmon);
+  drawbars();
+}
+
+static int finder_pointer_inside(XButtonEvent *ev) {
+  XWindowAttributes attr;
+  if (!selmon || !selmon->barcenterwin ||
+      !XGetWindowAttributes(dpy, selmon->barcenterwin, &attr))
+    return 0;
+  return ev->x_root >= attr.x && ev->x_root < attr.x + (int)attr.width &&
+          ev->y_root >= attr.y && ev->y_root < attr.y + (int)attr.height;
+}
+
+static void finder_motion(XMotionEvent *ev) {
+  XWindowAttributes attr;
+  int row, selected;
+
+  if (!finder_active || finder_math_active || finder_math_help_active ||
+      !selmon || !selmon->barcenterwin ||
+      !XGetWindowAttributes(dpy, selmon->barcenterwin, &attr) ||
+      ev->x_root < attr.x || ev->x_root >= attr.x + (int)attr.width ||
+      ev->y_root < attr.y || ev->y_root >= attr.y + (int)attr.height)
+    return;
+
+  row = (ev->y_root - attr.y) / MAX(1, bh);
+  if (row <= 0 || row >= finder_display_rows())
+    return;
+  selected = (int)floor(finder_scroll_visual + row - 1);
+  if (selected == finder_selected)
+    return;
+  finder_selected = selected;
+  finder_dirty = 1;
+}
+
+static void finder_focus_pointer(void) {
+  Window root_return, child;
+  int root_x, root_y, win_x, win_y;
+  unsigned int mask;
+  Client *c;
+
+  if (!XQueryPointer(dpy, root, &root_return, &child, &root_x, &root_y,
+                     &win_x, &win_y, &mask))
+    return;
+  if ((c = wintoclient(child))) {
+    if (c->mon != selmon)
+      selmon = c->mon;
+    focus(c);
+  }
+}
+
+static void finder_launch(void) {
+  FinderApp *app = finder_selected_app();
+  pid_t pid;
+  if (!app)
+    return;
+  if ((pid = fork()) == 0) {
+    /* Launch the desktop entry instead of executing its Exec= value through
+     * a new shell/session.  Applications such as grub-customizer rely on
+     * the desktop launch environment and can initialize differently when
+     * started with setsid(2) and /bin/sh -c. */
+    execlp("gio", "gio", "launch", app->file, (char *)NULL);
+    /* Keep the finder usable on systems without gio. */
+    execl("/bin/sh", "sh", "-c", app->exec, (char *)NULL);
+    _exit(127);
+  }
+  for (unsigned int i = 0; i < finder_recent_count; i++) {
+    if (strcmp(finder_recent[i], app->file))
+      continue;
+    for (unsigned int j = i; j + 1 < finder_recent_count; j++)
+      snprintf(finder_recent[j], sizeof(finder_recent[j]), "%s",
+               finder_recent[j + 1]);
+    finder_recent_count--;
+    break;
+  }
+  for (unsigned int i = MIN(finder_recent_count, LENGTH(finder_recent) - 1);
+       i > 0; i--)
+    snprintf(finder_recent[i], sizeof(finder_recent[i]), "%s",
+             finder_recent[i - 1]);
+  snprintf(finder_recent[0], sizeof(finder_recent[0]), "%s", app->file);
+  if (finder_recent_count < LENGTH(finder_recent))
+    finder_recent_count++;
+  finder_save_recent();
+  finder_close();
+}
+
+static void finder(const Arg *arg) {
+  (void)arg;
+  /* Keep the modal Finder off fullscreen clients.  It would otherwise raise
+   * itself above the fullscreen window and steal keyboard focus.  Closing an
+   * already-open Finder is still allowed. */
+  if (!finder_active && (fullscreen_st ||
+                         (selmon && selmon->sel && selmon->sel->isfullscreen)))
+    return;
+  finder_active = !finder_active;
+  finder_ocr_mode = 0;
+  finder_dirty = 1;
+  finder_query[0] = '\0';
+  finder_translation_cancel();
+  finder_translate_outgoing[0] = '\0';
+  finder_translate_outgoing_started_ms = 0;
+  finder_translate_result_started_ms = 0;
+  finder_math_active = 0;
+  finder_math_help_active = 0;
+  finder_math_result[0] = '\0';
+  finder_math_result_started_ms = 0;
+  finder_cursor = 0;
+  finder_query_view_start = 0;
+  finder_cursor_reset();
+  finder_selected = 0;
+  finder_scroll = 0;
+  finder_scroll_visual = 0.0;
+  finder_scroll_started.tv_sec = finder_scroll_started.tv_nsec = 0;
+  finder_filter_animating = 0;
+  finder_filter_display_rows = 0;
+  memset(finder_filter_anim, 0, sizeof(finder_filter_anim));
+  finder_presented_w = finder_presented_h = 0;
+  if (finder_active) {
+    /* Open and paint the query row first.  Desktop metadata and icons are
+     * loaded by the event loop after this frame is visible. */
+    finder_free_icons();
+    finder_app_count = 0;
+    finder_visible = 0;
+    finder_loading = 1;
+    finder_icons_pending = 0;
+    /* Keep Escape available even if an application changes focus while the
+     * Finder is active. */
+    XGrabKeyboard(dpy, selmon->barcenterwin, True, GrabModeAsync,
+                  GrabModeAsync, CurrentTime);
+    /* Client windows normally consume their own ButtonPress events.  Grab
+     * the pointer so outside clicks are delivered to dwm and can close the
+     * modal Finder instead of falling through to the application. */
+     XGrabPointer(dpy, root, False, ButtonPressMask | PointerMotionMask,
+                  GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+    XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent, CurrentTime);
+     } else {
+    finder_loading = 0;
+    finder_icons_pending = 0;
+    finder_close();
+    return;
+  }
+  resizebarwin(selmon);
+  drawbars();
+}
+
+static void finder_ocr(const Arg *arg) {
+  int pipes[2];
+  pid_t pid;
+
+  (void)arg;
+  if (finder_active || !selmon || fullscreen_st ||
+      (selmon->sel && selmon->sel->isfullscreen) ||
+      finder_ocr_fd >= 0 || finder_ocr_pid > 0)
+    return;
+  if (pipe(pipes) < 0)
+    return;
+  pid = fork();
+  if (pid < 0) {
+    close(pipes[0]);
+    close(pipes[1]);
+    return;
+  }
+  if (pid == 0) {
+    close(pipes[0]);
+    if (dup2(pipes[1], STDOUT_FILENO) < 0)
+      _exit(127);
+    close(pipes[1]);
+    execl("/bin/sh", "sh", "-c",
+          "geometry=$(slop -f '%wx%h+%x+%y') || exit; "
+           "if command -v maim >/dev/null 2>&1; then "
+           "maim -g \"$geometry\"; "
+           "else import -window root -crop \"$geometry\" png:-; fi | "
+           "tesseract stdin stdout --oem 1 --psm 6 "
+           "-c preserve_interword_spaces=1 -l eng+tha+jpn 2>/dev/null",
+           (char *)NULL);
+    _exit(127);
+  }
+  close(pipes[1]);
+  fcntl(pipes[0], F_SETFL, fcntl(pipes[0], F_GETFL) | O_NONBLOCK);
+  finder_ocr_fd = pipes[0];
+  finder_ocr_pid = pid;
+  finder_ocr_response_len = 0;
+  finder_ocr_response[0] = '\0';
+}
+
+/* Return the longest valid UTF-8 prefix no longer than len.  OCR output is
+ * bounded before it enters the fixed-size Finder query buffer, and the cut
+ * can otherwise land in the middle of a multibyte character. */
+static size_t finder_utf8_prefix_length(const char *text, size_t len) {
+  size_t i = 0;
+
+  while (i < len) {
+    const unsigned char c = (unsigned char)text[i];
+    size_t bytes = c < 0x80 ? 1 :
+                   c >= 0xc2 && c <= 0xdf ? 2 :
+                   c >= 0xe0 && c <= 0xef ? 3 :
+                   c >= 0xf0 && c <= 0xf4 ? 4 : 1;
+
+    if (i + bytes > len)
+      break;
+    if (bytes > 1) {
+      size_t j;
+      for (j = 1; j < bytes; j++)
+        if (((unsigned char)text[i + j] & 0xc0) != 0x80)
+          break;
+      if (j != bytes)
+        bytes = 1;
+      else if ((c == 0xe0 && (unsigned char)text[i + 1] < 0xa0) ||
+               (c == 0xed && (unsigned char)text[i + 1] >= 0xa0) ||
+               (c == 0xf0 && (unsigned char)text[i + 1] < 0x90) ||
+               (c == 0xf4 && (unsigned char)text[i + 1] >= 0x90))
+        bytes = 1;
+    }
+    i += bytes;
+  }
+  return i;
+}
+
+static void finder_ocr_finish(void) {
+  Arg arg = {0};
+  size_t start = 0, end, len;
+
+  if (finder_ocr_fd >= 0) {
+    close(finder_ocr_fd);
+    finder_ocr_fd = -1;
+  }
+  if (finder_ocr_pid > 0) {
+    while (waitpid(finder_ocr_pid, NULL, 0) < 0 && errno == EINTR)
+      ;
+    finder_ocr_pid = 0;
+  }
+  finder_ocr_response[finder_ocr_response_len] = '\0';
+  len = finder_ocr_response_len;
+  while (start < len && isspace((unsigned char)finder_ocr_response[start]))
+    start++;
+  end = len;
+  while (end > start && isspace((unsigned char)finder_ocr_response[end - 1]))
+    end--;
+  if (end == start)
+    return;
+
+  finder(&arg);
+  if (!finder_active)
+    return;
+  finder_ocr_mode = 1;
+  len = MIN(end - start, sizeof(finder_query) - 1);
+  len = finder_utf8_prefix_length(finder_ocr_response + start, len);
+  memcpy(finder_query, finder_ocr_response + start, len);
+  finder_query[len] = '\0';
+  finder_cursor = len;
+  finder_filter_prepare();
+  finder_update_math();
+  finder_rank();
+  finder_translation_update();
+  finder_filter_start();
+  finder_dirty = 1;
+  finder_icons_pending = 1;
+  resizebarwin(selmon);
+  drawbars();
+}
+
+static void finder_ocr_read(void) {
+  char chunk[1024];
+  ssize_t n;
+  int eof = 0;
+
+  if (finder_ocr_fd < 0)
+    return;
+  while ((n = read(finder_ocr_fd, chunk, sizeof(chunk))) > 0) {
+    size_t copy = MIN((size_t)n,
+                      sizeof(finder_ocr_response) -
+                        finder_ocr_response_len - 1);
+    if (copy) {
+      memcpy(finder_ocr_response + finder_ocr_response_len, chunk, copy);
+      finder_ocr_response_len += copy;
+      finder_ocr_response[finder_ocr_response_len] = '\0';
+    }
+  }
+  if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                 errno != EINTR))
+    eof = 1;
+  if (eof)
+    finder_ocr_finish();
+}
+
+static int finder_keypress(XKeyEvent *ev) {
+  KeySym keysym = XLookupKeysym(ev, 0);
+  char text[64];
+  char previous_math_result[sizeof(finder_math_result)];
+  int len, query_changed = 0, cursor_moved = 0;
+  int previous_math_active;
+  size_t n;
+
+  if (!finder_active)
+    return 0;
+  n = strlen(finder_query);
+  if (finder_cursor > n)
+    finder_cursor = n;
+  if (keysym == XK_Escape) {
+    /* Escape should dismiss notification history revealed under the Finder
+     * as well as closing the Finder itself. */
+    notification_history_hide();
+    finder_close();
+    return 1;
+  } else if (keysym == XK_Return || keysym == XK_KP_Enter) {
+    finder_launch();
+    return 1;
+  } else if (keysym == XK_Up) {
+    if (finder_selected > 0) finder_selected--;
+  } else if (keysym == XK_Down) {
+    if (finder_selected + 1 < finder_visible_count())
+      finder_selected++;
+  } else if (keysym == XK_Left) {
+    size_t prev = finder_cursor_prev(finder_query, finder_cursor);
+    if (prev != finder_cursor) {
+      finder_cursor = prev;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_Right) {
+    size_t next = finder_cursor_next(finder_query, finder_cursor);
+    if (next != finder_cursor) {
+      finder_cursor = next;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_Home) {
+    if (finder_cursor != 0) {
+      finder_cursor = 0;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_End) {
+    if (finder_cursor != n) {
+      finder_cursor = n;
+      cursor_moved = 1;
+    }
+  } else if (keysym == XK_BackSpace) {
+    if (finder_cursor > 0) {
+      size_t prev = finder_cursor_prev(finder_query, finder_cursor);
+      memmove(finder_query + prev, finder_query + finder_cursor,
+              n - finder_cursor + 1);
+      finder_cursor = prev;
+      query_changed = 1;
+    }
+  } else if (keysym == XK_Delete) {
+    if (finder_cursor < n) {
+      size_t next = finder_cursor_next(finder_query, finder_cursor);
+      memmove(finder_query + finder_cursor, finder_query + next,
+              n - next + 1);
+      query_changed = 1;
+    }
+  } else {
+    len = XLookupString(ev, text, sizeof(text) - 1, NULL, NULL);
+    if (len <= 0)
+      return 1;
+    text[len] = '\0';
+    if (n + (size_t)len < sizeof(finder_query)) {
+      memmove(finder_query + finder_cursor + len,
+              finder_query + finder_cursor, n - finder_cursor + 1);
+      memcpy(finder_query + finder_cursor, text, (size_t)len);
+      finder_cursor += (size_t)len;
+      query_changed = 1;
+    }
+  }
+  if (query_changed) {
+    previous_math_active = finder_math_active;
+    snprintf(previous_math_result, sizeof(previous_math_result), "%s",
+             finder_math_result);
+    finder_filter_prepare();
+    finder_update_math();
+    if (finder_math_active &&
+        (!previous_math_active ||
+         strcmp(previous_math_result, finder_math_result)))
+      finder_math_result_started_ms = finder_monotonic_ms();
+    else if (!finder_math_active)
+      finder_math_result_started_ms = 0;
+    finder_rank();
+    finder_translation_update();
+    finder_selected = 0;
+    finder_filter_start();
+  }
+  if (query_changed || cursor_moved)
+    finder_cursor_reset();
+  finder_dirty = 1;
+  if (cursor_moved) {
+    return 1;
+  }
+  finder_icons_pending = 1;
+  if (finder_selected < finder_scroll)
+    finder_set_scroll(finder_selected);
+  if (finder_selected >= finder_scroll + finder_rows)
+    finder_set_scroll(finder_selected - finder_rows + 1);
+  return 1;
+}
+
+static int finder_buttonpress(XButtonPressedEvent *ev) {
+  int row;
+  if (!finder_active)
+    return finder_active;
+  if (ev->button == Button4) {
+    finder_set_scroll(finder_scroll - 1);
+    finder_selected = MAX(finder_scroll, finder_selected - 1);
+    finder_dirty = 1;
+    finder_icons_pending = 1;
+    return 1;
+  }
+  if (ev->button == Button5) {
+    finder_set_scroll(finder_scroll + 1);
+    finder_selected = MIN(finder_scroll + finder_rows - 1, finder_selected + 1);
+    finder_dirty = 1;
+    finder_icons_pending = 1;
+    return 1;
+  }
+  if (ev->button != Button1)
+    return 1;
+  row = ev->y / MAX(1, bh);
+  if (row > 0 && row < finder_display_rows()) {
+    finder_selected = (int)floor(finder_scroll_visual + row - 1);
+    finder_launch();
+  }
+  return 1;
+}
+
 static char *notify_strdup(const char *s) {
   return s ? strdup(s) : strdup("");
+}
+
+static void notification_image_texture_free(Notification *n) {
+  if (!n || !n->img_texture)
+    return;
+  if (notify_gl_ctx && notify_gl_pbuffer &&
+      glXMakeCurrent(dpy, notify_gl_pbuffer, notify_gl_ctx))
+    glDeleteTextures(1, &n->img_texture);
+  n->img_texture = 0;
+}
+
+static void notification_image_texture_create(Notification *n) {
+  unsigned int w, h;
+  uint32_t *pixels;
+
+  if (!n || n->img_texture || !n->img_pixels || !n->img_w || !n->img_h ||
+      !n->image_w || !n->image_h)
+    return;
+  h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+  w = MAX(1U, (unsigned int)((uint64_t)n->image_w * h / n->image_h));
+  if (w > 100) {
+    w = 100;
+    h = MAX(1U, (unsigned int)((uint64_t)n->image_h * w / n->image_w));
+  }
+  pixels = calloc((size_t)w * h, sizeof(*pixels));
+  if (!pixels)
+    return;
+
+  /* Upload only display-sized pixels: notification source images may be
+   * thousands of pixels wide, but are rendered at no more than 100x60. */
+  for (unsigned int y = 0; y < h; y++)
+    for (unsigned int x = 0; x < w; x++) {
+      double sx = ((x + 0.5) * n->img_w / w) - 0.5;
+      double sy = ((y + 0.5) * n->img_h / h) - 0.5;
+      unsigned int x0, x1, y0, y1;
+      double fx, fy;
+      uint32_t p00, p10, p01, p11, out = 0;
+
+      if (sx < 0) sx = 0;
+      if (sy < 0) sy = 0;
+      x0 = MIN((unsigned int)sx, n->img_w - 1);
+      y0 = MIN((unsigned int)sy, n->img_h - 1);
+      x1 = MIN(x0 + 1, n->img_w - 1);
+      y1 = MIN(y0 + 1, n->img_h - 1);
+      fx = sx - x0;
+      fy = sy - y0;
+      p00 = n->img_pixels[(size_t)y0 * n->img_w + x0];
+      p10 = n->img_pixels[(size_t)y0 * n->img_w + x1];
+      p01 = n->img_pixels[(size_t)y1 * n->img_w + x0];
+      p11 = n->img_pixels[(size_t)y1 * n->img_w + x1];
+      for (unsigned int shift = 0; shift < 32; shift += 8) {
+        double top = ((p00 >> shift) & 0xff) * (1.0 - fx) +
+                     ((p10 >> shift) & 0xff) * fx;
+        double bottom = ((p01 >> shift) & 0xff) * (1.0 - fx) +
+                        ((p11 >> shift) & 0xff) * fx;
+        unsigned int channel = (unsigned int)lround(top * (1.0 - fy) +
+                                                    bottom * fy);
+        out |= channel << shift;
+      }
+      pixels[(size_t)y * w + x] = out;
+    }
+
+  glGenTextures(1, &n->img_texture);
+  if (n->img_texture) {
+    glBindTexture(GL_TEXTURE_2D, n->img_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA,
+                 GL_UNSIGNED_BYTE, pixels);
+  }
+  free(pixels);
 }
 
 static void notification_free(Notification *n) {
   unsigned int i;
   if (!n)
     return;
+  notification_image_texture_free(n);
   free(n->app_name);
   free(n->summary);
   free(n->body);
@@ -2703,6 +5973,7 @@ static void notification_free(Notification *n) {
   free(n->input_action);
   free(n->input_placeholder);
   free(n->input_text);
+  free(n->img_pixels);
   if (n->image)
     XRenderFreePicture(dpy, n->image);
   free(n);
@@ -2712,6 +5983,9 @@ static void notification_free_contents(Notification *n) {
   unsigned int i;
   if (!n)
     return;
+  n->body_wrap_valid = 0;
+  n->body_wrap_count = 0;
+  notification_image_texture_free(n);
   free(n->app_name);
   free(n->summary);
   free(n->body);
@@ -2722,6 +5996,9 @@ static void notification_free_contents(Notification *n) {
   free(n->input_action);
   free(n->input_placeholder);
   free(n->input_text);
+  free(n->img_pixels);
+  n->img_pixels = NULL;
+  n->img_w = n->img_h = 0;
   if (n->image)
     XRenderFreePicture(dpy, n->image);
   n->app_name = n->summary = n->body = n->icon = NULL;
@@ -2755,12 +6032,17 @@ static int notification_center_active(void) {
   return notify_active || notify_history_active;
 }
 
-static void notification_update_wm_class(Window win, int active, int history) {
+static void notification_update_wm_class(Window win, int active, int history,
+                                         int finder) {
   XClassHint ch;
 
   if (!win)
     return;
-  if (active) {
+  if (finder) {
+    ch.res_name = "finder";
+    ch.res_class = "finder";
+    XSetClassHint(dpy, win, &ch);
+  } else if (active) {
     ch.res_name = history ? "notification-history" : "notification";
     ch.res_class = "notify";
     XSetClassHint(dpy, win, &ch);
@@ -2786,21 +6068,29 @@ static int notification_clock_hit(int x, unsigned int width) {
 }
 
 static void notification_history_add(Notification *n) {
-  Notification *old;
+  Notification *old, *prev;
 
   if (!n)
     return;
-  n->next = NULL;
-  if (notify_history_tail)
-    notify_history_tail->next = n;
-  else
-    notify_history_head = n;
-  notify_history_tail = n;
+  n->next = notify_history_head;
+  notify_history_head = n;
+  if (!notify_history_tail)
+    notify_history_tail = n;
   notify_history_count++;
   while (notify_history_count > NOTIFY_HISTORY_MAX) {
+    prev = NULL;
     old = notify_history_head;
-    notify_history_head = old->next;
-    old->next = NULL;
+    while (old && old->next) {
+      prev = old;
+      old = old->next;
+    }
+    if (!old)
+      break;
+    if (prev)
+      prev->next = NULL;
+    else
+      notify_history_head = NULL;
+    notify_history_tail = prev;
     notification_free(old);
     notify_history_count--;
   }
@@ -2901,6 +6191,42 @@ static Picture notification_round_picture(Picture source, unsigned int w,
   return rounded;
 }
 
+static void notification_round_pixels(uint32_t *pixels, unsigned int w,
+                                      unsigned int h, unsigned int draw_w,
+                                      unsigned int draw_h) {
+  double radius, scale_x, scale_y;
+
+  if (!pixels || !w || !h || !draw_w || !draw_h)
+    return;
+  radius = MIN(NOTIFY_IMAGE_RADIUS, MIN(draw_w, draw_h) / 2.0);
+  if (radius <= 0)
+    return;
+  scale_x = (double)w / draw_w;
+  scale_y = (double)h / draw_h;
+
+  for (unsigned int y = 0; y < h; y++)
+    for (unsigned int x = 0; x < w; x++) {
+      double px = (x + 0.5) / scale_x;
+      double py = (y + 0.5) / scale_y;
+      double dx = px < radius ? radius - px
+          : px > draw_w - radius ? px - (draw_w - radius) : 0;
+      double dy = py < radius ? radius - py
+          : py > draw_h - radius ? py - (draw_h - radius) : 0;
+      double distance, coverage;
+      uint32_t *pixel;
+      unsigned int alpha;
+
+      if (!dx || !dy)
+        continue;
+      distance = sqrt(dx * dx + dy * dy);
+      coverage = fmax(0.0, fmin(1.0, radius + 0.5 - distance));
+      pixel = &pixels[(size_t)y * w + x];
+      alpha = *pixel >> 24;
+      *pixel = (*pixel & 0x00ffffffU) |
+               ((uint32_t)(alpha * coverage + 0.5) << 24);
+    }
+}
+
 static void notification_load_image(Notification *n, const char *path) {
   Imlib_Image image;
   DATA32 *data;
@@ -2919,11 +6245,27 @@ static void notification_load_image(Notification *n, const char *path) {
     unsigned int dw, dh;
     /* Keep the image's aspect ratio.  Images normally fit at their source
      * size, while larger images are reduced to no more than 50 px high. */
-    notification_fit_size(w, h, NOTIFY_MAX_W - 40, 50, &dw, &dh);
+    notification_fit_size(w, h, NOTIFY_MAX_W - 40, NOTIFY_IMAGE_MAX_H,
+                          &dw, &dh);
     n->image = notification_round_picture(
         drw_picture_create_resized(drw, (char *)data, w, h, dw, dh), dw, dh);
     n->image_w = dw;
     n->image_h = dh;
+
+    n->img_pixels = ecalloc((size_t)w * h, sizeof(uint32_t));
+    if (n->img_pixels) {
+      memcpy(n->img_pixels, data, (size_t)w * h * sizeof(uint32_t));
+      n->img_w = w;
+      n->img_h = h;
+      {
+        unsigned int draw_w = dw, draw_h = dh;
+        if (draw_w > 100) {
+          draw_w = 100;
+          draw_h = MAX(1U, (unsigned int)((uint64_t)dh * draw_w / dw));
+        }
+        notification_round_pixels(n->img_pixels, w, h, draw_w, draw_h);
+      }
+    }
   }
   if (imlib_context_get_image())
     imlib_free_image();
@@ -2952,102 +6294,269 @@ static void notification_load_image_data(Notification *n, int w, int h,
     }
   {
     unsigned int dw, dh;
-    notification_fit_size(w, h, NOTIFY_MAX_W - 40, 50, &dw, &dh);
+    notification_fit_size(w, h, NOTIFY_MAX_W - 40, NOTIFY_IMAGE_MAX_H,
+                          &dw, &dh);
     n->image = notification_round_picture(
         drw_picture_create_resized(drw, (char *)pixels, w, h, dw, dh), dw,
         dh);
     n->image_w = dw;
     n->image_h = dh;
+
+    n->img_pixels = ecalloc((size_t)w * h, sizeof(uint32_t));
+    if (n->img_pixels) {
+      memcpy(n->img_pixels, pixels, (size_t)w * h * sizeof(uint32_t));
+      n->img_w = w;
+      n->img_h = h;
+      {
+        unsigned int draw_w = dw, draw_h = dh;
+        if (draw_w > 100) {
+          draw_w = 100;
+          draw_h = MAX(1U, (unsigned int)((uint64_t)dh * draw_w / dw));
+        }
+        notification_round_pixels(n->img_pixels, w, h, draw_w, draw_h);
+      }
+    }
   }
   n->image_hint = 1;
   free(pixels);
 }
 
 static unsigned int notification_text_width(const char *text) {
-  const char *start, *end, *next;
-  char line[512];
-  unsigned int width = 0, line_width;
+  const char *start, *end;
+  char line[1024];
+  unsigned int width = 0;
 
   if (!text || !*text)
     return 0;
+  /* Do not resize the pbuffer when measuring during a popup draw.  The
+   * current drawable may be the full-size notification surface. */
+  if (!gl_font && !notification_gl_init(1, 1))
+    return 0;
+  if (!gl_font)
+    gl_font = gl_font_create();
+  if (!gl_font)
+    return 0;
   start = text;
   while (*start) {
-    next = strchr(start, '\n');
-    end = next ? next : start + strlen(start);
-    {
-      size_t len = MIN((size_t)(end - start), sizeof(line) - 1);
-      memcpy(line, start, len);
-      line[len] = '\0';
-    }
-    line_width = drw_fontset_getwidth(drw, line);
-    width = MAX(width, line_width);
-    start = next ? next + 1 : end;
+    size_t len;
+    end = strchr(start, '\n');
+    len = MIN(end ? (size_t)(end - start) : strlen(start), sizeof(line) - 1);
+    memcpy(line, start, len);
+    line[len] = '\0';
+    width = MAX(width, gl_font_text_width(line));
+    start += len;
+    if (*start == '\n')
+      start++;
+    else if (!*start)
+      break;
   }
   return width;
 }
 
-static unsigned int notification_body_lines(const char *text) {
-  unsigned int lines = 1;
+static unsigned int notification_body_wrap(Notification *n,
+                                             unsigned int width,
+                                             unsigned int max_lines) {
+  const char *p;
 
-  if (!text || !*text)
+  if (!n || !n->body || !*n->body)
     return 0;
-  for (; *text; text++)
-    if (*text == '\n')
-      lines++;
-  return lines;
+  max_lines = MIN(max_lines, NOTIFY_BODY_MAX_LINES);
+  if (!max_lines)
+    return 0;
+  if (n->body_wrap_valid && n->body_wrap_width == width &&
+      n->body_wrap_max_lines == max_lines)
+    return n->body_wrap_count;
+
+  n->body_wrap_valid = 0;
+  n->body_wrap_width = width;
+  n->body_wrap_max_lines = max_lines;
+  n->body_wrap_count = 0;
+  p = n->body;
+  while (*p && n->body_wrap_count < max_lines) {
+    unsigned int lines = n->body_wrap_count;
+    char *line = n->body_wrap_lines[lines];
+    size_t used = 0, last_space = 0;
+    const char *after_space = NULL;
+    int explicit_break = 0;
+
+    line[0] = '\0';
+    while (*p && *p != '\n') {
+      const char *next = p;
+      uint32_t cp = notification_utf8_next(&next);
+      size_t bytes = (size_t)(next - p);
+      if (used + bytes >= NOTIFY_BODY_LINE_BYTES) {
+        p = next;
+        break;
+      }
+      memcpy(line + used, p, bytes);
+      line[used + bytes] = '\0';
+      if (notification_text_width(line) > width) {
+        if (last_space) {
+          used = last_space;
+          p = after_space;
+        } else if (used) {
+          p = next == p ? p + 1 : p;
+          break;
+        } else {
+          used += bytes;
+          p = next;
+        }
+        break;
+      }
+      used += bytes;
+      p = next;
+      if (cp == ' ' || cp == '\t') {
+        last_space = used;
+        after_space = p;
+      }
+    }
+    if (*p == '\n') {
+      p++;
+      explicit_break = 1;
+    }
+    while (used && (line[used - 1] == ' ' || line[used - 1] == '\t'))
+      used--;
+    line[used] = '\0';
+    n->body_wrap_count++;
+    if (!used && !explicit_break && *p)
+      p++;
+  }
+  n->body_wrap_valid = 1;
+  return n->body_wrap_count;
 }
 
-static unsigned int notification_content_height(Notification *n) {
-  unsigned int height = bh;
-  unsigned int body_lines;
-  int has_summary, has_body, has_two_content;
+static unsigned int notification_text_block_height(int has_summary,
+                                                    unsigned int body_lines) {
+  unsigned int line_h, body_line_h, height;
+  int ascender, descender;
+
+  if (!has_summary && !body_lines)
+    return 0;
+  line_h = (unsigned int)MAX(gl_font ? gl_font->height : drw->fonts->h, 1);
+  body_line_h = (unsigned int)MAX(
+      (int)ceil(gl_font ? gl_font->pixel_size : drw->fonts->h) +
+          NOTIFY_BODY_LINE_GAP,
+      1);
+  if (gl_font && gl_font->face_count) {
+    FT_Size_Metrics metrics = gl_font->faces[0].face->size->metrics;
+    ascender = MAX(1, (int)(metrics.ascender >> 6));
+    descender = MAX(0, -(int)(metrics.descender >> 6));
+  } else {
+    ascender = MAX(1, (int)(line_h * 3 / 4));
+    descender = MAX(0, (int)line_h - ascender);
+  }
+
+  height = (unsigned int)(ascender + descender);
+  if (has_summary && body_lines)
+    height += line_h + 2U;
+  if (body_lines > 1)
+    height += (body_lines - 1) * body_line_h;
+  return height;
+}
+
+static int notification_action_row_y(Notification *n) {
+  (void)n;
+  return notify_action_y;
+}
+
+static GLFont *notification_history_time_font_get(void) {
+  if (!notify_history_time_font && gl_font)
+    notify_history_time_font =
+        gl_font_create_scaled(NOTIFY_HISTORY_TIME_SCALE);
+  return notify_history_time_font ? notify_history_time_font : gl_font;
+}
+
+static unsigned int notification_history_time_gap(void) {
+  return (unsigned int)MAX(clockpad / 4, 1);
+}
+
+static unsigned int notification_history_time_column_width(void) {
+  GLFont *font = notification_history_time_font_get();
+
+  return font ? MAX(gl_font_text_width_for(font, "00"), 1U) : 20U;
+}
+
+static unsigned int notification_history_time_height(void) {
+  GLFont *font = notification_history_time_font_get();
+  unsigned int line_h = font ? (unsigned int)MAX(font->height, 1)
+                             : (unsigned int)MAX(1, (int)(bh * 0.58));
+  unsigned int gap = notification_history_time_gap();
+
+  return 3U * line_h + 2U * gap;
+}
+
+static unsigned int notification_history_content_height(Notification *n) {
+  unsigned int height = 0;
+  unsigned int time_col_w = notification_history_time_column_width();
+  unsigned int body_width = NOTIFY_MAX_W - 2U * NOTIFY_PADDING;
+  unsigned int body_lines = 0, img_w = 0, img_h = 0;
+  int has_summary, has_body;
 
   if (!n)
-    return height;
+    return (unsigned int)bh;
   has_summary = n->summary && *n->summary;
   has_body = n->body && *n->body;
-  has_two_content = (has_summary && has_body) ||
-                    (n->image && (has_summary || has_body));
-  if (!has_two_content)
-    return height;
+  body_width = body_width > time_col_w + NOTIFY_HISTORY_TIME_GAP
+                   ? body_width - time_col_w - NOTIFY_HISTORY_TIME_GAP
+                   : 1U;
+  if (n->image && n->image_w && n->image_h) {
+    img_h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+    img_w = (unsigned int)((uint64_t)n->image_w * img_h / n->image_h);
+    if (img_w > 100) {
+      img_w = 100;
+      img_h = MAX(1U, (unsigned int)((uint64_t)n->image_h * img_w /
+                                     n->image_w));
+    }
+    body_width = body_width > img_w + 12 ? body_width - img_w - 12 : 1;
+  }
+  if (has_body) {
+    body_lines = notification_body_wrap(n, body_width,
+                                        NOTIFY_HISTORY_BODY_MAX_LINES);
+  }
+  height = notification_text_block_height(has_summary, body_lines);
+  return MAX(notification_history_time_height(),
+             MAX((unsigned int)bh, MAX(height, img_h)));
+}
 
-  body_lines = notification_body_lines(n->body);
-  height = MAX(NOTIFY_TWO_CONTENT_H,
-               32 + body_lines * (drw->fonts->h + NOTIFY_BODY_LINE_GAP) + 8);
+static unsigned int notification_history_entry_content_height(Notification *n) {
+  unsigned int height;
+
+  if (!n)
+    return NOTIFY_HISTORY_ENTRY_H;
+  height = notification_history_content_height(n);
+  if (n->input_enabled)
+    height += NOTIFY_INPUT_ROW_H;
+  if (n->action_count >= 4)
+    height += NOTIFY_BUTTON_H;
   return height;
 }
 
 static unsigned int notification_history_entry_height(Notification *n) {
-  unsigned int height;
-  int has_summary, has_body, has_two_content;
+  unsigned int height = notification_history_entry_content_height(n);
 
-  if (!n)
-    return NOTIFY_HISTORY_ENTRY_H;
-  has_summary = n->summary && *n->summary;
-  has_body = n->body && *n->body;
-  has_two_content = (has_summary && has_body) ||
-                    (n->image && (has_summary || has_body));
-  height = (!has_two_content && !n->image) ? bh
-                                           : notification_content_height(n);
-  if (n->input_enabled)
-    height += NOTIFY_INPUT_ROW_H;
-  if (n->action_count > 2)
-    height += NOTIFY_BUTTON_ROW_H;
+  if (n && n->next)
+    height += NOTIFY_PADDING;
   return height;
 }
 
 static void notification_history_layout(void) {
   Notification *n;
-  unsigned int content_h;
+  unsigned int content_h, viewport_h;
   int max_scroll;
 
-  /* Keep history stable while entries are added or removed. */
+  if (!gl_font && notification_gl_init(1, 1))
+    gl_font = gl_font_create();
+  if (gl_font)
+    notification_history_time_font_get();
   notify_width = NOTIFY_MAX_W;
   content_h = 0;
   for (n = notify_history_head; n; n = n->next)
     content_h += notification_history_entry_height(n);
-  notify_height = MIN(MAX(content_h, bh), (unsigned int)NOTIFY_HISTORY_MAX_H);
-  max_scroll = content_h > notify_height ? (int)(content_h - notify_height) : 0;
+  notify_height = MIN(MAX(content_h + 2U * NOTIFY_PADDING, (unsigned int)bh),
+                      (unsigned int)NOTIFY_HISTORY_MAX_H);
+  viewport_h = notify_height > 2U * NOTIFY_PADDING
+                   ? notify_height - 2U * NOTIFY_PADDING : 0;
+  max_scroll = content_h > viewport_h ? (int)(content_h - viewport_h) : 0;
   notify_history_scroll = MAX(0, MIN(notify_history_scroll, max_scroll));
   notify_history_scroll_target = MAX(0, MIN(notify_history_scroll_target,
                                              max_scroll));
@@ -3058,9 +6567,17 @@ static void notification_history_layout(void) {
 }
 
 static void notification_history_show(void) {
-  if (!notify_history_count)
+  if (!notify_history_count || notify_active || finder_active)
     return;
   notify_history_active = 1;
+  notify_history_input = NULL;
+  notify_input_focus = 0;
+  notify_history_hover_entry = NULL;
+  notify_history_hover_action = -1;
+  notify_history_scroll = 0;
+  notify_history_scroll_target = 0;
+    notify_history_scroll_started.tv_sec = 0;
+    notify_history_scroll_started.tv_nsec = 0;
   notification_history_layout();
   drawbars();
   resizebarwin(selmon);
@@ -3070,54 +6587,105 @@ static void notification_history_hide(void) {
   if (!notify_history_active)
     return;
   notify_history_active = 0;
-  notify_history_input = NULL;
+  if (notify_input_focus)
+    XSetInputFocus(dpy, root, RevertToParent, CurrentTime);
   notify_input_focus = 0;
+  notify_history_input = NULL;
   notify_history_hover_entry = NULL;
   notify_history_hover_action = -1;
-  notify_history_scroll = 0;
-  notify_history_scroll_target = 0;
-  notify_history_scroll_start = 0;
-  notify_history_scroll_end = 0;
+  notification_history_layout();
   drawbars();
   resizebarwin(selmon);
 }
 
 static void notification_update_layout(Notification *n) {
-  unsigned int text_w, line_w;
-  unsigned int min_width;
+  unsigned int text_w, body_w, content_w, img_w = 0, img_h = 0;
+  unsigned int content_h, text_content_h, body_lines = 0;
+  int image_y;
+  unsigned int actions = 0, visible_actions = 0;
+  unsigned int action_w = 0, action_label_w[16] = {0};
+  unsigned int control_top;
+  const unsigned int pad = NOTIFY_PADDING;
+
   if (!n)
     return;
-  text_w = notification_text_width(n->summary);
-  line_w = notification_text_width(n->body);
-  text_w = MAX(text_w, line_w);
-  text_w = MAX(text_w, 1);
-  if (n->image)
-    text_w += n->image_w + 16;
-  if (n->input_enabled)
-    text_w = MAX(text_w, notification_text_width(n->input_placeholder) + 32);
-  if (n->action_count >= 2) {
-    unsigned int action_w = 0, i;
-    for (i = 1; i < n->action_count; i += 2)
-      action_w += notification_text_width(n->actions[i]) + 24;
-    text_w = MAX(text_w, action_w);
-  }
-  notify_width = MIN(NOTIFY_MAX_W, text_w + 40);
-  min_width = clockbar_cw ? clockbar_cw : clockwidth();
-  min_width = MIN(min_width, NOTIFY_MAX_W);
-  notify_width = MAX(notify_width, min_width);
 
-  /* A one-line notification stays at the normal clock-bar height. */
-  notify_height = notification_content_height(n);
-  if (n->input_enabled || (notify_hovered && n->action_count >= 2)) {
-    unsigned int content_height = notification_content_height(n);
-    unsigned int controls = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
-                            (notify_hovered && n->action_count >= 2
-                                 ? NOTIFY_BUTTON_ROW_H
-                                 : 0);
-    if (notify_hovered && n->image && n->action_count >= 2)
-      controls += NOTIFY_IMAGE_BUTTON_GAP + 6;
-    notify_height = MAX(notify_height, content_height + controls);
+  /* Keep image and text alignment based on the baselines actually rendered. */
+  if (!gl_font && notification_gl_init(1, 1))
+    gl_font = gl_font_create();
+
+  /* The optional image stays at its natural aspect ratio and at most 70px
+   * high.  Its width is capped so it cannot consume the whole text column. */
+  if (n->image && n->image_w > 0 && n->image_h > 0) {
+    img_h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+    img_w = (unsigned int)((double)n->image_w * img_h / n->image_h);
+    if (img_w > 100) {
+      img_w = 100;
+      img_h = MAX(1U, (unsigned int)((double)n->image_h * img_w / n->image_w));
+    }
   }
+
+  text_w = MAX(notification_text_width(n->summary),
+               notification_text_width(n->body));
+  if (n->input_enabled) {
+    text_w = MAX(text_w, notification_text_width(n->input_placeholder));
+    text_w = MAX(text_w, notification_text_width(n->input_text));
+  }
+  actions = n->actions
+      ? MIN(n->action_count / 2, LENGTH(notify_action_x)) : 0;
+  visible_actions = notify_hovered ? actions : 0;
+  for (unsigned int i = 0; i < visible_actions; i++) {
+    action_label_w[i] = notification_text_width(n->actions[i * 2 + 1]);
+    action_w += action_label_w[i];
+  }
+  if (visible_actions > 1)
+    action_w += (visible_actions - 1) * 16;
+  text_w = MAX(text_w, action_w);
+  if (img_w)
+    text_w += img_w + 12;
+  content_w = MIN(NOTIFY_MAX_W - 2U * pad, text_w);
+  notify_width = MAX(100U, content_w + 2U * pad);
+
+  content_w = notify_width - 2U * pad;
+  body_w = MAX(1U, content_w - (img_w ? img_w + 12 : 0));
+  if (n->body && *n->body)
+    body_lines = notification_body_wrap(n, body_w,
+        notify_hovered ? NOTIFY_POPUP_BODY_HOVER_MAX_LINES
+                       : NOTIFY_POPUP_BODY_MAX_LINES);
+  text_content_h = notification_text_block_height(
+      n->summary && *n->summary, body_lines);
+  content_h = MAX(text_content_h, img_h);
+  notify_text_y = (int)(content_h - text_content_h) / 2;
+  image_y = (int)(content_h - img_h) / 2;
+  notify_image_y = image_y;
+
+  memset(notify_action_x, 0, sizeof(notify_action_x));
+  memset(notify_action_w, 0, sizeof(notify_action_w));
+  notify_input_x = (int)pad;
+  notify_input_w = (int)content_w;
+  notify_input_h = n->input_enabled ? NOTIFY_INPUT_ROW_H : 0;
+  control_top = content_h;
+  notify_input_y = n->input_enabled ? (int)(pad + control_top) : 0;
+  notify_action_y = visible_actions ? (int)(pad + control_top +
+      (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0)) : 0;
+  if (visible_actions) {
+    unsigned int used = 0, weight = MAX(action_w, visible_actions);
+    for (unsigned int i = 0; i < visible_actions; i++) {
+      unsigned int cell_weight = action_label_w[i] +
+          (i + 1 < visible_actions ? 16U : 0U);
+      unsigned int cell_w = i + 1 == visible_actions
+          ? content_w - used
+          : MAX(1U, (unsigned int)(((uint64_t)content_w *
+                                    MAX(cell_weight, 1U)) / weight));
+      cell_w = MIN(cell_w, content_w - used);
+      notify_action_x[i] = (int)(pad + used);
+      notify_action_w[i] = (int)cell_w;
+      used += cell_w;
+    }
+  }
+  notify_height = MAX(50U, control_top +
+      (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
+      (visible_actions ? NOTIFY_BUTTON_H : 0) + 2U * pad);
 }
 
 static void notification_set_hovered(int hovered) {
@@ -3152,10 +6720,39 @@ static void notification_set_hovered(int hovered) {
   resizebarwin(selmon);
 }
 
+static int notification_is_ignored(const Notification *n) {
+  unsigned int i;
+  int app_match = 0;
+  int text_match = 0;
+
+  if (!n)
+    return 0;
+  for (i = 0; notification_ignore_apps[i]; i++)
+    if (n->app_name && strstr(n->app_name, notification_ignore_apps[i]))
+      app_match = 1;
+  for (i = 0; notification_ignore_summaries[i]; i++)
+    if (n->summary && strstr(n->summary, notification_ignore_summaries[i]))
+      text_match = 1;
+  for (i = 0; notification_ignore_bodies[i]; i++)
+    if (n->body && strstr(n->body, notification_ignore_bodies[i]))
+      text_match = 1;
+
+  /* When both app and text filters are configured, require both to match so
+   * other notifications from the same application are still shown. */
+  if (notification_ignore_apps[0] &&
+      (notification_ignore_summaries[0] || notification_ignore_bodies[0]))
+    return app_match && text_match;
+  return app_match || text_match;
+}
+
 static void notification_queue(Notification *n) {
   Notification *p;
   if (!n)
     return;
+  if (notification_is_ignored(n)) {
+    notification_free(n);
+    return;
+  }
 
   /* Updates to an entry already in history stay in history. */
   for (p = notify_history_head; p; p = p->next) {
@@ -3176,6 +6773,10 @@ static void notification_queue(Notification *n) {
       p->image_w = n->image_w;
       p->image_h = n->image_h;
       p->image_hint = n->image_hint;
+      p->img_pixels = n->img_pixels;
+       p->img_w = n->img_w;
+      p->img_h = n->img_h;
+      n->img_pixels = NULL;
       p->id = id;
       free(n);
       if (notify_history_active) {
@@ -3215,8 +6816,12 @@ static void notification_queue(Notification *n) {
       p->image = n->image;
       p->image_w = n->image_w;
       p->image_h = n->image_h;
-       p->image_hint = n->image_hint;
-        p->id = id;
+      p->image_hint = n->image_hint;
+      p->img_pixels = n->img_pixels;
+       p->img_w = n->img_w;
+      p->img_h = n->img_h;
+      n->img_pixels = NULL;
+      p->id = id;
         notify_input_focus = 0;
         notify_hovered = 0;
         notify_hover = -1;
@@ -3245,11 +6850,21 @@ static void notification_queue(Notification *n) {
       p->image = n->image;
       p->image_w = n->image_w;
       p->image_h = n->image_h;
-      p->image_hint = n->image_hint;
+       p->image_hint = n->image_hint;
+       p->img_pixels = n->img_pixels;
+       p->img_w = n->img_w;
+       p->img_h = n->img_h;
+       n->img_pixels = NULL;
       p->id = id;
       free(n);
       return;
     }
+  }
+  /* Preserve notifications for later review without showing popups over a
+   * fullscreen client. */
+  if (fullscreen_st) {
+    notification_history_add(n);
+    return;
   }
   if (notify_count >= NOTIFY_MAX) {
     notification_free(n);
@@ -3471,6 +7086,8 @@ static DBusHandlerResult notification_message(DBusConnection *conn,
   uint32_t notification_id;
   Notification *n;
   unsigned int i;
+  time_t received_at;
+  struct tm received_local;
 
   dbus_error_init(&error);
 
@@ -3550,6 +7167,12 @@ static DBusHandlerResult notification_message(DBusConnection *conn,
   dbus_message_iter_get_basic(&iter, &body); dbus_message_iter_next(&iter);
   n = ecalloc(1, sizeof(*n));
   n->id = replaces_id ? replaces_id : notify_next_id++;
+  received_at = time(NULL);
+  if (localtime_r(&received_at, &received_local))
+    strftime(n->received_time, sizeof(n->received_time), "%H-%M-%S",
+             &received_local);
+  else
+    memcpy(n->received_time, "00-00-00", sizeof(n->received_time));
   notification_id = n->id;
   n->app_name = notify_strdup(app); n->summary = notify_strdup(summary);
   n->body = notify_strdup(body); n->icon = notify_strdup(icon);
@@ -3577,226 +7200,1701 @@ static DBusHandlerResult notification_message(DBusConnection *conn,
   return DBUS_HANDLER_RESULT_HANDLED;
 }
 
-static void notification_draw_text(int x, int y, int width, int bottom,
-                                   const char *text) {
-  char line[512], *p, *start;
-  int line_h = drw->fonts->h + NOTIFY_BODY_LINE_GAP;
-  if (!text || !*text)
-    return;
-  start = (char *)text;
-  while (*start && y < bottom - NOTIFY_TEXT_BOTTOM_GAP) {
-    p = strchr(start, '\n');
-    if (p) {
-      size_t len = MIN((size_t)(p - start), sizeof(line) - 1);
-      memcpy(line, start, len); line[len] = '\0';
-      start = p + 1;
-    } else {
-      strncpy(line, start, sizeof(line) - 1);
-      line[sizeof(line) - 1] = '\0';
-      start += strlen(start);
-    }
-    drw_text(drw, x, y, width, line_h, 8, line, 0);
-    y += line_h;
+/* Initialize FreeType and select the font already configured for the bar. */
+static int gl_font_init_ft(void) {
+  if (ft_lib)
+    return 1;
+  if (FT_Init_FreeType(&ft_lib)) {
+    fprintf(stderr, "AnDWM: cannot initialize FreeType for notifications\n");
+    return 0;
   }
+  return 1;
+}
+
+static int notification_gl_init(unsigned int w, unsigned int h) {
+  int attrs[] = { GLX_X_RENDERABLE, True,
+                  GLX_DRAWABLE_TYPE, GLX_PBUFFER_BIT,
+                  GLX_RENDER_TYPE, GLX_RGBA_BIT,
+                  GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8,
+                  GLX_BLUE_SIZE, 8, GLX_ALPHA_SIZE, 8, None };
+  int pbuf_attrs[5];
+  int nconfigs = 0;
+  GLXFBConfig *configs;
+
+  w = MAX(w, 1U);
+  h = MAX(h, 1U);
+  if (!notify_gl_initialized) {
+    configs = glXChooseFBConfig(dpy, screen, attrs, &nconfigs);
+    if (!configs || nconfigs == 0) {
+      if (configs) XFree(configs);
+      fprintf(stderr, "AnDWM: GLX has no RGBA pbuffer configuration for notifications\n");
+      return 0;
+    }
+    notify_gl_fbconfig = configs[0];
+    notify_gl_ctx = glXCreateNewContext(dpy, notify_gl_fbconfig, GLX_RGBA_TYPE,
+                                        NULL, True);
+    XFree(configs);
+    if (!notify_gl_ctx) {
+      fprintf(stderr, "AnDWM: cannot create notification GLX context\n");
+      return 0;
+    }
+    notify_gl_initialized = 1;
+  }
+  if (!notify_gl_pbuffer || notify_gl_pbuffer_w != w ||
+      notify_gl_pbuffer_h != h) {
+    if (notify_gl_pbuffer) {
+      glXMakeCurrent(dpy, None, NULL);
+      glXDestroyPbuffer(dpy, notify_gl_pbuffer);
+    }
+    pbuf_attrs[0] = GLX_PBUFFER_WIDTH;
+    pbuf_attrs[1] = (int)w;
+    pbuf_attrs[2] = GLX_PBUFFER_HEIGHT;
+    pbuf_attrs[3] = (int)h;
+    pbuf_attrs[4] = None;
+    notify_gl_pbuffer = glXCreatePbuffer(dpy, notify_gl_fbconfig, pbuf_attrs);
+    if (!notify_gl_pbuffer) {
+      notify_gl_pbuffer_w = notify_gl_pbuffer_h = 0;
+      fprintf(stderr, "AnDWM: cannot create notification GLX pbuffer\n");
+      return 0;
+    }
+    notify_gl_pbuffer_w = w;
+    notify_gl_pbuffer_h = h;
+  }
+  if (!glXMakeCurrent(dpy, notify_gl_pbuffer, notify_gl_ctx)) {
+    fprintf(stderr, "AnDWM: cannot bind notification GLX pbuffer\n");
+    return 0;
+  }
+  if (!notify_gl_blend_func_separate)
+    notify_gl_blend_func_separate = (NotificationGLBlendFuncSeparate)
+        glXGetProcAddressARB((const GLubyte *)"glBlendFuncSeparate");
+  return 1;
+}
+
+static void notification_gl_blend_separate(void) {
+  if (notify_gl_blend_func_separate)
+    notify_gl_blend_func_separate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                  GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  else
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+static void notification_gl_blend_premultiplied(void) {
+  if (notify_gl_blend_func_separate)
+    notify_gl_blend_func_separate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                                  GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  else
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+static void *finder_gl_proc(const char *name) {
+  return (void *)glXGetProcAddressARB((const GLubyte *)name);
+}
+
+static int finder_gl_bloom_load_procs(void) {
+  finder_gl_gen_framebuffers = (FinderGLGenFramebuffers)
+      finder_gl_proc("glGenFramebuffers");
+  finder_gl_bind_framebuffer = (FinderGLBindFramebuffer)
+      finder_gl_proc("glBindFramebuffer");
+  finder_gl_delete_framebuffers = (FinderGLDeleteFramebuffers)
+      finder_gl_proc("glDeleteFramebuffers");
+  finder_gl_framebuffer_texture_2d = (FinderGLFramebufferTexture2D)
+      finder_gl_proc("glFramebufferTexture2D");
+  finder_gl_check_framebuffer_status = (FinderGLCheckFramebufferStatus)
+      finder_gl_proc("glCheckFramebufferStatus");
+  finder_gl_create_shader = (FinderGLCreateShader)
+      finder_gl_proc("glCreateShader");
+  finder_gl_shader_source = (FinderGLShaderSource)
+      finder_gl_proc("glShaderSource");
+  finder_gl_compile_shader = (FinderGLCompileShader)
+      finder_gl_proc("glCompileShader");
+  finder_gl_get_shader_iv = (FinderGLGetShaderiv)
+      finder_gl_proc("glGetShaderiv");
+  finder_gl_get_shader_info_log = (FinderGLGetShaderInfoLog)
+      finder_gl_proc("glGetShaderInfoLog");
+  finder_gl_create_program = (FinderGLCreateProgram)
+      finder_gl_proc("glCreateProgram");
+  finder_gl_attach_shader = (FinderGLAttachShader)
+      finder_gl_proc("glAttachShader");
+  finder_gl_link_program = (FinderGLLinkProgram)
+      finder_gl_proc("glLinkProgram");
+  finder_gl_get_program_iv = (FinderGLGetProgramiv)
+      finder_gl_proc("glGetProgramiv");
+  finder_gl_get_program_info_log = (FinderGLGetProgramInfoLog)
+      finder_gl_proc("glGetProgramInfoLog");
+  finder_gl_use_program = (FinderGLUseProgram)
+      finder_gl_proc("glUseProgram");
+  finder_gl_delete_shader = (FinderGLDeleteShader)
+      finder_gl_proc("glDeleteShader");
+  finder_gl_delete_program = (FinderGLDeleteProgram)
+      finder_gl_proc("glDeleteProgram");
+  finder_gl_get_uniform_location = (FinderGLGetUniformLocation)
+      finder_gl_proc("glGetUniformLocation");
+  finder_gl_uniform1i = (FinderGLUniform1i)
+      finder_gl_proc("glUniform1i");
+  finder_gl_uniform2f = (FinderGLUniform2f)
+      finder_gl_proc("glUniform2f");
+  /* Some older drivers expose framebuffer objects through EXT names. */
+  if (!finder_gl_gen_framebuffers)
+    finder_gl_gen_framebuffers = (FinderGLGenFramebuffers)
+        finder_gl_proc("glGenFramebuffersEXT");
+  if (!finder_gl_bind_framebuffer)
+    finder_gl_bind_framebuffer = (FinderGLBindFramebuffer)
+        finder_gl_proc("glBindFramebufferEXT");
+  if (!finder_gl_delete_framebuffers)
+    finder_gl_delete_framebuffers = (FinderGLDeleteFramebuffers)
+        finder_gl_proc("glDeleteFramebuffersEXT");
+  if (!finder_gl_framebuffer_texture_2d)
+    finder_gl_framebuffer_texture_2d = (FinderGLFramebufferTexture2D)
+        finder_gl_proc("glFramebufferTexture2DEXT");
+  if (!finder_gl_check_framebuffer_status)
+    finder_gl_check_framebuffer_status = (FinderGLCheckFramebufferStatus)
+        finder_gl_proc("glCheckFramebufferStatusEXT");
+  return finder_gl_gen_framebuffers && finder_gl_bind_framebuffer &&
+      finder_gl_framebuffer_texture_2d && finder_gl_check_framebuffer_status &&
+      finder_gl_create_shader && finder_gl_shader_source &&
+      finder_gl_compile_shader && finder_gl_get_shader_iv &&
+      finder_gl_create_program && finder_gl_attach_shader &&
+      finder_gl_link_program && finder_gl_get_program_iv &&
+      finder_gl_use_program && finder_gl_get_uniform_location &&
+      finder_gl_uniform1i && finder_gl_uniform2f;
+}
+
+static GLuint finder_gl_bloom_shader(GLenum type, const char *source) {
+  GLuint shader = finder_gl_create_shader(type);
+  GLint ok = 0;
+  if (!shader)
+    return 0;
+  finder_gl_shader_source(shader, 1, (const GLchar *const *)&source, NULL);
+  finder_gl_compile_shader(shader);
+  finder_gl_get_shader_iv(shader, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    if (finder_gl_get_shader_info_log) {
+      char log[512];
+      GLsizei length = 0;
+      finder_gl_get_shader_info_log(shader, sizeof(log), &length, log);
+      fprintf(stderr, "AnDWM: Finder bloom shader compile failed: %.*s\n",
+              (int)length, log);
+    }
+    finder_gl_delete_shader(shader);
+    return 0;
+  }
+  return shader;
+}
+
+static int finder_gl_bloom_program_init(void) {
+  static const char *vertex_source =
+      "#version 120\n"
+      "varying vec2 uv;\n"
+      "void main() { uv = gl_MultiTexCoord0.st; gl_Position = ftransform(); }\n";
+  static const char *fragment_source =
+      "#version 120\n"
+      "uniform sampler2D source;\n"
+      "uniform vec2 texel_size;\n"
+      "uniform int mode;\n"
+      "varying vec2 uv;\n"
+      "void main() {\n"
+      "  vec2 d = texel_size;\n"
+      "  vec4 c = texture2D(source, uv) * (mode == 0 ? 0.25 : 0.20);\n"
+      "  c += texture2D(source, uv + vec2( d.x,  d.y)) * (mode == 0 ? 0.1875 : 0.10);\n"
+      "  c += texture2D(source, uv + vec2(-d.x,  d.y)) * (mode == 0 ? 0.1875 : 0.10);\n"
+      "  c += texture2D(source, uv + vec2( d.x, -d.y)) * (mode == 0 ? 0.1875 : 0.10);\n"
+      "  c += texture2D(source, uv + vec2(-d.x, -d.y)) * (mode == 0 ? 0.1875 : 0.10);\n"
+      "  if (mode != 0) {\n"
+      "    c += texture2D(source, uv + vec2( d.x, 0.0)) * 0.10;\n"
+      "    c += texture2D(source, uv + vec2(-d.x, 0.0)) * 0.10;\n"
+      "    c += texture2D(source, uv + vec2(0.0,  d.y)) * 0.10;\n"
+      "    c += texture2D(source, uv + vec2(0.0, -d.y)) * 0.10;\n"
+      "  }\n"
+      "  gl_FragColor = c;\n"
+      "}\n";
+  GLuint vertex, fragment;
+  GLint ok = 0;
+
+  if (finder_bloom_program)
+    return 1;
+  vertex = finder_gl_bloom_shader(GL_VERTEX_SHADER, vertex_source);
+  fragment = finder_gl_bloom_shader(GL_FRAGMENT_SHADER, fragment_source);
+  if (!vertex || !fragment)
+    return 0;
+  finder_bloom_program = finder_gl_create_program();
+  finder_gl_attach_shader(finder_bloom_program, vertex);
+  finder_gl_attach_shader(finder_bloom_program, fragment);
+  finder_gl_link_program(finder_bloom_program);
+  finder_gl_get_program_iv(finder_bloom_program, GL_LINK_STATUS, &ok);
+  finder_gl_delete_shader(vertex);
+  finder_gl_delete_shader(fragment);
+  if (!ok) {
+    finder_gl_delete_program(finder_bloom_program);
+    finder_bloom_program = 0;
+    return 0;
+  }
+  finder_bloom_texture_uniform = finder_gl_get_uniform_location(
+      finder_bloom_program, "source");
+  finder_bloom_texel_uniform = finder_gl_get_uniform_location(
+      finder_bloom_program, "texel_size");
+  finder_bloom_mode_uniform = finder_gl_get_uniform_location(
+      finder_bloom_program, "mode");
+  if (finder_bloom_texture_uniform < 0 || finder_bloom_texel_uniform < 0 ||
+      finder_bloom_mode_uniform < 0) {
+    finder_gl_delete_program(finder_bloom_program);
+    finder_bloom_program = 0;
+    return 0;
+  }
+  return 1;
+}
+
+static void finder_gl_bloom_delete_buffers(void) {
+  GLuint textures[] = { finder_bloom_source, finder_bloom_ping,
+                        finder_bloom_pong };
+  if (finder_gl_delete_framebuffers && finder_bloom_fbo)
+    finder_gl_delete_framebuffers(1, &finder_bloom_fbo);
+  if (finder_bloom_source || finder_bloom_ping || finder_bloom_pong)
+    glDeleteTextures(3, textures);
+  finder_bloom_source = finder_bloom_ping = finder_bloom_pong = 0;
+  finder_bloom_fbo = 0;
+  finder_bloom_w = finder_bloom_h = 0;
+}
+
+static int finder_gl_bloom_buffers(unsigned int w, unsigned int h) {
+  GLuint textures[3];
+  if (!finder_bloom_ready || !w || !h)
+    return 0;
+  if (finder_bloom_w == w && finder_bloom_h == h && finder_bloom_fbo)
+    return 1;
+  finder_gl_bloom_delete_buffers();
+  glGenTextures(3, textures);
+  for (int i = 0; i < 3; i++) {
+    glBindTexture(GL_TEXTURE_2D, textures[i]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  }
+  finder_bloom_source = textures[0];
+  finder_bloom_ping = textures[1];
+  finder_bloom_pong = textures[2];
+  finder_gl_gen_framebuffers(1, &finder_bloom_fbo);
+  finder_bloom_w = w;
+  finder_bloom_h = h;
+  return finder_bloom_fbo != 0;
+}
+
+static void finder_gl_bloom_quad(void) {
+  glBegin(GL_QUADS);
+  /* FBO textures have their origin at the bottom left, while Finder's
+   * projection has its origin at the top left. */
+  glTexCoord2f(0.0f, 1.0f); glVertex2f(0.0f, 0.0f);
+  glTexCoord2f(1.0f, 1.0f); glVertex2f((GLfloat)finder_bloom_w, 0.0f);
+  glTexCoord2f(1.0f, 0.0f); glVertex2f((GLfloat)finder_bloom_w,
+                                       (GLfloat)finder_bloom_h);
+  glTexCoord2f(0.0f, 0.0f); glVertex2f(0.0f, (GLfloat)finder_bloom_h);
+  glEnd();
+}
+
+static GLFont *gl_font_create(void) {
+  return gl_font_create_scaled(1.0);
+}
+
+static GLFont *gl_font_create_scaled(double scale) {
+  GLFont *font;
+  Fnt *f;
+  int subpixel_order;
+  int have_fontconfig_order = 0;
+  double pixel_size = drw && drw->fonts ? drw->fonts->h : 14;
+
+  if (scale <= 0.0)
+    scale = 1.0;
+  pixel_size *= scale;
+
+  if (!gl_font_init_ft())
+    return NULL;
+  font = calloc(1, sizeof(*font));
+  if (!font)
+    return NULL;
+  font->pixel_size = pixel_size;
+  switch (XRenderQuerySubpixelOrder(dpy, screen)) {
+  case SubPixelHorizontalRGB:
+    font->lcd_order = 1;
+    break;
+  case SubPixelHorizontalBGR:
+    font->lcd_order = 2;
+    break;
+  default:
+    font->lcd_order = 0;
+    break;
+  }
+
+  /* Mirror config.h's fontset for GL text. Xft's resolved pattern provides
+   * the actual font file, face index, and configured size for each entry. */
+  for (f = drw ? drw->fonts : NULL; f; f = f->next) {
+    FcChar8 *file = NULL;
+    double face_pixel_size = pixel_size;
+    int index = 0;
+
+    if (!f->xfont || !f->xfont->pattern ||
+        FcPatternGetString(f->xfont->pattern, FC_FILE, 0, &file) !=
+            FcResultMatch)
+      continue;
+    if (!have_fontconfig_order &&
+        FcPatternGetInteger(f->xfont->pattern, FC_RGBA, 0, &subpixel_order) ==
+            FcResultMatch) {
+      switch (subpixel_order) {
+      case FC_RGBA_RGB:
+        font->lcd_order = 1;
+        break;
+      case FC_RGBA_BGR:
+        font->lcd_order = 2;
+        break;
+      case FC_RGBA_NONE:
+      case FC_RGBA_VRGB:
+      case FC_RGBA_VBGR:
+        font->lcd_order = 0;
+        break;
+      default:
+        break;
+      }
+      have_fontconfig_order = 1;
+    }
+    FcPatternGetDouble(f->xfont->pattern, FC_PIXEL_SIZE, 0,
+                       &face_pixel_size);
+    FcPatternGetInteger(f->xfont->pattern, FC_INDEX, 0, &index);
+    face_pixel_size *= scale;
+    if (!font->face_count)
+      font->pixel_size = face_pixel_size;
+    gl_font_add_face(font, (const char *)file, index, face_pixel_size);
+  }
+
+  if (font->lcd_order &&
+      FT_Library_SetLcdFilter(ft_lib, FT_LCD_FILTER_DEFAULT))
+    font->lcd_order = 0;
+
+  /* Keep a local system-font fallback for unusual setups where none of the
+   * configured Xft fonts expose a file that FreeType can open. */
+  if (!font->face_count) {
+    static const char *fallbacks[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        NULL};
+    for (int i = 0; fallbacks[i]; i++) {
+      if (gl_font_add_face(font, fallbacks[i], 0, font->pixel_size) >= 0)
+        goto face_loaded;
+    }
+    fprintf(stderr, "AnDWM: cannot find a FreeType font for notifications\n");
+    free(font);
+    return NULL;
+  }
+face_loaded:
+  font->height = drw && drw->fonts ? (int)lround(drw->fonts->h * scale)
+      : (int)(font->faces[0].face->size->metrics.height >> 6);
+  if (font->height <= 0)
+    font->height = (int)ceil(pixel_size);
+  return font;
+}
+
+static int gl_font_add_face(GLFont *font, const char *file, int index,
+                            double pixel_size) {
+  GLFontFace *font_face;
+  if (!font || !file)
+    return -1;
+  if (pixel_size <= 0)
+    pixel_size = font->pixel_size > 0 ? font->pixel_size : 14;
+  for (unsigned int i = 0; i < font->face_count; i++)
+    if (font->faces[i].index == index &&
+        font->faces[i].pixel_size == pixel_size &&
+        !strcmp(font->faces[i].file, file))
+      return (int)i;
+  if (font->face_count >= LENGTH(font->faces))
+    return -1;
+  font_face = &font->faces[font->face_count];
+  memset(font_face, 0, sizeof(*font_face));
+  font_face->file = strdup(file);
+  font_face->index = index;
+  font_face->pixel_size = pixel_size;
+  if (!font_face->file ||
+      FT_New_Face(ft_lib, file, index, &font_face->face) ||
+      FT_Set_Char_Size(font_face->face, 0,
+                       (FT_F26Dot6)lround(pixel_size * 64.0), 72, 72)) {
+    if (font_face->face)
+      FT_Done_Face(font_face->face);
+    free(font_face->file);
+    memset(font_face, 0, sizeof(*font_face));
+    return -1;
+  }
+  font_face->hb_font = hb_ft_font_create_referenced(font_face->face);
+  if (!font_face->hb_font) {
+    FT_Done_Face(font_face->face);
+    free(font_face->file);
+    memset(font_face, 0, sizeof(*font_face));
+    return -1;
+  }
+  /* Keep Xft's slight-hinting metrics even when the outline is rasterized
+   * into horizontal LCD coverage below. */
+  hb_ft_font_set_load_flags(font_face->hb_font,
+                            FT_LOAD_DEFAULT | FT_LOAD_TARGET_LIGHT);
+  font->face_count++;
+  return (int)(font->face_count - 1);
+}
+
+static uint32_t notification_utf8_next(const char **text) {
+  const unsigned char *s = (const unsigned char *)*text;
+  uint32_t c;
+  if (s[0] < 0x80) {
+    *text += 1;
+    return s[0];
+  }
+  if (s[0] >= 0xc2 && s[0] <= 0xdf &&
+      (s[1] & 0xc0) == 0x80) {
+    c = ((uint32_t)(s[0] & 0x1f) << 6) | (s[1] & 0x3f);
+    *text += 2;
+    return c;
+  }
+  if (s[0] >= 0xe0 && s[0] <= 0xef &&
+      (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80 &&
+      !(s[0] == 0xe0 && s[1] < 0xa0) &&
+      !(s[0] == 0xed && s[1] >= 0xa0)) {
+    c = ((uint32_t)(s[0] & 0x0f) << 12) |
+        ((uint32_t)(s[1] & 0x3f) << 6) | (s[2] & 0x3f);
+    *text += 3;
+    return c;
+  }
+  if (s[0] >= 0xf0 && s[0] <= 0xf4 &&
+      (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80 &&
+      (s[3] & 0xc0) == 0x80 &&
+      !(s[0] == 0xf0 && s[1] < 0x90) &&
+      !(s[0] == 0xf4 && s[1] > 0x8f)) {
+    c = ((uint32_t)(s[0] & 7) << 18) | ((uint32_t)(s[1] & 0x3f) << 12) |
+        ((uint32_t)(s[2] & 0x3f) << 6) | (s[3] & 0x3f);
+    *text += 4;
+    return c;
+  }
+  *text += 1;
+  return 0xfffd;
+}
+
+/* Keep expensive, animated glyph shaping bounded without changing the full
+ * query used by translation.  Stop only at a UTF-8 codepoint boundary. */
+static void finder_gl_text_copy(const char *text, char *out, size_t size) {
+  const char *p = text;
+  size_t used = 0, limit;
+  int truncated = 0;
+
+  if (!out || !size)
+    return;
+  out[0] = '\0';
+  if (!text)
+    return;
+  limit = MIN(size - 1, (size_t)FINDER_GL_TEXT_MAX - 3);
+  while (*p) {
+    const char *next = p;
+    size_t n;
+
+    notification_utf8_next(&next);
+    n = (size_t)(next - p);
+    if (used + n > limit) {
+      truncated = 1;
+      break;
+    }
+    memcpy(out + used, p, n);
+    used += n;
+    p = next;
+  }
+  if (truncated && size - used > 3) {
+    memcpy(out + used, "…", 3);
+    used += 3;
+  }
+  out[used] = '\0';
+}
+
+static int gl_font_face_for_codepoint(GLFont *font, uint32_t codepoint) {
+  FcPattern *pattern = NULL, *match = NULL;
+  FcCharSet *charset = NULL;
+  FcChar8 *file = NULL;
+  FcResult match_result;
+  int index = 0, face_index = -1;
+
+  if (!font || !codepoint)
+    return 0;
+  for (unsigned int i = 0; i < font->face_count; i++)
+    if (FT_Get_Char_Index(font->faces[i].face, codepoint))
+      return (int)i;
+
+  pattern = FcPatternCreate();
+  charset = FcCharSetCreate();
+  if (pattern && charset && FcCharSetAddChar(charset, codepoint) &&
+      FcPatternAddCharSet(pattern, FC_CHARSET, charset)) {
+    FcConfigSubstitute(NULL, pattern, FcMatchPattern);
+    FcDefaultSubstitute(pattern);
+    match = FcFontMatch(NULL, pattern, &match_result);
+  }
+  if (match && FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch) {
+    FcPatternGetInteger(match, FC_INDEX, 0, &index);
+    face_index = gl_font_add_face(font, (const char *)file, index,
+                                  font->pixel_size);
+    if (face_index >= 0 &&
+        !FT_Get_Char_Index(font->faces[face_index].face, codepoint))
+      face_index = -1;
+  }
+  if (match)
+    FcPatternDestroy(match);
+  if (pattern)
+    FcPatternDestroy(pattern);
+  if (charset)
+    FcCharSetDestroy(charset);
+  return face_index >= 0 ? face_index : 0;
+}
+
+static GLGlyph *gl_font_glyph(GLFont *font, unsigned int face_index,
+                              unsigned int glyph_index) {
+  GLGlyph *g = NULL;
+  FT_Face face;
+  FT_GlyphSlot slot;
+  unsigned char *pixels;
+  int lcd;
+  int pitch, x, y;
+
+  if (!font || face_index >= font->face_count)
+    return NULL;
+  for (unsigned int i = 0; i < font->glyph_count; i++)
+    if (font->glyphs[i].face_index == face_index &&
+        font->glyphs[i].glyph_index == glyph_index)
+      return &font->glyphs[i];
+  if (font->glyph_count >= LENGTH(font->glyphs))
+    return NULL;
+
+  face = font->faces[face_index].face;
+  if (FT_Load_Glyph(face, glyph_index,
+                    FT_LOAD_DEFAULT | FT_LOAD_TARGET_LIGHT))
+    return NULL;
+  slot = face->glyph;
+  lcd = font->lcd_order != 0;
+  if (FT_Render_Glyph(slot, lcd ? FT_RENDER_MODE_LCD : FT_RENDER_MODE_NORMAL)) {
+    if (!lcd || FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL))
+      return NULL;
+    lcd = 0;
+  }
+  g = &font->glyphs[font->glyph_count++];
+  memset(g, 0, sizeof(*g));
+  g->face_index = face_index;
+  g->glyph_index = glyph_index;
+  g->w = slot->bitmap.pixel_mode == FT_PIXEL_MODE_LCD
+      ? (int)slot->bitmap.width / 3 : (int)slot->bitmap.width;
+  g->h = slot->bitmap.rows;
+  g->bearing_x = slot->bitmap_left;
+  g->bearing_y = slot->bitmap_top;
+  g->advance = slot->advance.x >> 6;
+  g->loaded = 1;
+  if (!g->w || !g->h)
+    return g;
+
+  pixels = calloc((size_t)g->w * g->h, 4);
+  if (!pixels)
+    return g;
+  pitch = slot->bitmap.pitch;
+  for (y = 0; y < g->h; y++) {
+    const unsigned char *row = pitch >= 0
+        ? slot->bitmap.buffer + y * pitch
+        : slot->bitmap.buffer + (g->h - 1 - y) * -pitch;
+    for (x = 0; x < g->w; x++) {
+      unsigned char r, green, b, alpha;
+      if (slot->bitmap.pixel_mode == FT_PIXEL_MODE_LCD && lcd) {
+        const unsigned char *sample = row + x * 3;
+        r = sample[font->lcd_order == 2 ? 2 : 0];
+        green = sample[1];
+        b = sample[font->lcd_order == 2 ? 0 : 2];
+        alpha = MAX(r, MAX(green, b));
+      } else {
+        unsigned char coverage = slot->bitmap.pixel_mode == FT_PIXEL_MODE_MONO
+            ? ((row[x >> 3] & (0x80 >> (x & 7))) ? 255 : 0)
+            : row[x];
+        r = green = b = alpha = coverage;
+      }
+      pixels[((size_t)y * g->w + x) * 4] = r;
+      pixels[((size_t)y * g->w + x) * 4 + 1] = green;
+      pixels[((size_t)y * g->w + x) * 4 + 2] = b;
+      pixels[((size_t)y * g->w + x) * 4 + 3] = alpha;
+    }
+  }
+  glGenTextures(1, &g->tex_id);
+  glBindTexture(GL_TEXTURE_2D, g->tex_id);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g->w, g->h, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, pixels);
+  free(pixels);
+  return g;
+}
+
+static unsigned int gl_font_text_width_for(GLFont *font, const char *text) {
+  int64_t width = 0;
+  const char *run_start, *p;
+  if (!text || !font)
+    return 0;
+  p = text;
+  while (*p) {
+    const char *next = p;
+    unsigned int face_index;
+    hb_buffer_t *buffer;
+    hb_glyph_position_t *positions;
+    unsigned int count;
+
+    face_index = (unsigned int)gl_font_face_for_codepoint(
+        font, notification_utf8_next(&next));
+    run_start = p;
+    p = next;
+    while (*p) {
+      next = p;
+      if ((unsigned int)gl_font_face_for_codepoint(
+              font, notification_utf8_next(&next)) != face_index)
+        break;
+      p = next;
+    }
+    buffer = hb_buffer_create();
+    if (!buffer)
+      break;
+    hb_buffer_add_utf8(buffer, run_start, (int)(p - run_start), 0,
+                       (int)(p - run_start));
+    hb_buffer_guess_segment_properties(buffer);
+    hb_shape(font->faces[face_index].hb_font, buffer, NULL, 0);
+    positions = hb_buffer_get_glyph_positions(buffer, &count);
+    for (unsigned int i = 0; i < count; i++)
+      width += MAX(positions[i].x_advance, 0);
+    hb_buffer_destroy(buffer);
+  }
+  return (unsigned int)MAX((width + 63) / 64, 0);
+}
+
+static unsigned int gl_font_text_width(const char *text) {
+  return gl_font_text_width_for(gl_font, text);
+}
+
+static void gl_font_draw_text_alpha_for(GLFont *font, const char *text,
+                                        int x, int baseline,
+                                        unsigned int max_width, float r,
+                                        float g, float b, float alpha,
+                                        int grayscale) {
+  int64_t pen_x = (int64_t)x * 64;
+  const char *p = text;
+  if (!text || !font)
+    return;
+  glEnable(GL_TEXTURE_2D);
+  glEnable(GL_BLEND);
+  notification_gl_blend_premultiplied();
+  glColor4f(r * alpha, g * alpha, b * alpha, alpha);
+  if (grayscale) {
+    /* Bloom must not multiply the LCD red/green/blue coverage channels into
+     * the output. Keep the glyph's alpha coverage, but take RGB exclusively
+     * from the (already neutral-gray) draw color. */
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_RGB, GL_REPLACE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_RGB, GL_PRIMARY_COLOR);
+    glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_RGB, GL_SRC_COLOR);
+    glTexEnvi(GL_TEXTURE_ENV, GL_COMBINE_ALPHA, GL_MODULATE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE0_ALPHA, GL_TEXTURE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND0_ALPHA, GL_SRC_ALPHA);
+    glTexEnvi(GL_TEXTURE_ENV, GL_SOURCE1_ALPHA, GL_PRIMARY_COLOR);
+    glTexEnvi(GL_TEXTURE_ENV, GL_OPERAND1_ALPHA, GL_SRC_ALPHA);
+  } else {
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+  }
+  while (*p) {
+    const char *run_start = p, *next = p;
+    unsigned int face_index = (unsigned int)gl_font_face_for_codepoint(
+        font, notification_utf8_next(&next));
+    hb_buffer_t *buffer;
+    hb_glyph_info_t *infos;
+    hb_glyph_position_t *positions;
+    unsigned int count;
+    int64_t run_x = pen_x;
+
+    p = next;
+    while (*p) {
+      next = p;
+      if ((unsigned int)gl_font_face_for_codepoint(
+              font, notification_utf8_next(&next)) != face_index)
+        break;
+      p = next;
+    }
+    buffer = hb_buffer_create();
+    if (!buffer)
+      break;
+    hb_buffer_add_utf8(buffer, run_start, (int)(p - run_start), 0,
+                       (int)(p - run_start));
+    hb_buffer_guess_segment_properties(buffer);
+    hb_shape(font->faces[face_index].hb_font, buffer, NULL, 0);
+    infos = hb_buffer_get_glyph_infos(buffer, &count);
+    positions = hb_buffer_get_glyph_positions(buffer, &count);
+    for (unsigned int i = 0; i < count; i++) {
+      GLGlyph *glyph = gl_font_glyph(font, face_index, infos[i].codepoint);
+      float pen = (float)(run_x + positions[i].x_offset) / 64.0f;
+      float x1, y1, x2, y2;
+      if ((uint64_t)MAX(run_x + positions[i].x_advance -
+                            (int64_t)x * 64, 0) >
+          (uint64_t)max_width * 64) {
+        hb_buffer_destroy(buffer);
+        glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+        return;
+      }
+      if (glyph && glyph->tex_id && glyph->w > 0 && glyph->h > 0) {
+        x1 = pen + glyph->bearing_x;
+        y1 = baseline - glyph->bearing_y -
+             (float)positions[i].y_offset / 64.0f;
+        x2 = x1 + glyph->w;
+        y2 = y1 + glyph->h;
+        glBindTexture(GL_TEXTURE_2D, glyph->tex_id);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(x1, y1);
+        glTexCoord2f(1, 0); glVertex2f(x2, y1);
+        glTexCoord2f(1, 1); glVertex2f(x2, y2);
+        glTexCoord2f(0, 1); glVertex2f(x1, y2);
+        glEnd();
+      }
+      run_x += positions[i].x_advance;
+    }
+    pen_x = run_x;
+    hb_buffer_destroy(buffer);
+    if ((uint64_t)MAX(pen_x - (int64_t)x * 64, 0) >
+        (uint64_t)max_width * 64)
+      break;
+  }
+  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+  glDisable(GL_BLEND);
+  glDisable(GL_TEXTURE_2D);
+}
+
+static void gl_font_draw_text_alpha(const char *text, int x, int baseline,
+                                    unsigned int max_width, float r, float g,
+                                    float b, float alpha) {
+  gl_font_draw_text_alpha_for(gl_font, text, x, baseline, max_width, r, g, b,
+                              alpha, 0);
+}
+
+static void gl_font_draw_text(const char *text, int x, int baseline,
+                              unsigned int max_width, float r, float g,
+                              float b) {
+  gl_font_draw_text_alpha(text, x, baseline, max_width, r, g, b, 1.0f);
+}
+
+static void gl_font_free(GLFont *font) {
+  if (!font)
+    return;
+  for (unsigned int i = 0; i < font->glyph_count; i++)
+    if (font->glyphs[i].tex_id)
+      glDeleteTextures(1, &font->glyphs[i].tex_id);
+  for (unsigned int i = 0; i < font->face_count; i++) {
+    if (font->faces[i].hb_font)
+      hb_font_destroy(font->faces[i].hb_font);
+    if (font->faces[i].face)
+      FT_Done_Face(font->faces[i].face);
+    free(font->faces[i].file);
+  }
+  free(font);
+}
+
+static void notification_gl_draw_body(Notification *n, int x, int *baseline,
+                                      int line_h, unsigned int width,
+                                      unsigned int max_lines,
+                                      float r, float g, float b) {
+  unsigned int lines = notification_body_wrap(n, width, max_lines);
+
+  for (unsigned int i = 0; i < lines; i++) {
+    gl_font_draw_text(n->body_wrap_lines[i], x, *baseline, width, r, g, b);
+    *baseline += line_h;
+  }
+}
+
+static unsigned long notification_channel_pixel(unsigned long mask,
+                                                unsigned char value) {
+  unsigned int shift = 0;
+  unsigned long max;
+  if (!mask)
+    return 0;
+  while (!(mask & 1)) {
+    mask >>= 1;
+    shift++;
+  }
+  max = mask;
+  return ((((unsigned long)value * max + 127) / 255) << shift);
+}
+
+static unsigned char notification_vertical_alpha(unsigned int y,
+                                                 unsigned int h) {
+  static const double stops[] = {0.0, 0.0, 0.1, 0.2, 0.3, 0.4,
+                                 0.5, 0.6, 0.7, 0.8, 0.9, 1.0};
+  /* Finder's accelerating curve, remapped from 100% at the top to 50% at
+   * the bottom while retaining the same transition profile. */
+  static const unsigned char alpha[] = {
+      255, 255, 254, 251, 246, 238, 228, 215, 200, 182, 162, 128};
+  double position = h > 1 ? (double)y / (double)(h - 1) : 0.0;
+
+  for (unsigned int i = 1; i < LENGTH(stops); i++) {
+    if (position <= stops[i]) {
+      double span = stops[i] - stops[i - 1];
+      double fraction = span > 0.0 ? (position - stops[i - 1]) / span : 0.0;
+      return (unsigned char)lround(alpha[i - 1] +
+                                   (alpha[i] - alpha[i - 1]) * fraction);
+    }
+  }
+  return alpha[LENGTH(alpha) - 1];
+}
+
+static void notification_present_gl(unsigned int w, unsigned int h,
+                                   Drawable target) {
+  unsigned char *pixels;
+  Visual *visual;
+  int depth;
+  XImage *image;
+  GC gc;
+  Pixmap pixmap;
+  Picture src = None, dest = None;
+  XRenderPictFormat *format, *visual_format;
+  unsigned long alpha_mask = 0;
+
+  /* History frames, including their per-pixel alpha, are uploaded directly
+   * into the reusable content pixmap. Scrolling then uses XCopyArea. */
+  if (target != None || (notify_history_active && selmon &&
+                         selmon->barcenterwin)) {
+    uint16_t endian_test = 1;
+    int native_byte_order = *(unsigned char *)&endian_test
+                                ? LSBFirst : MSBFirst;
+    unsigned char *row = NULL;
+    Drawable dest = target != None ? target : selmon->barcenterwin;
+
+    visual = finder_argb_visual ? finder_argb_visual
+                                : DefaultVisual(dpy, screen);
+    depth = finder_argb_visual ? finder_argb_depth
+                               : DefaultDepth(dpy, screen);
+    visual_format = XRenderFindVisualFormat(dpy, visual);
+    if (visual_format && visual_format->type == PictTypeDirect)
+      alpha_mask = (unsigned long)visual_format->direct.alphaMask
+                   << visual_format->direct.alpha;
+    image = XCreateImage(dpy, visual, (unsigned int)depth, ZPixmap, 0, NULL,
+                         w, h, 32, 0);
+    if (image && image->bits_per_pixel == 32 &&
+        image->byte_order == native_byte_order &&
+        image->bytes_per_line == (int)(w * 4U) &&
+        visual->red_mask == 0x00ff0000UL &&
+        visual->green_mask == 0x0000ff00UL &&
+        visual->blue_mask == 0x000000ffUL &&
+        (!alpha_mask || alpha_mask == 0xff000000UL)) {
+      image->data = calloc((size_t)image->bytes_per_line, h);
+      row = malloc((size_t)image->bytes_per_line);
+      if (image->data && row) {
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_BGRA,
+                     GL_UNSIGNED_BYTE, image->data);
+        /* Preserve transparent history foreground pixels so text and images
+         * can be composited above the separately-gradient-masked background.
+         * Popups use the gradient directly as one complete surface. */
+        for (unsigned int y = 0; y < h; y++) {
+          unsigned char opacity = target != None
+              ? 0 : notification_vertical_alpha(h - 1U - y, h);
+          for (unsigned int x = 0; x < w; x++) {
+            unsigned char *pixel = (unsigned char *)image->data +
+                (size_t)y * image->bytes_per_line + (size_t)x * 4U;
+            if (target == None)
+              pixel[3] = opacity;
+          }
+        }
+        for (unsigned int y = 0; y < h / 2; y++) {
+          unsigned char *top = (unsigned char *)image->data +
+                               (size_t)y * image->bytes_per_line;
+          unsigned char *bottom = (unsigned char *)image->data +
+                                  (size_t)(h - 1 - y) * image->bytes_per_line;
+          memcpy(row, top, (size_t)image->bytes_per_line);
+          memcpy(top, bottom, (size_t)image->bytes_per_line);
+          memcpy(bottom, row, (size_t)image->bytes_per_line);
+        }
+        gc = XCreateGC(dpy, dest, 0, NULL);
+        if (gc) {
+          XPutImage(dpy, dest, gc, image, 0, 0, 0, 0, w, h);
+          XFreeGC(dpy, gc);
+          free(row);
+          XDestroyImage(image);
+          return;
+        }
+      }
+      free(row);
+    }
+    if (image)
+      XDestroyImage(image);
+  }
+
+  pixels = calloc((size_t)w * h, 4);
+  if (!pixels)
+    return;
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+  visual = finder_argb_visual ? finder_argb_visual : DefaultVisual(dpy, screen);
+  depth = finder_argb_visual ? finder_argb_depth : DefaultDepth(dpy, screen);
+  visual_format = XRenderFindVisualFormat(dpy, visual);
+  if (visual_format && visual_format->type == PictTypeDirect)
+    alpha_mask = (unsigned long)visual_format->direct.alphaMask
+                 << visual_format->direct.alpha;
+  image = XCreateImage(dpy, visual, (unsigned int)depth, ZPixmap, 0, NULL,
+                       w, h, 32, 0);
+  if (!image) {
+    free(pixels);
+    return;
+  }
+  image->data = calloc((size_t)image->bytes_per_line, h);
+  if (!image->data) {
+    image->f.destroy_image(image);
+    free(pixels);
+    return;
+  }
+  for (unsigned int py = 0; py < h; py++)
+    for (unsigned int px = 0; px < w; px++) {
+      size_t src_offset = ((size_t)(h - 1 - py) * w + px) * 4;
+      unsigned char r = pixels[src_offset];
+      unsigned char g = pixels[src_offset + 1];
+      unsigned char b = pixels[src_offset + 2];
+      /* Both popup and history pixels remain transparent foreground. The
+       * viewport's fixed background gradient is composited separately. */
+      unsigned char a = pixels[src_offset + 3];
+      unsigned long pixel = notification_channel_pixel(visual->red_mask, r) |
+                            notification_channel_pixel(visual->green_mask, g) |
+                            notification_channel_pixel(visual->blue_mask, b) |
+                            notification_channel_pixel(alpha_mask, a);
+      XPutPixel(image, (int)px, (int)py, pixel);
+    }
+  free(pixels);
+
+  /* The history cache is a pixmap with the same depth as the bar window.
+   * Use the generic XImage conversion when the fast BGRA layout above is
+   * unavailable, rather than leaving the cache uninitialized. */
+  if (target != None) {
+    gc = XCreateGC(dpy, target, 0, NULL);
+    if (gc) {
+      XPutImage(dpy, target, gc, image, 0, 0, 0, 0, w, h);
+      XFreeGC(dpy, gc);
+    }
+    XDestroyImage(image);
+    return;
+  }
+
+  pixmap = XCreatePixmap(dpy, root, w, h, (unsigned int)depth);
+  if (!pixmap) {
+    XDestroyImage(image);
+    return;
+  }
+  gc = XCreateGC(dpy, pixmap, 0, NULL);
+  if (!gc) {
+    XFreePixmap(dpy, pixmap);
+    XDestroyImage(image);
+    return;
+  }
+  XPutImage(dpy, pixmap, gc, image, 0, 0, 0, 0, w, h);
+  format = XRenderFindStandardFormat(dpy, depth == 32 ? PictStandardARGB32
+                                                       : PictStandardRGB24);
+  if (format)
+    src = XRenderCreatePicture(dpy, pixmap, format, 0, NULL);
+  if (finder_argb_visual)
+    format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+  else
+    format = XRenderFindVisualFormat(dpy, visual);
+  if (format)
+    dest = XRenderCreatePicture(dpy, selmon->barcenterwin, format, 0, NULL);
+  if (src && dest && notification_history_background_create() &&
+      notification_history_mask_create(w, h)) {
+    XRenderColor transparent = {0, 0, 0, 0};
+    XRenderFillRectangle(dpy, PictOpSrc, dest, &transparent, 0, 0, w, h);
+    XRenderComposite(dpy, PictOpOver, notify_history_background_picture,
+                     notify_history_mask_picture, dest,
+                     0, 0, 0, 0, 0, 0, w, h);
+    XRenderComposite(dpy, PictOpOver, src, None, dest,
+                     0, 0, 0, 0, 0, 0, w, h);
+  } else if (src && dest) {
+    XRenderComposite(dpy, PictOpSrc, src, None, dest,
+                     0, 0, 0, 0, 0, 0, w, h);
+  }
+  if (src) XRenderFreePicture(dpy, src);
+  if (dest) XRenderFreePicture(dpy, dest);
+  XFreeGC(dpy, gc);
+  XFreePixmap(dpy, pixmap);
+  XDestroyImage(image);
+}
+
+/* Render the complete popup, including its image and text, on a dedicated
+ * GLX pbuffer.  It is then copied as one full-height image, never from dwm's
+ * bar-sized scratch drawable. */
+static uint64_t notification_hash_bytes(uint64_t hash, const void *data,
+                                       size_t len) {
+  const unsigned char *bytes = data;
+  for (size_t i = 0; i < len; i++) {
+    hash ^= bytes[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+static uint64_t notification_hash_string(uint64_t hash, const char *text) {
+  static const unsigned char null_marker = 0xff;
+  if (!text)
+    return notification_hash_bytes(hash, &null_marker, sizeof(null_marker));
+  hash = notification_hash_bytes(hash, text, strlen(text));
+  return notification_hash_bytes(hash, "\0", 1);
+}
+
+static uint64_t notification_hash_item(uint64_t hash, const Notification *n) {
+  hash = notification_hash_bytes(hash, &n->id, sizeof(n->id));
+  hash = notification_hash_bytes(hash, n->received_time,
+                                 sizeof(n->received_time));
+  hash = notification_hash_string(hash, n->summary);
+  hash = notification_hash_string(hash, n->body);
+  hash = notification_hash_string(hash, n->input_text);
+  hash = notification_hash_string(hash, n->input_placeholder);
+  hash = notification_hash_bytes(hash, &n->img_pixels, sizeof(n->img_pixels));
+  hash = notification_hash_bytes(hash, &n->img_w, sizeof(n->img_w));
+  hash = notification_hash_bytes(hash, &n->img_h, sizeof(n->img_h));
+  hash = notification_hash_bytes(hash, &n->action_count,
+                                 sizeof(n->action_count));
+  hash = notification_hash_bytes(hash, &n->input_enabled,
+                                 sizeof(n->input_enabled));
+  hash = notification_hash_bytes(hash, &n->action_used,
+                                 sizeof(n->action_used));
+  for (unsigned int i = 0; n->actions && i < n->action_count; i++)
+    hash = notification_hash_string(hash, n->actions[i]);
+  return hash;
+}
+
+static uint64_t notification_frame_hash(int history) {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  Notification *n;
+  hash = notification_hash_bytes(hash, &history, sizeof(history));
+  hash = notification_hash_bytes(hash, &notify_width, sizeof(notify_width));
+  hash = notification_hash_bytes(hash, &notify_height, sizeof(notify_height));
+  if (history) {
+    hash = notification_hash_bytes(hash, &notify_history_count,
+                                   sizeof(notify_history_count));
+    hash = notification_hash_bytes(hash, &notify_history_hover_entry,
+                                   sizeof(notify_history_hover_entry));
+    hash = notification_hash_bytes(hash, &notify_history_hover_action,
+                                   sizeof(notify_history_hover_action));
+    hash = notification_hash_bytes(hash, &notify_history_input,
+                                   sizeof(notify_history_input));
+    for (n = notify_history_head; n; n = n->next)
+      hash = notification_hash_item(hash, n);
+  } else if (notify_current) {
+    hash = notification_hash_item(hash, notify_current);
+    hash = notification_hash_bytes(hash, &notify_hovered,
+                                   sizeof(notify_hovered));
+    hash = notification_hash_bytes(hash, &notify_hover, sizeof(notify_hover));
+    hash = notification_hash_bytes(hash, &notify_input_focus,
+                                   sizeof(notify_input_focus));
+    hash = notification_hash_bytes(hash, &notify_text_y, sizeof(notify_text_y));
+    hash = notification_hash_bytes(hash, &notify_image_y,
+                                   sizeof(notify_image_y));
+    hash = notification_hash_bytes(hash, &notify_input_x,
+                                   sizeof(notify_input_x));
+    hash = notification_hash_bytes(hash, &notify_input_y,
+                                   sizeof(notify_input_y));
+    hash = notification_hash_bytes(hash, &notify_input_w,
+                                   sizeof(notify_input_w));
+    hash = notification_hash_bytes(hash, &notify_input_h,
+                                   sizeof(notify_input_h));
+    hash = notification_hash_bytes(hash, notify_action_x,
+                                   sizeof(notify_action_x));
+    hash = notification_hash_bytes(hash, notify_action_w,
+                                   sizeof(notify_action_w));
+    hash = notification_hash_bytes(hash, &notify_action_y,
+                                   sizeof(notify_action_y));
+  }
+  return hash;
+}
+
+static int notification_frame_cached(int history) {
+  return notify_render_cache_valid &&
+         notify_render_cache_hash == notification_frame_hash(history);
 }
 
 static void notification_draw(void) {
   Notification *n = notify_current;
-  int text_x = 12, text_w = notify_width - 24;
-  int content_h;
-  int controls_h;
-  int summary_y, body_y;
-  int has_summary, has_body;
-  if (!n)
-    return;
-  has_summary = n->summary && *n->summary;
-  has_body = n->body && *n->body;
-  controls_h = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
-               (notify_hovered && n->action_count >= 2
-                    ? NOTIFY_BUTTON_ROW_H
-                    : 0);
-  if (notify_hovered && n->image && n->action_count >= 2)
-    controls_h += NOTIFY_IMAGE_BUTTON_GAP + 6;
-  content_h = notify_height - controls_h;
-  XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
-                 notify_width, notify_height);
-  if (n->image) {
-    int image_x = 12;
-    int image_y = (content_h - (int)n->image_h) / 2;
-    drw_pic(drw, image_x, image_y, n->image_w, n->image_h, n->image);
-    text_x = image_x + n->image_w + 8;
-    text_w = notify_width - text_x - 12;
-  } else {
-    unsigned int content_w = MAX(notification_text_width(n->summary),
-                                 notification_text_width(n->body));
-    if (content_w && content_w < notify_width)
-      text_x = MAX(0, ((int)notify_width - (int)content_w) / 2 - 8);
-    text_w = notify_width - text_x - 8;
-  }
-  if (has_body && has_summary) {
-    summary_y = 7 + NOTIFY_TEXT_TOP_OFFSET;
-    body_y = 32 + NOTIFY_TEXT_TOP_OFFSET;
-  } else {
-    summary_y = body_y = MAX(0, (content_h - (drw->fonts->h + 8)) / 2);
-  }
-  drw_setscheme(drw, notify_summary_scheme);
-  if (has_summary)
-    drw_text(drw, text_x, summary_y, text_w, drw->fonts->h + 8, 8,
-             n->summary, 0);
-  drw_setscheme(drw, notify_body_scheme);
-  if (has_body)
-    notification_draw_text(text_x, body_y, text_w, content_h, n->body);
+  unsigned int w = notify_width, h = notify_height;
+  int pad = NOTIFY_PADDING, x = pad, baseline, line_h, ascender;
+  int body_line_h;
+  int img_w = 0, img_h = 0;
+  int text_x, text_width;
+  unsigned int body_lines = 0, single_line_width = 0;
+  int has_summary;
 
-  memset(notify_action_x, 0, sizeof(notify_action_x));
-  memset(notify_action_w, 0, sizeof(notify_action_w));
-  if (n->input_enabled) {
-    notify_input_x = 8;
-    notify_input_y = notify_height - NOTIFY_INPUT_ROW_H -
-                     (notify_hovered && n->action_count >= 2
-                           ? NOTIFY_BUTTON_ROW_H
-                           : 0);
-    notify_input_w = notify_width - 16;
-    notify_input_h = NOTIFY_ACTION_H - 6;
-    drw_setscheme(drw, notify_hover == -2 ? notify_control_hover_scheme
-                                          : notify_control_scheme);
-    drw_rect(drw, notify_input_x, notify_input_y, notify_input_w,
-             notify_input_h, 1, 1);
-    drw_text(drw, notify_input_x + 6, notify_input_y, notify_input_w - 12,
-             notify_input_h, 6,
-             n->input_text && *n->input_text ? n->input_text
-                                              : n->input_placeholder,
-             0);
+  if (!n || !notify_active || !w || !h || !selmon || !selmon->barcenterwin)
+    return;
+  if (notification_frame_cached(0))
+    return;
+  if (!notification_gl_init(w, h))
+    return;
+  if (!gl_font)
+    gl_font = gl_font_create();
+  if (!gl_font)
+    return;
+  line_h = MAX(gl_font->height, 1);
+  body_line_h = MAX((int)ceil(gl_font->pixel_size) +
+                        NOTIFY_BODY_LINE_GAP,
+                    1);
+  ascender = MAX(1, (int)(gl_font->faces[0].face->size->metrics.ascender >> 6));
+  if (n->image && n->image_w && n->image_h) {
+    img_h = MIN((int)n->image_h, NOTIFY_IMAGE_MAX_H);
+    img_w = (int)((double)n->image_w * img_h / n->image_h);
+    if (img_w > 100) {
+      img_w = 100;
+      img_h = MAX(1, (int)((double)n->image_h * img_w / n->image_w));
+    }
   }
-  if (n->action_count >= 2) {
-    unsigned int i, x = NOTIFY_ACTION_X, button = 0;
-    int y = notify_height - NOTIFY_ACTION_H;
-    for (i = 0; i + 1 < n->action_count && button < LENGTH(notify_action_x);
-         i += 2, button++) {
-      unsigned int w = notification_text_width(n->actions[i + 1]) + 24;
-      if (x + w > notify_width - 8)
-        break;
-      notify_action_x[button] = x;
-      notify_action_w[button] = w;
-      if (notify_hovered) {
-        drw_setscheme(drw, notify_hover == (int)button
-                                ? notify_action_hover_scheme
-                                : notify_action_scheme);
-        drw_text(drw, x, y, w, NOTIFY_BUTTON_H, 12, n->actions[i + 1], 0);
+  text_x = pad + (img_w ? img_w + 12 : 0);
+  text_width = MAX(1, (int)w - text_x - pad);
+  has_summary = n->summary && *n->summary;
+  if (n->body && *n->body)
+    body_lines = notification_body_wrap(
+        n, (unsigned int)text_width,
+        notify_hovered ? NOTIFY_POPUP_BODY_HOVER_MAX_LINES
+                       : NOTIFY_POPUP_BODY_MAX_LINES);
+  /* Keep a short, single-row text-only popup compact and center its text
+   * inside the existing content area. Multi-line text and controls retain
+   * their normal left alignment. */
+  if (!img_w && !n->input_enabled &&
+      !(notify_hovered && n->actions && n->action_count >= 2) &&
+      ((unsigned int)has_summary + body_lines == 1)) {
+    single_line_width = has_summary
+        ? notification_text_width(n->summary)
+        : gl_font_text_width(n->body_wrap_lines[0]);
+    if (single_line_width < (unsigned int)text_width)
+      text_x += (text_width - (int)single_line_width) / 2;
+  }
+  baseline = pad + notify_text_y + ascender;
+
+  glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho(0, w, h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0, 0, 0, 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDisable(GL_TEXTURE_2D);
+
+  if (img_w > 0 && n->img_pixels && n->img_w > 0 && n->img_h > 0) {
+    notification_image_texture_create(n);
+    if (n->img_texture)
+      glBindTexture(GL_TEXTURE_2D, n->img_texture);
+    if (n->img_texture) {
+      glEnable(GL_TEXTURE_2D);
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      glColor4f(1, 1, 1, 1);
+      glBegin(GL_QUADS);
+      glTexCoord2f(0, 0); glVertex2f(x, pad + notify_image_y);
+      glTexCoord2f(1, 0); glVertex2f(x + img_w, pad + notify_image_y);
+      glTexCoord2f(1, 1); glVertex2f(x + img_w, pad + notify_image_y + img_h);
+      glTexCoord2f(0, 1); glVertex2f(x, pad + notify_image_y + img_h);
+      glEnd();
+      glDisable(GL_BLEND);
+      glDisable(GL_TEXTURE_2D);
+    }
+  }
+
+  if (n->summary && *n->summary) {
+    gl_font_draw_text(n->summary, text_x, baseline, text_width,
+                      1.0f, 1.0f, 1.0f);
+    baseline += line_h + 2;
+  }
+  if (n->body && *n->body)
+    notification_gl_draw_body(n, text_x, &baseline, body_line_h,
+                              text_width,
+                              notify_hovered
+                                  ? NOTIFY_POPUP_BODY_HOVER_MAX_LINES
+                                  : NOTIFY_POPUP_BODY_MAX_LINES,
+                              0.82f, 0.85f, 0.9f);
+
+  /* Controls are intentionally just text: their rows have hitboxes but no
+   * filled rectangles, borders, or other button/input backgrounds. */
+  if (n->input_enabled) {
+    const char *value = n->input_text && *n->input_text
+        ? n->input_text : n->input_placeholder;
+    const char *visible = value;
+    unsigned int max_width = (unsigned int)MAX(1, notify_input_w);
+    if (!value)
+      value = "";
+    visible = value;
+    if (n->input_text && *n->input_text) {
+      visible = n->input_text;
+      while (*visible && gl_font_text_width(visible) +
+             (notify_input_focus ? gl_font_text_width("|") : 0U) > max_width)
+        notification_utf8_next(&visible);
+    }
+    if (notify_input_focus) {
+      const char *typed = n->input_text && *n->input_text ? visible : "";
+      size_t len = strlen(typed);
+      char *with_cursor = malloc(len + 2);
+      if (with_cursor) {
+        memcpy(with_cursor, typed, len);
+        with_cursor[len] = '|';
+        with_cursor[len + 1] = '\0';
+        gl_font_draw_text(with_cursor, notify_input_x,
+                          notify_input_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                          max_width,
+                          1.0f, 1.0f, 1.0f);
+        if (!len && value && *value) {
+          unsigned int cursor_w = notification_text_width("|");
+          gl_font_draw_text(value, notify_input_x + cursor_w,
+                            notify_input_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                            max_width > cursor_w ? max_width - cursor_w : 0,
+                            0.58f, 0.61f, 0.66f);
+        }
+        free(with_cursor);
       }
-      x += w + 6;
+    } else {
+      float r = n->input_text && *n->input_text ? 0.92f : 0.58f;
+      float g = n->input_text && *n->input_text ? 0.93f : 0.61f;
+      float b = n->input_text && *n->input_text ? 0.96f : 0.66f;
+      gl_font_draw_text(visible, notify_input_x,
+                        notify_input_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                        max_width, r, g, b);
+    }
+  }
+  for (unsigned int i = 0; notify_hovered && n->actions &&
+       i < MIN(n->action_count / 2, LENGTH(notify_action_x)); i++) {
+    const char *label = n->actions[i * 2 + 1];
+    unsigned int cell_w = (unsigned int)MAX(1, notify_action_w[i]);
+    unsigned int label_w = notification_text_width(label);
+    int label_x = notify_action_x[i] +
+        (int)(cell_w - MIN(label_w, cell_w));
+    int hovered = notify_hover == (int)i;
+    float r = hovered ? 1.0f : 0.82f;
+    float g = hovered ? 1.0f : 0.85f;
+    float b = hovered ? 1.0f : 0.9f;
+    gl_font_draw_text(label, label_x,
+                      notify_action_y + MAX(0, (NOTIFY_BUTTON_H - line_h) / 2) + ascender,
+                      cell_w, r, g, b);
+  }
+
+  notification_present_gl(w, h, None);
+  notify_render_cache_hash = notification_frame_hash(0);
+  notify_render_cache_valid = 1;
+}
+
+static unsigned int notification_history_surface_height(void) {
+  Notification *n;
+  unsigned int height = 2U * NOTIFY_PADDING;
+
+  for (n = notify_history_head; n; n = n->next)
+    height += notification_history_entry_height(n);
+  return MAX(height, notify_height);
+}
+
+static int notification_history_mask_create(unsigned int w,
+                                            unsigned int h) {
+  XRenderPictFormat *format;
+  Pixmap pixmap;
+  Picture picture;
+
+  if (notify_history_mask_picture && notify_history_mask_w == w &&
+      notify_history_mask_h == h)
+    return 1;
+  if (notify_history_mask_picture)
+    XRenderFreePicture(dpy, notify_history_mask_picture);
+  if (notify_history_mask_pixmap)
+    XFreePixmap(dpy, notify_history_mask_pixmap);
+  notify_history_mask_picture = None;
+  notify_history_mask_pixmap = None;
+  notify_history_mask_w = notify_history_mask_h = 0;
+
+  format = XRenderFindStandardFormat(dpy, PictStandardA8);
+  if (!format)
+    return 0;
+  pixmap = XCreatePixmap(dpy, root, w, h, 8);
+  if (!pixmap)
+    return 0;
+  picture = XRenderCreatePicture(dpy, pixmap, format, 0, NULL);
+  if (!picture) {
+    XFreePixmap(dpy, pixmap);
+    return 0;
+  }
+  for (unsigned int y = 0; y < h; y++) {
+    unsigned char opacity = notification_vertical_alpha(y, h);
+    XRenderColor color = {0, 0, 0, (unsigned short)(opacity * 257U)};
+    XRenderFillRectangle(dpy, PictOpSrc, picture, &color, 0, (int)y, w, 1);
+  }
+  notify_history_mask_pixmap = pixmap;
+  notify_history_mask_picture = picture;
+  notify_history_mask_w = w;
+  notify_history_mask_h = h;
+  return 1;
+}
+
+static int notification_history_background_create(void) {
+  XRenderPictFormat *format;
+  XRenderPictureAttributes attributes = {0};
+  XRenderColor color = {7864, 8519, 11141, 65535};
+  Pixmap pixmap;
+  Picture picture;
+
+  if (notify_history_background_picture)
+    return 1;
+  format = XRenderFindStandardFormat(dpy, PictStandardARGB32);
+  if (!format)
+    return 0;
+  pixmap = XCreatePixmap(dpy, root, 1, 1, 32);
+  if (!pixmap)
+    return 0;
+  attributes.repeat = True;
+  picture = XRenderCreatePicture(dpy, pixmap, format, CPRepeat, &attributes);
+  if (!picture) {
+    XFreePixmap(dpy, pixmap);
+    return 0;
+  }
+  XRenderFillRectangle(dpy, PictOpSrc, picture, &color, 0, 0, 1, 1);
+  notify_history_background_pixmap = pixmap;
+  notify_history_background_picture = picture;
+  return 1;
+}
+
+static int notification_history_cache_create(unsigned int w,
+                                             unsigned int h) {
+  XWindowAttributes attr;
+  Pixmap pixmap;
+  GC gc;
+  XRenderPictFormat *format;
+
+  if (!selmon || !selmon->barcenterwin || !w || !h ||
+      !XGetWindowAttributes(dpy, selmon->barcenterwin, &attr))
+    return 0;
+  pixmap = XCreatePixmap(dpy, selmon->barcenterwin, w, h,
+                         (unsigned int)attr.depth);
+  if (!pixmap)
+    return 0;
+  gc = XCreateGC(dpy, pixmap, 0, NULL);
+  if (!gc) {
+    XFreePixmap(dpy, pixmap);
+    return 0;
+  }
+  if (notify_history_gc)
+    XFreeGC(dpy, notify_history_gc);
+  if (notify_history_picture)
+    XRenderFreePicture(dpy, notify_history_picture);
+  if (notify_history_pixmap)
+    XFreePixmap(dpy, notify_history_pixmap);
+  notify_history_pixmap = pixmap;
+  notify_history_gc = gc;
+  format = XRenderFindStandardFormat(dpy, attr.depth == 32
+      ? PictStandardARGB32 : PictStandardRGB24);
+  notify_history_picture = format
+      ? XRenderCreatePicture(dpy, pixmap, format, 0, NULL) : None;
+  notify_history_pixmap_w = w;
+  notify_history_pixmap_h = h;
+  notify_render_cache_valid = 0;
+  return 1;
+}
+
+static void notification_history_present(void) {
+  unsigned int pad, content_h, content_src_y;
+  XWindowAttributes attr;
+  XRenderPictFormat *dest_format;
+
+  if (!notify_history_active || !notify_history_pixmap ||
+      !notify_history_gc || !selmon || !selmon->barcenterwin)
+    return;
+  if (notify_width > notify_history_pixmap_w ||
+      notify_history_scroll < 0)
+    return;
+
+  /* Keep the viewport padding fixed while only scrolling the content region.
+   * The old GL path used a scissor rectangle for exactly this clipping. */
+  pad = MIN((unsigned int)NOTIFY_PADDING, notify_height / 2U);
+  content_h = notify_height - 2U * pad;
+  content_src_y = pad + (unsigned int)notify_history_scroll;
+  if (notify_history_pixmap_h < content_src_y)
+    return;
+  content_h = MIN(content_h, notify_history_pixmap_h - content_src_y);
+  if (notify_history_dest_window != selmon->barcenterwin) {
+    if (notify_history_dest_picture)
+      XRenderFreePicture(dpy, notify_history_dest_picture);
+    notify_history_dest_picture = None;
+    notify_history_dest_window = selmon->barcenterwin;
+  }
+  if (notify_history_picture &&
+      notification_history_background_create() &&
+      notification_history_mask_create(notify_width, notify_height) &&
+      (notify_history_dest_picture ||
+       (XGetWindowAttributes(dpy, selmon->barcenterwin, &attr) &&
+        (dest_format = XRenderFindVisualFormat(dpy, attr.visual)) &&
+        (notify_history_dest_picture = XRenderCreatePicture(
+             dpy, selmon->barcenterwin, dest_format, 0, NULL))))) {
+    XRenderComposite(dpy, PictOpSrc, notify_history_background_picture,
+                     notify_history_mask_picture, notify_history_dest_picture,
+                     0, 0, 0, 0, 0, 0, notify_width, notify_height);
+    if (content_h)
+      XRenderComposite(dpy, PictOpOver, notify_history_picture, None,
+                       notify_history_dest_picture,
+                       0, (int)content_src_y, 0, (int)pad, 0, (int)pad,
+                       notify_width, content_h);
+    XFlush(dpy);
+    return;
+  }
+  if (pad) {
+    XCopyArea(dpy, notify_history_pixmap, selmon->barcenterwin,
+              notify_history_gc, 0, 0, notify_width, pad, 0, 0);
+    XCopyArea(dpy, notify_history_pixmap, selmon->barcenterwin,
+              notify_history_gc, 0, 0, notify_width, pad, 0,
+              (int)(notify_height - pad));
+  }
+  if (content_h)
+    XCopyArea(dpy, notify_history_pixmap, selmon->barcenterwin,
+              notify_history_gc, 0, (int)content_src_y, notify_width,
+              content_h, 0, (int)pad);
+  XFlush(dpy);
+}
+
+static void notification_history_draw_time(const Notification *n, int x,
+                                          int y, unsigned int content_h,
+                                          int dimmed) {
+  static const unsigned int time_offsets[] = {0, 3, 6};
+  char fallback[] = "00-00-00";
+  const char *value = n && n->received_time[0] ? n->received_time : fallback;
+  GLFont *font = notification_history_time_font_get();
+  unsigned int line_h, stack_h, col_w;
+  unsigned int gap;
+  int ascender, stack_y;
+
+  if (!font)
+    return;
+  line_h = (unsigned int)MAX(font->height, 1);
+  col_w = notification_history_time_column_width();
+  gap = notification_history_time_gap();
+  stack_h = notification_history_time_height();
+  ascender = font->face_count
+      ? MAX(1, (int)(font->faces[0].face->size->metrics.ascender >> 6))
+      : MAX(1, (int)(line_h * 3 / 4));
+  stack_y = y + MAX(0, ((int)content_h - (int)stack_h) / 2);
+  for (unsigned int row = 0; row < NOTIFY_HISTORY_TIME_ROWS; row++) {
+    int row_y;
+
+    if (row == 1 || row == 3) {
+      float rule_w = MIN(12.0f, (float)col_w);
+      float rule_h = 1.0f;
+      float rule_x = x + (col_w - rule_w) / 2.0f;
+      unsigned int group = row / 2;
+      float rule_y = stack_y + group * (line_h + gap) +
+                     line_h + (gap - rule_h) / 2.0f;
+
+      glDisable(GL_TEXTURE_2D);
+      glEnable(GL_BLEND);
+      notification_gl_blend_separate();
+      glColor4f(dimmed ? 0.48f : 0.66f,
+                dimmed ? 0.51f : 0.69f,
+                dimmed ? 0.55f : 0.74f, 1.0f);
+      glBegin(GL_QUADS);
+      glVertex2f(rule_x, rule_y);
+      glVertex2f(rule_x + rule_w, rule_y);
+      glVertex2f(rule_x + rule_w, rule_y + rule_h);
+      glVertex2f(rule_x, rule_y + rule_h);
+      glEnd();
+      glDisable(GL_BLEND);
+    } else {
+      char part[3] = {0};
+      unsigned int text_w;
+      int text_x;
+
+      row_y = stack_y + (int)(row / 2) *
+          ((int)line_h + (int)gap);
+      memcpy(part, value + time_offsets[row / 2], 2);
+      text_w = gl_font_text_width_for(font, part);
+      text_x = x + MAX(0, ((int)col_w - (int)text_w) / 2);
+      gl_font_draw_text_alpha_for(
+          font, part, text_x, row_y + ascender, col_w,
+          dimmed ? 0.48f : 0.66f, dimmed ? 0.51f : 0.69f,
+          dimmed ? 0.55f : 0.74f, 1.0f, 0);
     }
   }
 }
 
 static void notification_history_draw(void) {
   Notification *n;
-  Notification *entries[NOTIFY_HISTORY_MAX];
-  unsigned int count = 0, index;
-  int y, text_x, text_w, entry_bottom, body_bottom;
-  int action_y, input_y;
-  unsigned int entry_h;
+  unsigned int w = notify_width, h = notification_history_surface_height();
+  unsigned int pad = NOTIFY_PADDING, content_w, media_w, time_col_w;
+  int line_h, body_line_h, ascender, y;
 
-  notification_history_layout();
-  for (n = notify_history_head; n && count < LENGTH(entries); n = n->next)
-    entries[count++] = n;
-  XSetForeground(drw->dpy, drw->gc, notify_bg.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0,
-                 notify_width, notify_height);
-  for (index = 0; index < count; index++) {
-    /* The newest notification is shown at the top. */
-    n = entries[count - 1 - index];
-    unsigned int image_w, image_h, content_h;
-    int has_summary, has_body, has_two_content, controls_h, text_y;
-    entry_h = notification_history_entry_height(n);
-    y = -notify_history_scroll;
-    for (unsigned int previous = 0; previous < index; previous++)
-      y += notification_history_entry_height(entries[count - 1 - previous]);
-    entry_bottom = y + entry_h;
-    has_summary = n->summary && *n->summary;
-    has_body = n->body && *n->body;
-    has_two_content = (has_summary && has_body) ||
-                      (n->image && (has_summary || has_body));
-    controls_h = (n->input_enabled ? NOTIFY_INPUT_ROW_H : 0) +
-                 (n->action_count > 2 ? NOTIFY_BUTTON_ROW_H : 0);
-    content_h = entry_h - controls_h;
-    if (entry_bottom <= 0 || y >= (int)notify_height)
+  if (!notify_history_active || !notify_history_count || !w || !h ||
+      !selmon || !selmon->barcenterwin)
+    return;
+  if ((notify_history_pixmap_w != w || notify_history_pixmap_h != h ||
+       !notify_history_pixmap || !notify_history_gc) &&
+      !notification_history_cache_create(w, h))
+    return;
+  if (notification_frame_cached(1)) {
+    notification_history_present();
+    return;
+  }
+  if (!notification_gl_init(w, h))
+    return;
+  if (!gl_font)
+    gl_font = gl_font_create();
+  if (!gl_font)
+    return;
+  content_w = w > 2U * pad ? w - 2U * pad : 1U;
+  time_col_w = notification_history_time_column_width();
+  media_w = content_w > time_col_w + NOTIFY_HISTORY_TIME_GAP
+                ? content_w - time_col_w - NOTIFY_HISTORY_TIME_GAP
+                : 1U;
+  line_h = MAX(gl_font->height, 1);
+  body_line_h = MAX((int)ceil(gl_font->pixel_size) +
+                        NOTIFY_BODY_LINE_GAP,
+                    1);
+  ascender = MAX(1, (int)(gl_font->faces[0].face->size->metrics.ascender >> 6));
+
+  glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho(0, w, h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDisable(GL_TEXTURE_2D);
+  glEnable(GL_SCISSOR_TEST);
+  glScissor((GLint)pad, (GLint)pad, (GLsizei)content_w,
+            (GLsizei)(h - 2U * pad));
+
+  y = (int)pad;
+  for (n = notify_history_head; n; n = n->next) {
+    unsigned int entry_h = notification_history_entry_height(n);
+    unsigned int content_h = notification_history_content_height(n);
+    unsigned int img_w = 0, img_h = 0, body_w;
+    unsigned int body_lines = 0, text_h;
+    int has_summary = n->summary && *n->summary;
+    int has_body = n->body && *n->body;
+    int dimmed = n->action_used ||
+                 (n->action_count < 2 && !n->input_enabled);
+    int text_y, baseline, controls_y, image_x, image_y, text_x;
+
+    if (y + (int)entry_h <= (int)pad) {
+      y += (int)entry_h;
       continue;
-    text_x = 12;
-    text_w = notify_width - 24;
-    if (n->image) {
-      /* The picture has already been resized when the notification was
-       * received.  Use its real dimensions here: drw_pic composites the
-       * source without scaling, so drawing it into a different aspect ratio
-       * would crop or distort it. */
-      image_w = n->image_w;
-      image_h = n->image_h;
-      text_x = 12 + image_w + 8;
-      text_w = notify_width - text_x - 12;
-      drw_pic(drw, 12, y + ((int)content_h - image_h) / 2,
-              image_w, image_h, n->image);
     }
-    drw_setscheme(drw, notify_summary_scheme);
-    text_y = has_two_content ? y + 7 + NOTIFY_TEXT_TOP_OFFSET
-                             : y + MAX(0, ((int)content_h -
-                                           (drw->fonts->h + 8)) / 2);
-    if (has_summary)
-      drw_text(drw, text_x, text_y, text_w,
-               drw->fonts->h + 6, 8,
-               n->summary, 0);
-    drw_setscheme(drw, notify_body_scheme);
-    action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count > 2
-                  ? action_y - NOTIFY_INPUT_ROW_H
-                  : entry_bottom - NOTIFY_INPUT_ROW_H;
-    body_bottom = entry_bottom - 6;
-    if (n->action_count > 2)
-      body_bottom = MIN(body_bottom, action_y - 4);
-    if (n->input_enabled)
-      body_bottom = MIN(body_bottom, input_y - 4);
-    notification_draw_text(text_x, has_two_content
-                                      ? y + 32 + NOTIFY_TEXT_TOP_OFFSET
-                                      : text_y,
-                           text_w,
-                           MIN(body_bottom, (int)notify_height), n->body);
-    if (n->input_enabled) {
-      notify_input_x = 8;
-      notify_input_y = input_y;
-      notify_input_w = notify_width - 16;
-      notify_input_h = NOTIFY_ACTION_H - 6;
-      drw_setscheme(drw, notify_history_hover_entry == n &&
-                            notify_history_hover_action == -2
-                            ? notify_control_hover_scheme
-                            : notify_control_scheme);
-      drw_rect(drw, notify_input_x, notify_input_y, notify_input_w,
-               notify_input_h, 1, 1);
-      drw_text(drw, notify_input_x + 6, notify_input_y,
-               notify_input_w - 12, notify_input_h, 6,
-               n->input_text && *n->input_text ? n->input_text
-                                                : n->input_placeholder,
-               0);
-    }
-    if (n->action_count > 2) {
-      unsigned int i, x = NOTIFY_ACTION_X;
-      for (i = 1; i < n->action_count; i += 2) {
-        unsigned int w = notification_text_width(n->actions[i]) + 24;
-        if (x + w > notify_width - 8)
-          break;
-        drw_setscheme(drw, notify_history_hover_entry == n &&
-                              notify_history_hover_action == (int)(i / 2)
-                              ? notify_action_hover_scheme
-                              : notify_action_scheme);
-        drw_text(drw, x, action_y, w, NOTIFY_BUTTON_H, 12,
-                 n->actions[i], 0);
-        x += w + 6;
+    if (y >= (int)(h - pad))
+      break;
+
+    if (n->image && n->image_w && n->image_h) {
+      img_h = MIN(n->image_h, (unsigned int)NOTIFY_IMAGE_MAX_H);
+      img_w = (unsigned int)((uint64_t)n->image_w * img_h / n->image_h);
+      if (img_w > 100) {
+        img_w = 100;
+        img_h = MAX(1U, (unsigned int)((uint64_t)n->image_h * img_w /
+                                       n->image_w));
       }
     }
-    if (index + 1 < count) {
-      XSetForeground(drw->dpy, drw->gc, notify_body.pixel);
-      XDrawLine(drw->dpy, drw->drawable, drw->gc, 8, entry_bottom - 1,
-                notify_width - 8, entry_bottom - 1);
+    body_w = media_w;
+    if (img_w)
+      body_w = body_w > img_w + 12 ? body_w - img_w - 12 : 1;
+    image_x = (int)pad + (int)time_col_w + NOTIFY_HISTORY_TIME_GAP;
+    image_y = y + (int)(content_h - img_h) / 2;
+    text_x = image_x + (img_w ? (int)img_w + 12 : 0);
+    if (!img_w)
+      text_x += NOTIFY_HISTORY_TEXT_ONLY_OFFSET;
+    if (has_body)
+      body_lines = notification_body_wrap(n, body_w,
+                                          NOTIFY_HISTORY_BODY_MAX_LINES);
+    text_h = notification_text_block_height(has_summary, body_lines);
+    text_y = y + MAX(0, ((int)content_h - (int)text_h) / 2);
+    baseline = text_y + ascender;
+
+    notification_history_draw_time(n, (int)pad, y, content_h, dimmed);
+
+    if (img_w && n->img_pixels && n->img_w && n->img_h) {
+      notification_image_texture_create(n);
+      if (n->img_texture)
+        glBindTexture(GL_TEXTURE_2D, n->img_texture);
+      if (n->img_texture) {
+        glEnable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        notification_gl_blend_separate();
+        glColor4f(dimmed ? 0.68f : 1.0f,
+                  dimmed ? 0.70f : 1.0f,
+                  dimmed ? 0.73f : 1.0f, 1.0f);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f((float)image_x, (float)image_y);
+        glTexCoord2f(1, 0); glVertex2f((float)image_x + img_w, (float)image_y);
+        glTexCoord2f(1, 1); glVertex2f((float)image_x + img_w, (float)image_y + img_h);
+        glTexCoord2f(0, 1); glVertex2f((float)image_x, (float)image_y + img_h);
+        glEnd();
+        glDisable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+      }
     }
+    if (has_summary) {
+      gl_font_draw_text(n->summary, text_x, baseline,
+                        body_w, dimmed ? 0.84f : 1.0f,
+                        dimmed ? 0.86f : 1.0f,
+                        dimmed ? 0.90f : 1.0f);
+      baseline += line_h + 2;
+    }
+    if (has_body)
+      notification_gl_draw_body(n, text_x,
+                                &baseline, body_line_h, body_w,
+                                NOTIFY_HISTORY_BODY_MAX_LINES,
+                                dimmed ? 0.56f : 0.82f,
+                                dimmed ? 0.58f : 0.85f,
+                                dimmed ? 0.61f : 0.9f);
+
+    controls_y = y + (int)content_h;
+    if (n->input_enabled) {
+      const char *value = n->input_text && *n->input_text
+          ? n->input_text : n->input_placeholder;
+      float r = n->input_text && *n->input_text ? 0.92f : 0.58f;
+      float g = n->input_text && *n->input_text ? 0.93f : 0.61f;
+      float b = n->input_text && *n->input_text ? 0.96f : 0.66f;
+      gl_font_draw_text(value ? value : "", (int)pad,
+                        controls_y + MAX(0, (NOTIFY_INPUT_ROW_H - line_h) / 2) + ascender,
+                        content_w, r, g, b);
+      controls_y += NOTIFY_INPUT_ROW_H;
+    }
+    if (n->action_count >= 4) {
+      unsigned int actions = MIN(n->action_count / 2, 16U);
+      unsigned int cell_w = actions ? content_w / actions : content_w;
+      for (unsigned int i = 0; i < actions; i++) {
+        const char *label = n->actions[i * 2 + 1];
+        unsigned int label_w = notification_text_width(label);
+        int label_x = (int)pad +
+                      (int)((i + 1 == actions ? content_w : (i + 1) * cell_w)) -
+                      (int)MIN(label_w, cell_w);
+        int hovered = notify_history_hover_action == (int)i;
+        gl_font_draw_text(label, label_x,
+                          controls_y + MAX(0, (NOTIFY_BUTTON_H - line_h) / 2) + ascender,
+                          cell_w, hovered ? 1.0f : 0.82f,
+                          hovered ? 1.0f : 0.85f,
+                          hovered ? 1.0f : 0.9f);
+      }
+    }
+
+    y += (int)entry_h;
   }
+  glDisable(GL_SCISSOR_TEST);
+  notification_present_gl(w, h, notify_history_pixmap);
+  notify_render_cache_hash = notification_frame_hash(1);
+  notify_render_cache_valid = 1;
+  notification_history_present();
+}
+
+static void notification_draw_foreground(int history) {
+  if (history)
+    notification_history_draw();
+  else
+    notification_draw();
+}
+
+static void notification_present_layers(int history) {
+  notification_draw_foreground(history);
 }
 
 static void notification_motion(XMotionEvent *ev) {
@@ -3815,11 +8913,12 @@ static void notification_motion(XMotionEvent *ev) {
   else if (n->action_count >= 2) {
     for (i = 0; i < LENGTH(notify_action_x); i++)
       if (notify_action_w[i] && ev->x >= notify_action_x[i] &&
-          ev->x < notify_action_x[i] + notify_action_w[i] &&
-           ev->y >= notify_height - NOTIFY_ACTION_H &&
-           ev->y < notify_height) {
-        hover = (int)i;
-        break;
+          ev->x < notify_action_x[i] + notify_action_w[i]) {
+        int button_y = notification_action_row_y(n);
+        if (ev->y >= button_y && ev->y < button_y + NOTIFY_BUTTON_H) {
+          hover = (int)i;
+          break;
+        }
       }
   }
   if (hover != notify_hover) {
@@ -3829,209 +8928,165 @@ static void notification_motion(XMotionEvent *ev) {
 }
 
 static void notification_history_motion(XMotionEvent *ev) {
-  Notification *n;
-  Notification *entries[NOTIFY_HISTORY_MAX];
-  unsigned int count = 0, index, action;
-  unsigned int entry_h, action_w;
-  int content_y, y = 0, entry_bottom, action_y, input_y, action_x;
-  int hover_action = -1;
-  int hover_input = 0;
+  Notification *n, *hovered = NULL;
+  int entry_y = NOTIFY_PADDING - notify_history_scroll;
+  int local_y = 0, action = -1;
+  unsigned int content_w = notify_width > 2U * NOTIFY_PADDING
+                               ? notify_width - 2U * NOTIFY_PADDING : 1U;
 
-  for (n = notify_history_head; n && count < LENGTH(entries); n = n->next)
-    entries[count++] = n;
-  content_y = ev->y + notify_history_scroll;
-  for (index = 0; index < count; index++) {
-    n = entries[count - index - 1];
-    entry_h = notification_history_entry_height(n);
-    if (content_y >= y && content_y < y + (int)entry_h)
+  if (!notify_history_active)
+    return;
+  for (n = notify_history_head;
+       ev->y >= (int)NOTIFY_PADDING &&
+       ev->y < (int)(notify_height - NOTIFY_PADDING) && n; n = n->next) {
+    unsigned int entry_h = notification_history_entry_height(n);
+    if (ev->y >= entry_y &&
+        ev->y < entry_y + (int)notification_history_entry_content_height(n)) {
+      hovered = n;
+      local_y = ev->y - entry_y;
       break;
-    y += entry_h;
-  }
-  if (index < count) {
-    n = entries[count - index - 1];
-    y -= notify_history_scroll;
-    entry_bottom = y + entry_h;
-    action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count > 2
-                  ? action_y - NOTIFY_INPUT_ROW_H
-                  : entry_bottom - NOTIFY_INPUT_ROW_H;
-    if (n->input_enabled &&
-        ev->x >= 8 && ev->x < (int)notify_width - 8 &&
-        ev->y >= input_y && ev->y < input_y + NOTIFY_INPUT_ROW_H)
-      hover_input = 1;
-    if (n->action_count > 2 &&
-        ev->y >= action_y &&
-        ev->y < action_y + NOTIFY_ACTION_H) {
-      action_x = NOTIFY_ACTION_X;
-      for (action = 1; action < n->action_count; action += 2) {
-        action_w = notification_text_width(n->actions[action]) + 24;
-        if (action_x + (int)action_w > (int)notify_width - 8)
-          break;
-        if (ev->x >= action_x && ev->x < action_x + (int)action_w) {
-          hover_action = (int)(action / 2);
-          break;
-        }
-        action_x += action_w + 6;
-      }
     }
-    if (hover_input)
-      hover_action = -2;
-  } else {
-    n = NULL;
+    entry_y += (int)entry_h;
   }
-  if (notify_history_hover_entry != n ||
-      notify_history_hover_action != hover_action) {
-    notify_history_hover_entry = n;
-    notify_history_hover_action = hover_action;
+
+  if (hovered && hovered->action_count >= 4 &&
+      ev->x >= NOTIFY_PADDING && ev->x < (int)(NOTIFY_PADDING + content_w) &&
+      local_y >= (int)notification_history_content_height(hovered) +
+                     (hovered->input_enabled ? NOTIFY_INPUT_ROW_H : 0) &&
+      local_y < (int)notification_history_entry_height(hovered)) {
+    unsigned int count = MIN(hovered->action_count / 2, 16U);
+    unsigned int cell_w = count ? content_w / count : content_w;
+    action = MIN((int)((ev->x - (int)NOTIFY_PADDING) / MAX(cell_w, 1U)),
+                 (int)count - 1);
+  }
+  if (notify_history_hover_entry != hovered ||
+      notify_history_hover_action != action) {
+    notify_history_hover_entry = hovered;
+    notify_history_hover_action = action;
+    if (hovered)
+      clock_gettime(CLOCK_MONOTONIC, &notify_history_hover_started);
+    /* Hover only changes action-label color; history geometry is unchanged. */
     drawbars();
   }
 }
 
 static int notification_history_buttonpress(XButtonPressedEvent *ev) {
   Notification *n;
-  Notification *entries[NOTIFY_HISTORY_MAX];
-  unsigned int count = 0, index;
-  unsigned int entry_h;
-  int y, entry_bottom, action_y, input_y, content_y;
-  int action_x, action_w;
-  int old_target;
+  int entry_y = NOTIFY_PADDING - notify_history_scroll;
+  unsigned int content_w = notify_width > 2U * NOTIFY_PADDING
+                               ? notify_width - 2U * NOTIFY_PADDING : 1U;
 
   if (!notify_history_active)
     return 0;
-  /* Middle and right clicks must not alter history.  Left clicks are handled
-   * below only when they land on an action button or input field. */
-  if (ev->button == Button2 || ev->button == Button3)
-    return 1;
-  if (ev->button != Button4 && ev->button != Button5) {
-    if (ev->button != Button1)
+  if (ev->button == Button4 || ev->button == Button5) {
+    int max_scroll = 0, old_target = notify_history_scroll_target;
+    int was_animating =
+        notify_history_scroll != notify_history_scroll_target;
+    int base_scroll = was_animating ? notify_history_scroll_target
+                                    : notify_history_scroll;
+    unsigned int total = 0;
+    unsigned int viewport_h = notify_height > 2U * NOTIFY_PADDING
+                                 ? notify_height - 2U * NOTIFY_PADDING : 0;
+    for (n = notify_history_head; n; n = n->next)
+      total += notification_history_entry_height(n);
+    if (total > viewport_h)
+      max_scroll = (int)(total - viewport_h);
+    notify_history_scroll_target = MAX(0, MIN(max_scroll,
+        base_scroll + (ev->button == Button4 ? -60 : 60)));
+    if (notify_history_scroll_target == old_target)
       return 1;
-    for (n = notify_history_head; n && count < NOTIFY_HISTORY_MAX;
-         n = n->next)
-      entries[count++] = n;
-    if (ev->y < 0 || ev->y >= (int)notify_height)
-      return 1;
-    content_y = (int)ev->y + notify_history_scroll;
-    y = 0;
-    for (index = 0; index < count; index++) {
-      n = entries[count - index - 1];
-      entry_h = notification_history_entry_height(n);
-      if (content_y >= y && content_y < y + (int)entry_h)
-        break;
-      y += entry_h;
-    }
-    if (index >= count)
-      return 1;
-    n = entries[count - index - 1];
-    y -= notify_history_scroll;
-    entry_bottom = y + entry_h;
-    action_y = entry_bottom - NOTIFY_ACTION_H;
-    input_y = n->action_count > 2
-                  ? action_y - NOTIFY_INPUT_ROW_H
-                  : entry_bottom - NOTIFY_INPUT_ROW_H;
-    if (n->input_enabled && ev->y >= input_y && ev->y < input_y +
-        NOTIFY_INPUT_ROW_H && ev->x >= 8 && ev->x < (int)notify_width - 8) {
-      if (ev->button == Button1) {
-        notify_history_input = n;
-        notify_input_focus = 1;
-        XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent,
-                       CurrentTime);
-        XFlush(dpy);
-      }
-      return 1;
-    }
-    if (n->action_count > 2 && ev->y >= action_y &&
-        ev->y < action_y + NOTIFY_ACTION_H) {
-      action_x = NOTIFY_ACTION_X;
-      for (unsigned int action = 1; action < n->action_count; action += 2) {
-        action_w = notification_text_width(n->actions[action]) + 24;
-        if (action_x + action_w > (int)notify_width - 8)
-          break;
-        if (ev->x >= action_x && ev->x < action_x + action_w) {
-          if (ev->button == Button1) {
-            notification_emit_action(n, n->actions[action - 1]);
-            /* Match active-notification behavior: the application receives
-             * both the action and the close notification for this ID. */
-            notification_emit_closed(n, 2);
-            notification_history_clear_controls(n);
-            if (notify_history_input == n) {
-              notify_history_input = NULL;
-              notify_input_focus = 0;
-            }
-            notification_history_layout();
-            drawbars();
-          }
-          return 1;
-        }
-        action_x += action_w + 6;
-      }
-    }
-    if (ev->button == Button1 && n->action_count == 2) {
-      notification_emit_action(n, n->actions[0]);
-      notification_emit_closed(n, 2);
-      notification_history_clear_controls(n);
-      if (notify_history_input == n) {
-        notify_history_input = NULL;
-        notify_input_focus = 0;
-      }
-      notification_history_layout();
-      drawbars();
-    }
-    /* Notifications with one action use the content as their action target. */
+    if (!was_animating)
+      clock_gettime(CLOCK_MONOTONIC, &notify_history_scroll_started);
+    drawbars();
     return 1;
   }
-  old_target = notify_history_scroll_target;
-  if (ev->button == Button4)
-    notify_history_scroll_target -= NOTIFY_HISTORY_ENTRY_H;
-  else
-    notify_history_scroll_target += NOTIFY_HISTORY_ENTRY_H;
-  notification_history_layout();
-  if (notify_history_scroll_target != old_target) {
-    /* Start a new transition at the currently displayed pixel position so
-     * repeated wheel input remains continuous. */
-    notify_history_scroll_start = notify_history_scroll;
-    notify_history_scroll_end = notify_history_scroll_target;
-    clock_gettime(CLOCK_MONOTONIC, &notify_history_scroll_started);
-    drawbars();
+  if (ev->button != Button1)
+    return 1;
+  if (ev->x < (int)NOTIFY_PADDING ||
+      ev->x >= (int)(NOTIFY_PADDING + content_w) ||
+      ev->y < (int)NOTIFY_PADDING ||
+      ev->y >= (int)(notify_height - NOTIFY_PADDING))
+    return 1;
+
+  for (n = notify_history_head; n; n = n->next) {
+    unsigned int entry_h = notification_history_entry_height(n);
+    int local_y = ev->y - entry_y;
+    int controls_y = (int)notification_history_content_height(n);
+    if (ev->y >= entry_y && ev->y < entry_y + (int)entry_h) {
+      if (local_y >= (int)notification_history_entry_content_height(n))
+        return 1;
+      if (n->input_enabled && local_y >= controls_y &&
+          local_y < controls_y + NOTIFY_INPUT_ROW_H) {
+        notify_history_input = n;
+        notify_input_focus = 1;
+        XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent, CurrentTime);
+        drawbars();
+        return 1;
+      }
+      controls_y += n->input_enabled ? NOTIFY_INPUT_ROW_H : 0;
+      if (n->action_count >= 4 && local_y >= controls_y &&
+          local_y < controls_y + NOTIFY_BUTTON_H) {
+        unsigned int count = MIN(n->action_count / 2, 16U);
+        unsigned int cell_w = count ? MAX(content_w / count, 1U) : content_w;
+        unsigned int index = MIN((unsigned int)(ev->x - (int)NOTIFY_PADDING) /
+                                     cell_w,
+                                 count ? count - 1 : 0);
+        notification_emit_action(n, n->actions[index * 2]);
+        notification_emit_closed(n, 2);
+        notification_history_clear_controls(n);
+        if (notify_history_input == n)
+          notify_history_input = NULL;
+        notify_input_focus = 0;
+        notification_history_layout();
+        drawbars();
+        resizebarwin(selmon);
+        return 1;
+      }
+      if (n->action_count >= 2) {
+        notification_emit_action(n, n->actions[0]);
+        notification_emit_closed(n, 2);
+        notification_history_clear_controls(n);
+        notification_history_layout();
+        drawbars();
+        resizebarwin(selmon);
+      }
+      return 1;
+    }
+    entry_y += (int)entry_h;
   }
   return 1;
 }
 
 static int notification_history_tick(void) {
   struct timespec now;
-  double elapsed, progress, u, lo, hi, x;
-  int i;
+  double elapsed, fraction;
+  int delta, step;
 
   if (!notify_history_active ||
       notify_history_scroll == notify_history_scroll_target)
     return 0;
 
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  elapsed = (double)(now.tv_sec - notify_history_scroll_started.tv_sec) * 1000.0 +
-            (double)(now.tv_nsec - notify_history_scroll_started.tv_nsec) /
-            1000000.0;
-  progress = MIN(1.0, MAX(0.0, elapsed / NOTIFY_HISTORY_SCROLL_MS));
+  /* Mouse/event traffic can keep poll() returning immediately.  Rate-limit
+   * actual scroll frames here as well as bounding the idle poll timeout. */
+  if (notification_elapsed(&notify_history_scroll_started) <
+      1.0 / NOTIFY_HISTORY_FPS)
+    return 1;
 
-  /* cubic-bezier(0, .6, .4, 1). Solve the X component for the
-   * parametric position, then evaluate the Y component. */
-  lo = 0.0;
-  hi = 1.0;
-  for (i = 0; i < 16; i++) {
-    u = (lo + hi) / 2.0;
-    x = 3.0 * (1.0 - u) * u * u * 0.4 + u * u * u;
-    if (x < progress)
-      lo = u;
-    else
-      hi = u;
-  }
-  u = (lo + hi) / 2.0;
-  progress = 3.0 * (1.0 - u) * (1.0 - u) * u * 0.6 +
-             3.0 * (1.0 - u) * u * u + u * u * u;
-  notify_history_scroll = notify_history_scroll_start +
-                          (int)((notify_history_scroll_end -
-                                 notify_history_scroll_start) * progress);
-  if (elapsed >= NOTIFY_HISTORY_SCROLL_MS)
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  elapsed = (double)(now.tv_sec - notify_history_scroll_started.tv_sec) +
+            (double)(now.tv_nsec - notify_history_scroll_started.tv_nsec) /
+            1000000000.0;
+  notify_history_scroll_started = now;
+  fraction = 1.0 - exp(-MAX(0.0, elapsed) / 0.055);
+  delta = notify_history_scroll_target - notify_history_scroll;
+  step = (int)lround(delta * fraction);
+  if (!step && delta)
+    step = delta > 0 ? 1 : -1;
+  if (abs(delta) <= 1)
     notify_history_scroll = notify_history_scroll_target;
-  drawbars();
+  else
+    notify_history_scroll += step;
+  notification_history_present();
   return 1;
 }
 
@@ -4052,6 +9107,8 @@ static void notification_emit_closed(Notification *n, uint32_t reason) {
 
 static void notification_emit_action(Notification *n, const char *action) {
   DBusMessage *signal;
+  if (n)
+    n->action_used = 1;
   if (!notify_conn || !n || !action)
     return;
   signal = dbus_message_new_signal("/org/freedesktop/Notifications",
@@ -4069,6 +9126,8 @@ static void notification_emit_input(Notification *n) {
   DBusMessage *signal;
   const char *action;
   const char *text;
+  if (n)
+    n->action_used = 1;
   if (!notify_conn || !n || !n->input_action)
     return;
   action = n->input_action;
@@ -4100,24 +9159,26 @@ static int notification_buttonpress(XButtonPressedEvent *ev) {
       notify_input_focus = 1;
       XSetInputFocus(dpy, selmon->barcenterwin, RevertToParent, CurrentTime);
       XFlush(dpy);
+      drawbars();
     }
     return 1;
   }
   for (i = 0; i < LENGTH(notify_action_x); i++) {
     if (notify_action_w[i] && ev->x >= notify_action_x[i] &&
-        ev->x < notify_action_x[i] + notify_action_w[i] &&
-           ev->y >= notify_height - NOTIFY_ACTION_H &&
-           ev->y < notify_height) {
-      in_action = 1;
-      if (ev->button == Button1) {
-        notification_emit_action(n, n->actions[i * 2]);
-        notification_emit_closed(n, 2);
-        /* An action was handled, so the archived copy keeps only the
-         * notification content, not controls which can no longer be used. */
-        notification_history_clear_controls(n);
-        notification_advance();
+        ev->x < notify_action_x[i] + notify_action_w[i]) {
+      int button_y = notification_action_row_y(n);
+      if (ev->y >= button_y && ev->y < button_y + NOTIFY_BUTTON_H) {
+        in_action = 1;
+        if (ev->button == Button1) {
+          notification_emit_action(n, n->actions[i * 2]);
+          notification_emit_closed(n, 2);
+          /* An action was handled, so the archived copy keeps only the
+           * notification content, not controls which can no longer be used. */
+          notification_history_clear_controls(n);
+          notification_advance();
+        }
+        return 1;
       }
-      return 1;
     }
   }
 
@@ -4160,8 +9221,7 @@ static int notification_input_keypress(XKeyEvent *ev) {
     if (history_input) {
       notification_history_clear_controls(n);
       notify_history_input = NULL;
-      notification_history_layout();
-      drawbars();
+      notification_history_hide();
     } else {
       notification_emit_closed(n, 2);
       notification_history_clear_controls(n);
@@ -4178,6 +9238,7 @@ static int notification_input_keypress(XKeyEvent *ev) {
       notify_history_input = NULL;
       notification_history_layout();
       drawbars();
+      resizebarwin(selmon);
     } else {
       notification_emit_closed(n, 2);
       notification_history_clear_controls(n);
@@ -4189,7 +9250,11 @@ static int notification_input_keypress(XKeyEvent *ev) {
   if (keysym == XK_BackSpace) {
     size_t length = n->input_text ? strlen(n->input_text) : 0;
     if (length) {
-      n->input_text[length - 1] = '\0';
+      do {
+        length--;
+      } while (length &&
+               (((unsigned char)n->input_text[length] & 0xc0) == 0x80));
+      n->input_text[length] = '\0';
       drawbars();
     }
     return 1;
@@ -4297,6 +9362,41 @@ static void notification_init(void) {
 
 static void notification_shutdown(void) {
   Notification *n, *next;
+  if (notify_history_gc) {
+    XFreeGC(dpy, notify_history_gc);
+    notify_history_gc = None;
+  }
+  if (notify_history_picture) {
+    XRenderFreePicture(dpy, notify_history_picture);
+    notify_history_picture = None;
+  }
+  if (notify_history_mask_picture) {
+    XRenderFreePicture(dpy, notify_history_mask_picture);
+    notify_history_mask_picture = None;
+  }
+  if (notify_history_dest_picture) {
+    XRenderFreePicture(dpy, notify_history_dest_picture);
+    notify_history_dest_picture = None;
+  }
+  if (notify_history_background_picture) {
+    XRenderFreePicture(dpy, notify_history_background_picture);
+    notify_history_background_picture = None;
+  }
+  if (notify_history_mask_pixmap) {
+    XFreePixmap(dpy, notify_history_mask_pixmap);
+    notify_history_mask_pixmap = None;
+  }
+  if (notify_history_background_pixmap) {
+    XFreePixmap(dpy, notify_history_background_pixmap);
+    notify_history_background_pixmap = None;
+  }
+  notify_history_mask_w = notify_history_mask_h = 0;
+  notify_history_dest_window = None;
+  if (notify_history_pixmap) {
+    XFreePixmap(dpy, notify_history_pixmap);
+    notify_history_pixmap = None;
+  }
+  notify_history_pixmap_w = notify_history_pixmap_h = 0;
   for (n = notify_current; n; n = next) {
     next = n->next;
     notification_free(n);
@@ -4312,12 +9412,70 @@ static void notification_shutdown(void) {
   notify_current = notify_head = notify_tail = NULL;
   notify_history_head = notify_history_tail = NULL;
   notify_history_count = 0;
+  if (finder_gl_picture) {
+    XRenderFreePicture(dpy, finder_gl_picture);
+    finder_gl_picture = None;
+  }
+  if (finder_gl_pixmap) {
+    XFreePixmap(dpy, finder_gl_pixmap);
+    finder_gl_pixmap = None;
+  }
+  finder_gl_pixmap_w = finder_gl_pixmap_h = 0;
+  if (finder_frame_picture) {
+    XRenderFreePicture(dpy, finder_frame_picture);
+    finder_frame_picture = None;
+  }
+  if (finder_frame_pixmap) {
+    XFreePixmap(dpy, finder_frame_pixmap);
+    finder_frame_pixmap = None;
+  }
+  finder_frame_pixmap_w = finder_frame_pixmap_h = 0;
   if (notify_conn) {
     dbus_bus_release_name(notify_conn, "org.freedesktop.Notifications", NULL);
     dbus_connection_remove_filter(notify_conn, notification_message, NULL);
     dbus_connection_unref(notify_conn);
     notify_conn = NULL;
   }
+
+  /* Cleanup OpenGL font while the notification context is current. */
+  if (notify_gl_ctx != None && notify_gl_pbuffer != None)
+    glXMakeCurrent(dpy, notify_gl_pbuffer, notify_gl_ctx);
+  finder_free_icons();
+  if (gl_font) {
+    gl_font_free(gl_font);
+    gl_font = NULL;
+  }
+  if (finder_query_gl_font) {
+    gl_font_free(finder_query_gl_font);
+    finder_query_gl_font = NULL;
+  }
+  if (finder_result_gl_font) {
+    gl_font_free(finder_result_gl_font);
+    finder_result_gl_font = NULL;
+  }
+  if (notify_history_time_font) {
+    gl_font_free(notify_history_time_font);
+    notify_history_time_font = NULL;
+  }
+
+  /* Cleanup FreeType */
+  if (ft_lib) {
+    FT_Done_FreeType(ft_lib);
+    ft_lib = NULL;
+  }
+
+  /* Cleanup OpenGL resources. */
+  if (notify_gl_ctx != None) {
+    glXMakeCurrent(dpy, None, NULL);
+    glXDestroyContext(dpy, notify_gl_ctx);
+    notify_gl_ctx = None;
+  }
+  if (notify_gl_pbuffer != None) {
+    glXDestroyPbuffer(dpy, notify_gl_pbuffer);
+    notify_gl_pbuffer = None;
+  }
+  notify_gl_pbuffer_w = notify_gl_pbuffer_h = 0;
+  notify_gl_initialized = 0;
 }
 
 void getkblayout(void) {
@@ -4398,7 +9556,8 @@ static void barwidths(Monitor *m, unsigned int *tw, unsigned int *tlw,
   /* Notifications participate in the bar layout and push the other bar
    * sections aside.  The visualizer is an overlay: its animated width must
    * not change the layout of the title, keyboard, or status sections. */
-   *cw = (notification_center_active() && m == selmon) ? notify_width : clockbar_cw;
+  *cw = finder_active && m == selmon ? finder_popup_width() :
+        ((notification_center_active() && m == selmon) ? notify_width : clockbar_cw);
   *kw = kblayoutwidth();
   *tw = tagsbarwidth(m);
   avail = (barW > *tw + *rw + *cw + *kw + 4 * bargap + stgap)
@@ -4409,13 +9568,1496 @@ static void barwidths(Monitor *m, unsigned int *tw, unsigned int *tlw,
     *tlw = avail;
 }
 
+static void map_center_window(Window win, int x, int y, unsigned int w,
+                              unsigned int h, int fade) {
+  if (finder_argb_visual)
+    if (fade == 4)
+      drw_map_alpha_background(drw, win, finder_argb_visual, x, y, w, h,
+                               notify_bg.pixel);
+    else if (fade == 2)
+      drw_map_alpha_notification(drw, win, finder_argb_visual, x, y, w, h,
+                                 0);
+    else
+      drw_map_alpha(drw, win, finder_argb_visual, x, y, w, h, fade);
+  else
+    drw_map(drw, win, x, y, w, h);
+}
+
+static int finder_fontset_text_width(Fnt *font, const char *text, size_t len) {
+  XGlyphInfo ext;
+  Fnt *curfont, *runfont;
+  const char *p, *run, *end;
+  FcChar32 codepoint;
+  int charlen, text_width = 0;
+
+  if (!font || !text)
+    return 0;
+  end = text + len;
+  run = p = text;
+  runfont = NULL;
+  while (p < end && *p) {
+    charlen = FcUtf8ToUcs4((const FcChar8 *)p, &codepoint, (int)(end - p));
+    if (charlen <= 0)
+      charlen = 1;
+    for (curfont = font; curfont; curfont = curfont->next)
+      if (XftCharExists(dpy, curfont->xfont, codepoint))
+        break;
+    if (!curfont)
+      curfont = font;
+    if (runfont && curfont != runfont) {
+      XftTextExtentsUtf8(dpy, runfont->xfont, (const FcChar8 *)run,
+                         (int)(p - run), &ext);
+      text_width += ext.xOff;
+      run = p;
+    }
+    runfont = curfont;
+    p += charlen;
+  }
+  if (runfont) {
+    XftTextExtentsUtf8(dpy, runfont->xfont, (const FcChar8 *)run,
+                       (int)(p - run), &ext);
+    text_width += ext.xOff;
+  }
+  return text_width;
+}
+
+/* OCR can leave a long query behind a short visible viewport. Cache its full
+ * width so animation frames only measure the text they actually draw. */
+static int finder_query_total_width(Fnt *font) {
+  static char measured_text[FINDER_MAX_QUERY];
+  static Fnt *measured_font;
+  static size_t measured_len = SIZE_MAX;
+  static int measured_width;
+  size_t len = strlen(finder_query);
+
+  if (font != measured_font || len != measured_len ||
+      len >= sizeof(measured_text) || memcmp(finder_query, measured_text, len)) {
+    measured_width = finder_fontset_text_width(font, finder_query, len);
+    measured_font = font;
+    measured_len = len;
+    if (len < sizeof(measured_text))
+      memcpy(measured_text, finder_query, len + 1);
+  }
+  return measured_width;
+}
+
+/* Let a translation widen Finder to fit its longest displayed line, without
+ * allowing the center popup to overlap the other bar sections. */
+static unsigned int finder_popup_width(void) {
+  char display[FINDER_GL_TEXT_MAX + 1];
+  const char *texts[] = {finder_translate_result, finder_translate_outgoing};
+  Fnt *font = finder_result_font ? finder_result_font : drw->fonts;
+  unsigned int width = (unsigned int)finder_width;
+  int max_line_width = 0;
+
+  if (!finder_active || !font)
+    return width;
+
+  for (unsigned int i = 0; i < LENGTH(texts); i++) {
+    const char *line, *p;
+
+    if (!texts[i] || !texts[i][0])
+      continue;
+    finder_gl_text_copy(texts[i], display, sizeof(display));
+    line = p = display;
+    for (;;) {
+      if (*p == '\n' || *p == '\0') {
+        max_line_width = MAX(max_line_width,
+            finder_fontset_text_width(font, line, (size_t)(p - line)));
+        if (!*p)
+          break;
+        line = p + 1;
+      }
+      p++;
+    }
+  }
+
+  if (max_line_width > 0) {
+    unsigned int desired = (unsigned int)max_line_width + 2U * FINDER_EDGE;
+    int bar_width, max_width, stw = 0, stgap = 0;
+    Monitor *m = selmon;
+
+    width = MAX(width, desired);
+    if (!m)
+      return width;
+    if (showsystray && m == systraytomon(m)) {
+      stw = (int)getsystraywidth();
+      if (stw)
+        stgap = bargap;
+    }
+    bar_width = floatbar ? m->ww - 2 * m->gappov : m->ww;
+    max_width = bar_width - (int)tagsbarwidth(m) -
+                (int)statuswidth(stext) - (int)kblayoutwidth() -
+                4 * bargap - stw - stgap - 1;
+    max_width = MAX(max_width, finder_width);
+    width = MIN(width, (unsigned int)max_width);
+  }
+  /* During translation the query is rendered at the enlarged waiting size.
+   * Let it widen the popup as well, otherwise a growing query remains in the
+   * old narrow viewport while the result can later expand the window. */
+  if (finder_translate_pending && finder_query[0]) {
+    unsigned int query_width = (unsigned int)finder_query_total_width(drw->fonts);
+    unsigned int desired = (unsigned int)ceil(query_width * 1.15) +
+                           2U * FINDER_EDGE;
+
+    width = MAX(width, desired);
+  }
+  /* Translation results wrap in a narrow, predictable column. */
+  return MIN(width, 550U);
+}
+
+/* Return a UTF-8-safe slice of the query. Keep its left edge stable while the
+ * cursor moves inside the visible range, shifting only when the cursor would
+ * cross an edge. */
+static void finder_query_viewport(const char *text, Fnt *font,
+                                  unsigned int width, char *out,
+                                  size_t out_size, size_t *cursor_pos) {
+  size_t len, cursor, start, end, next, previous, copy_len;
+  int available, prefix_width, previous_width, growth;
+
+  if (!out || !out_size)
+    return;
+  out[0] = '\0';
+  if (cursor_pos)
+    *cursor_pos = 0;
+  if (!text || !font)
+    return;
+  len = strlen(text);
+  cursor = MIN(finder_cursor, len);
+  available = MAX(1, (int)width - 4);
+  previous_width = (int)finder_query_view_width;
+  growth = finder_query_view_width && available > previous_width
+               ? available - previous_width : 0;
+  finder_query_view_width = (unsigned int)available;
+  start = MIN(finder_query_view_start, len);
+  while (start > 0 && ((unsigned char)text[start] & 0xc0) == 0x80)
+    start = finder_cursor_prev(text, start);
+
+  /* If the text fits again, restore the normal centered layout. Otherwise
+   * retain the viewport until the cursor actually reaches one of its edges. */
+  if (finder_query_total_width(font) <= available) {
+    start = 0;
+  } else if (cursor < start) {
+    start = cursor;
+  } else {
+    prefix_width = finder_fontset_text_width(font, text + start,
+                                              cursor - start);
+    /* When the popup becomes wider, spend the added room on text before the
+     * cursor as well. Otherwise a query scrolled to its end keeps the same
+     * left edge and looks frozen until the cursor moves. */
+    while (growth > 0 && start > 0) {
+      previous = finder_cursor_prev(text, start);
+      {
+        int expanded_width = finder_fontset_text_width(
+            font, text + previous, cursor - previous);
+        int added_width = expanded_width - prefix_width;
+
+        if (added_width > growth)
+          break;
+        start = previous;
+        prefix_width = expanded_width;
+        growth -= MAX(added_width, 0);
+      }
+    }
+    if (prefix_width > available && start < cursor) {
+      size_t too_wide = start, fits = cursor;
+
+      /* Find the first codepoint boundary whose suffix fits. Re-shaping every
+       * progressively shorter suffix is quadratic for long OCR queries. */
+      while (finder_cursor_next(text, too_wide) < fits) {
+        size_t mid = too_wide + (fits - too_wide) / 2;
+        int width;
+
+        while (mid < fits && ((unsigned char)text[mid] & 0xc0) == 0x80)
+          mid++;
+        if (mid >= fits)
+          mid = finder_cursor_prev(text, fits);
+        if (mid <= too_wide)
+          mid = finder_cursor_next(text, too_wide);
+        width = finder_fontset_text_width(font, text + mid, cursor - mid);
+        if (width <= available)
+          fits = mid;
+        else
+          too_wide = mid;
+      }
+      start = fits;
+      prefix_width = finder_fontset_text_width(font, text + start,
+                                                cursor - start);
+    }
+  }
+
+  end = start;
+  while (end < len) {
+    next = finder_cursor_next(text, end);
+    if (finder_fontset_text_width(font, text + start, next - start) >
+        available)
+      break;
+    end = next;
+  }
+  if (end == start && start < len)
+    end = finder_cursor_next(text, start);
+  finder_query_view_start = start;
+  copy_len = MIN(end - start, out_size - 1);
+  while (copy_len > 0 &&
+         ((unsigned char)text[start + copy_len] & 0xc0) == 0x80)
+    copy_len--;
+  memcpy(out, text + start, copy_len);
+  out[copy_len] = '\0';
+  if (cursor_pos)
+    *cursor_pos = cursor <= start ? 0 : MIN(cursor - start, copy_len);
+}
+
+#define FINDER_RESULT_MAX_LINES 32
+static const char *finder_wrap_fit_end(const char *start, const char *end,
+                                       Fnt *font, unsigned int width) {
+  const char *boundaries[FINDER_GL_TEXT_MAX + 1];
+  const char *p = start;
+  size_t count = 0, lo = 0, hi;
+  int max_width = (int)MAX(width, 1U);
+
+  boundaries[0] = start;
+  while (p < end && count < LENGTH(boundaries) - 1) {
+    notification_utf8_next(&p);
+    boundaries[++count] = p;
+  }
+  if (p < end || finder_fontset_text_width(font, start, (size_t)(end - start))
+                     <= max_width)
+    return end;
+
+  /* Repeatedly measuring each growing prefix is quadratic for OCR results.
+   * Find the last fitting UTF-8 boundary with logarithmically many measures. */
+  hi = count;
+  while (lo + 1 < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+
+    if (finder_fontset_text_width(font, start,
+                                  (size_t)(boundaries[mid] - start)) <=
+        max_width)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  return boundaries[lo];
+}
+
+static int finder_wrap_result(const char *text, Fnt *font, unsigned int width,
+                              int max_lines,
+                              char lines[FINDER_RESULT_MAX_LINES]
+                                           [FINDER_GL_TEXT_MAX + 1]) {
+  char display[FINDER_GL_TEXT_MAX + 1];
+  const char *start, *p, *last_space, *line_end, *next, *text_end;
+  int count = 0;
+
+  if (!text || !*text || !font || !max_lines)
+    return 0;
+  max_lines = MAX(1, MIN(max_lines, FINDER_RESULT_MAX_LINES));
+  finder_gl_text_copy(text, display, sizeof(display));
+  start = p = display;
+  text_end = display + strlen(display);
+  while (start < text_end && count < max_lines) {
+    const char *segment_end = memchr(start, '\n', (size_t)(text_end - start));
+    int has_newline = segment_end != NULL;
+
+    if (!segment_end)
+      segment_end = text_end;
+    if (start == segment_end) {
+      line_end = start;
+      next = has_newline ? segment_end + 1 : segment_end;
+    } else {
+      p = finder_wrap_fit_end(start, segment_end, font, width);
+      if (p == segment_end) {
+        line_end = segment_end;
+        next = has_newline ? segment_end + 1 : segment_end;
+      } else if (p == start) {
+        next = start;
+        notification_utf8_next(&next);
+        line_end = next;
+      } else {
+        last_space = NULL;
+        for (const char *q = start; q < p; q++)
+          if (*q == ' ' || *q == '\t')
+            last_space = q;
+        if (last_space && last_space > start) {
+          line_end = last_space;
+          next = last_space + 1;
+          while (next < segment_end && (*next == ' ' || *next == '\t'))
+            next++;
+        } else {
+          line_end = next = p;
+        }
+      }
+    }
+    while (line_end > start &&
+           (line_end[-1] == ' ' || line_end[-1] == '\t'))
+      line_end--;
+    size_t n = MIN((size_t)(line_end - start),
+                   (size_t)FINDER_GL_TEXT_MAX);
+    memcpy(lines[count], start, n);
+    lines[count][n] = '\0';
+    count++;
+    start = p = next;
+  }
+  if (count < max_lines && start < text_end) {
+    size_t n = MIN((size_t)(text_end - start), (size_t)FINDER_GL_TEXT_MAX);
+    memcpy(lines[count], start, n);
+    lines[count][n] = '\0';
+    count++;
+  }
+  return count;
+}
+
+static int finder_translation_line_count(const char *text) {
+  char lines[FINDER_RESULT_MAX_LINES][FINDER_GL_TEXT_MAX + 1];
+  Fnt *font = finder_result_font ? finder_result_font : drw->fonts;
+  unsigned int popup_width = finder_popup_width();
+  unsigned int width = popup_width > 2U * FINDER_EDGE
+                           ? popup_width - 2U * FINDER_EDGE : 1U;
+
+  return finder_wrap_result(text, font, width, finder_translation_max_lines(),
+                            lines);
+}
+
+/* Keep the result rows below the query and within the monitor. Finder is
+ * anchored at the bar, so use the remaining physical screen height rather
+ * than the work area (which already excludes the bar). */
+static int finder_translation_max_lines(void) {
+  /* Do not truncate a translation merely because the application list had a
+   * small row limit.  The popup may grow vertically for the wrapped result. */
+  return FINDER_RESULT_MAX_LINES;
+}
+
+static void finder_window_text_alpha_at(Window win, int x, int y,
+                                        unsigned int w, unsigned int h,
+                                        const char *text, Clr *color,
+                                        Fnt *font, int centered, float alpha) {
+  XftDraw *draw;
+  XGlyphInfo ext;
+  XftColor faded_color;
+  XRenderColor faded_render_color;
+  Fnt *curfont, *runfont;
+  const char *p, *run, *end;
+  FcChar32 codepoint;
+  int len, tx, baseline, text_width;
+  if (!finder_argb_visual || !text || !*text || !color || !font)
+    return;
+  alpha = MAX(0.0f, MIN(1.0f, alpha));
+  if (alpha <= 0.001f)
+    return;
+  faded_render_color = color->color;
+  faded_render_color.alpha =
+      (unsigned short)(faded_render_color.alpha * alpha);
+  if (alpha < 0.999f &&
+      !XftColorAllocValue(dpy, finder_argb_visual, finder_argb_colormap,
+                          &faded_render_color, &faded_color))
+    return;
+  if (alpha >= 0.999f)
+    faded_color = *color;
+  draw = XftDrawCreate(dpy, win, finder_argb_visual, finder_argb_colormap);
+  if (!draw) {
+    if (alpha < 0.999f)
+      XftColorFree(dpy, finder_argb_visual, finder_argb_colormap,
+                   &faded_color);
+    return;
+  }
+  text_width = finder_fontset_text_width(font, text, strlen(text));
+  tx = x + (centered && w > (unsigned int)text_width
+                ? (int)(w - (unsigned int)text_width) / 2 : 0);
+  baseline = y + ((int)h - font->xfont->ascent - font->xfont->descent) / 2
+             + font->xfont->ascent;
+
+  end = text + strlen(text);
+  run = p = text;
+  runfont = NULL;
+  while (p < end && *p) {
+    len = FcUtf8ToUcs4((const FcChar8 *)p, &codepoint, (int)(end - p));
+    if (len <= 0)
+      len = 1;
+    for (curfont = font; curfont; curfont = curfont->next)
+      if (XftCharExists(dpy, curfont->xfont, codepoint))
+        break;
+    if (!curfont)
+      curfont = font;
+    if (runfont && curfont != runfont) {
+      XftTextExtentsUtf8(dpy, runfont->xfont, (const FcChar8 *)run,
+                         (int)(p - run), &ext);
+      XftDrawStringUtf8(draw, &faded_color, runfont->xfont, tx, baseline,
+                        (const FcChar8 *)run, (int)(p - run));
+      tx += ext.xOff;
+      run = p;
+    }
+    runfont = curfont;
+    p += len;
+  }
+  if (runfont)
+    XftDrawStringUtf8(draw, &faded_color, runfont->xfont, tx, baseline,
+                      (const FcChar8 *)run, (int)(p - run));
+  XftDrawDestroy(draw);
+  if (alpha < 0.999f)
+    XftColorFree(dpy, finder_argb_visual, finder_argb_colormap,
+                 &faded_color);
+}
+
+static void finder_window_text_at(Window win, int x, int y, unsigned int w,
+                                  unsigned int h, const char *text, Clr *color,
+                                  Fnt *font, int centered) {
+  finder_window_text_alpha_at(win, x, y, w, h, text, color, font, centered,
+                              1.0f);
+}
+
+static float finder_result_fade_alpha(uint64_t started_ms, uint64_t now) {
+  float progress;
+
+  if (!started_ms || now <= started_ms)
+    return started_ms ? 0.0f : 1.0f;
+  progress = (float)(now - started_ms) / FINDER_TRANSLATE_FADE_MS;
+  progress = MAX(0.0f, MIN(1.0f, progress));
+  return progress * progress * (3.0f - 2.0f * progress);
+}
+
+static void finder_translation_text(Window win, unsigned int w) {
+  char incoming_text[FINDER_GL_TEXT_MAX + 1];
+  char outgoing_text[FINDER_GL_TEXT_MAX + 1];
+  char lines[FINDER_RESULT_MAX_LINES][FINDER_GL_TEXT_MAX + 1];
+  uint64_t now = finder_monotonic_ms();
+  Fnt *font = finder_result_font ? finder_result_font : drw->fonts;
+  float incoming = 1.0f, outgoing = 0.0f;
+  unsigned int text_width = w > 2U * FINDER_EDGE
+                                 ? w - 2U * FINDER_EDGE : 1U;
+  int count;
+  unsigned int result_bh = finder_result_line_height();
+
+  if (finder_translate_result_started_ms)
+    incoming = finder_result_fade_alpha(finder_translate_result_started_ms,
+                                         now);
+  finder_gl_text_copy(finder_translate_result, incoming_text,
+                      sizeof(incoming_text));
+  finder_gl_text_copy(finder_translate_outgoing, outgoing_text,
+                      sizeof(outgoing_text));
+  if (finder_translate_outgoing_started_ms) {
+    outgoing = (float)(now - finder_translate_outgoing_started_ms) /
+               FINDER_TRANSLATE_FADE_MS;
+    outgoing = 1.0f - MAX(0.0f, MIN(1.0f, outgoing));
+    outgoing = outgoing * outgoing * (3.0f - 2.0f * outgoing);
+    count = finder_wrap_result(outgoing_text, font, text_width,
+                               finder_display_rows() - 1, lines);
+    for (int i = 0; i < count; i++)
+       finder_window_text_alpha_at(win, FINDER_EDGE,
+                                   bh + i * result_bh,
+                                   text_width, result_bh, lines[i],
+                                  &scheme[SchemeTitle][ColFg], font, 1,
+                                  outgoing);
+  }
+  if (finder_translate_active && incoming_text[0]) {
+    count = finder_wrap_result(incoming_text, font, text_width,
+                               finder_display_rows() - 1, lines);
+    for (int i = 0; i < count; i++)
+       finder_window_text_alpha_at(win, FINDER_EDGE,
+                                   bh + i * result_bh,
+                                   text_width, result_bh, lines[i],
+                                  &scheme[SchemeTitle][ColFg], font, 1,
+                                  incoming);
+  }
+}
+
+/* Non-ARGB fallback: approximate text opacity by blending its foreground
+ * toward the row background while the same fade timer is running. */
+static void finder_result_text_fallback(unsigned int w, const char *text,
+                                        uint64_t started_ms) {
+  char display_text[FINDER_GL_TEXT_MAX + 1];
+  char lines[FINDER_RESULT_MAX_LINES][FINDER_GL_TEXT_MAX + 1];
+  Clr result_scheme[3];
+  Fnt *saved_fonts = drw->fonts;
+  Fnt *font = finder_result_font ? finder_result_font : saved_fonts;
+  uint64_t now = finder_monotonic_ms();
+  float alpha = finder_result_fade_alpha(started_ms, now);
+  unsigned int text_width;
+  int count;
+  unsigned int result_bh = finder_result_line_height();
+
+  finder_gl_text_copy(text, display_text, sizeof(display_text));
+  memcpy(result_scheme, scheme[SchemeTitle], sizeof(result_scheme));
+  result_scheme[ColFg].color.red = (unsigned short)(
+      result_scheme[ColBg].color.red +
+      (result_scheme[ColFg].color.red - result_scheme[ColBg].color.red) * alpha);
+  result_scheme[ColFg].color.green = (unsigned short)(
+      result_scheme[ColBg].color.green +
+      (result_scheme[ColFg].color.green - result_scheme[ColBg].color.green) * alpha);
+  result_scheme[ColFg].color.blue = (unsigned short)(
+      result_scheme[ColBg].color.blue +
+      (result_scheme[ColFg].color.blue - result_scheme[ColBg].color.blue) * alpha);
+  result_scheme[ColFg].color.alpha = 0xffff;
+  drw->fonts = font;
+  text_width = w > 2U * FINDER_EDGE ? w - 2U * FINDER_EDGE : 1U;
+  count = finder_wrap_result(display_text, font, text_width,
+                             finder_display_rows() - 1, lines);
+  drw_setscheme(drw, result_scheme);
+  for (int i = 0; i < count; i++)
+     drw_text(drw, FINDER_EDGE, bh + i * result_bh, text_width, result_bh, 0,
+             lines[i], 0);
+  drw_setscheme(drw, scheme[SchemeTitle]);
+  drw->fonts = saved_fonts;
+}
+
+/* Draw the query centred like finder_window_text(), then append a blinking
+ * cursor after the text.  The text stays centred whether the cursor is shown
+ * or hidden, so it does not jitter on every blink. */
+static void finder_window_query(Window win, int x, int y, unsigned int w,
+                                unsigned int h, const char *text, Clr *color,
+                                Fnt *font, int cursor, size_t cursor_pos) {
+  XftDraw *draw;
+  char visible_text[FINDER_GL_TEXT_MAX + 1];
+  int text_width, prefix_width;
+  size_t len;
+  int tx, cursor_h, cursor_x, scrolled;
+
+  if (!finder_argb_visual || !text || !*text || !font)
+    return;
+  scrolled = finder_query[0] && !finder_translate_active &&
+      finder_query_total_width(font) > (int)w;
+  if (finder_query[0])
+    finder_query_viewport(text, font, w, visible_text, sizeof(visible_text),
+                          &cursor_pos);
+  else
+    finder_gl_text_copy(text, visible_text, sizeof(visible_text));
+  len = strlen(visible_text);
+  cursor_pos = MIN(cursor_pos, len);
+  text_width = finder_fontset_text_width(font, visible_text, len);
+  prefix_width = finder_fontset_text_width(font, visible_text, cursor_pos);
+  tx = x + (!scrolled && w > (unsigned int)text_width
+                ? (int)(w - (unsigned int)text_width) / 2 : 0);
+  finder_window_text_at(win, x, y, w, h, visible_text, color, font, !scrolled);
+  draw = XftDrawCreate(dpy, win, finder_argb_visual, finder_argb_colormap);
+  if (!draw)
+    return;
+  if (cursor) {
+    cursor_x = tx + prefix_width + (cursor_pos == len ? 2 : 1);
+    cursor_h = (int)font->h;
+    if (cursor_h > (int)h)
+      cursor_h = (int)h;
+    if (cursor_h < 2)
+      cursor_h = 2;
+    XftDrawRect(draw, color, cursor_x,
+                y + ((int)h - cursor_h) / 2, 2, (unsigned int)cursor_h);
+  }
+  XftDrawDestroy(draw);
+}
+
+static void finder_window_icon(Window win, int x, int y, unsigned int w,
+                               unsigned int h, Picture icon) {
+  XRenderPictFormat *format;
+  Picture dest;
+  if (!finder_argb_visual || !icon)
+    return;
+  format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+  dest = format ? XRenderCreatePicture(dpy, win, format, 0, NULL) : None;
+  if (dest) {
+    XRenderComposite(dpy, PictOpOver, icon, None, dest, 0, 0, 0, 0,
+                     x, y, w, h);
+    XRenderFreePicture(dpy, dest);
+  }
+}
+
+static void finder_window_icon_clipped(Window win, int x, int y,
+                                       unsigned int w, unsigned int h,
+                                       Picture icon, int clip_top,
+                                       int clip_bottom) {
+  XRenderPictFormat *format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+  XRectangle clip = {0, (short)clip_top,
+                     (unsigned short)finder_popup_width(),
+                     (unsigned short)MAX(0, clip_bottom - clip_top)};
+  Picture dest = format ? XRenderCreatePicture(dpy, win, format, 0, NULL) : None;
+
+  if (!dest)
+    return;
+  if (!icon) {
+    XRenderFreePicture(dpy, dest);
+    return;
+  }
+  XRenderSetPictureClipRectangles(dpy, dest, 0, 0, &clip, 1);
+  XRenderComposite(dpy, PictOpOver, icon, None, dest, 0, 0, 0, 0,
+                   x, y, w, h);
+  XRenderFreePicture(dpy, dest);
+}
+
+/* Finder keeps its XRender-painted row backgrounds and icons.  This
+ * transparent foreground surface moves only the text onto the same GL font
+ * path used by notification history. */
+static int finder_gl_surface_create(unsigned int w, unsigned int h) {
+  XRenderPictFormat *format;
+
+  if (finder_gl_pixmap && finder_gl_pixmap_w == w &&
+      finder_gl_pixmap_h == h && finder_gl_picture)
+    return 1;
+  if (finder_gl_picture) {
+    XRenderFreePicture(dpy, finder_gl_picture);
+    finder_gl_picture = None;
+  }
+  if (finder_gl_pixmap) {
+    XFreePixmap(dpy, finder_gl_pixmap);
+    finder_gl_pixmap = None;
+  }
+  finder_gl_pixmap_w = finder_gl_pixmap_h = 0;
+  if (!finder_argb_visual || !finder_argb_depth || !w || !h)
+    return 0;
+  finder_gl_pixmap = XCreatePixmap(dpy, root, w, h,
+                                   (unsigned int)finder_argb_depth);
+  format = XRenderFindStandardFormat(dpy, PictStandardARGB32);
+  if (!finder_gl_pixmap || !format) {
+    if (finder_gl_pixmap)
+      XFreePixmap(dpy, finder_gl_pixmap);
+    finder_gl_pixmap = None;
+    return 0;
+  }
+  finder_gl_picture = XRenderCreatePicture(dpy, finder_gl_pixmap, format,
+                                            0, NULL);
+  if (!finder_gl_picture) {
+    XFreePixmap(dpy, finder_gl_pixmap);
+    finder_gl_pixmap = None;
+    return 0;
+  }
+  finder_gl_pixmap_w = w;
+  finder_gl_pixmap_h = h;
+  return 1;
+}
+
+static int finder_frame_surface_create(unsigned int w, unsigned int h) {
+  XRenderPictFormat *format;
+
+  if (finder_frame_pixmap && finder_frame_pixmap_w == w &&
+      finder_frame_pixmap_h == h && finder_frame_picture)
+    return 1;
+  if (finder_frame_picture) {
+    XRenderFreePicture(dpy, finder_frame_picture);
+    finder_frame_picture = None;
+  }
+  if (finder_frame_pixmap) {
+    XFreePixmap(dpy, finder_frame_pixmap);
+    finder_frame_pixmap = None;
+  }
+  finder_frame_pixmap_w = finder_frame_pixmap_h = 0;
+  if (!finder_argb_visual || !finder_argb_depth || !w || !h)
+    return 0;
+  finder_frame_pixmap = XCreatePixmap(dpy, root, w, h,
+                                      (unsigned int)finder_argb_depth);
+  format = XRenderFindStandardFormat(dpy, PictStandardARGB32);
+  if (!finder_frame_pixmap || !format) {
+    if (finder_frame_pixmap)
+      XFreePixmap(dpy, finder_frame_pixmap);
+    finder_frame_pixmap = None;
+    return 0;
+  }
+  finder_frame_picture = XRenderCreatePicture(dpy, finder_frame_pixmap,
+                                               format, 0, NULL);
+  if (!finder_frame_picture) {
+    XFreePixmap(dpy, finder_frame_pixmap);
+    finder_frame_pixmap = None;
+    return 0;
+  }
+  finder_frame_pixmap_w = w;
+  finder_frame_pixmap_h = h;
+  return 1;
+}
+
+static void finder_gl_text_alpha_for(GLFont *font, const char *text,
+                                     int x, int y, unsigned int w,
+                                     unsigned int draw_w, unsigned int h,
+                                     const Clr *color, int centered,
+                                     float alpha, int grayscale) {
+  int line_h, ascender, baseline;
+  unsigned int text_w;
+  float r, g, b;
+
+  if (!text || !*text || !color || !font)
+    return;
+  line_h = MAX(font->height, 1);
+  ascender = MAX(1, (int)(font->faces[0].face->size->metrics.ascender >> 6));
+  text_w = gl_font_text_width_for(font, text);
+  if (centered && text_w < w)
+    x += (int)(w - text_w) / 2;
+  baseline = y + ((int)h - line_h) / 2 + ascender;
+  r = (float)color->color.red / 65535.0f;
+  g = (float)color->color.green / 65535.0f;
+  b = (float)color->color.blue / 65535.0f;
+  gl_font_draw_text_alpha_for(font, text, x, baseline, draw_w, r, g, b,
+                               alpha, grayscale);
+}
+
+static void finder_gl_text_alpha(const char *text, int x, int y,
+                                 unsigned int w, unsigned int draw_w,
+                                 unsigned int h,
+                                 const Clr *color, int centered,
+                                 float alpha) {
+  finder_gl_text_alpha_for(gl_font, text, x, y, w, draw_w, h, color,
+                            centered, alpha, 0);
+}
+
+static void finder_gl_text(const char *text, int x, int y, unsigned int w,
+                           unsigned int h, const Clr *color, int centered) {
+  finder_gl_text_alpha(text, x, y, w, w, h, color, centered, 1.0f);
+}
+
+static GLFont *finder_gl_result_font(void) {
+  Fnt *saved_fonts;
+
+  if (finder_result_gl_font || !finder_result_font)
+    return finder_result_gl_font;
+  saved_fonts = drw->fonts;
+  drw->fonts = finder_result_font;
+  finder_result_gl_font = gl_font_create();
+  drw->fonts = saved_fonts;
+  return finder_result_gl_font;
+}
+
+static GLFont *finder_gl_query_font(void) {
+  if (!finder_query_gl_font && gl_font)
+    finder_query_gl_font = gl_font_create_scaled(1.15);
+  return finder_query_gl_font ? finder_query_gl_font : gl_font;
+}
+
+/* Use the app-row entrance/exit motion for result text too: opacity, scale,
+ * blur, and a short vertical settle all share the same eased progress. */
+static void finder_gl_draw_result(const char *text, uint64_t started_ms,
+                                  int outgoing, const Clr *color,
+                                  unsigned int width) {
+  char display_text[FINDER_GL_TEXT_MAX + 1];
+  char lines[FINDER_RESULT_MAX_LINES][FINDER_GL_TEXT_MAX + 1];
+  GLFont *font = finder_gl_result_font();
+  uint64_t now = finder_monotonic_ms();
+  double elapsed = started_ms
+                        ? (double)(now >= started_ms ? now - started_ms : 0) /
+                              FINDER_FILTER_ANIM_MS
+                        : 1.0;
+  float progress = (float)MAX(0.0, MIN(1.0, elapsed));
+  float eased = progress * progress * (3.0f - 2.0f * progress);
+  float move_eased = finder_filter_move_ease(progress);
+  float alpha = outgoing ? 1.0f - eased : eased;
+  float scale_x = outgoing ? 1.0f + 0.1f * eased
+                            : 0.9f + 0.1f * eased;
+  float scale_y = outgoing ? 1.0f + 0.3f * eased
+                            : 0.7f + 0.3f * eased;
+  float row_y = (float)bh +
+                (outgoing ? 0.0f : (1.0f - move_eased) * 0.35f * bh);
+  unsigned int available = width > 2U * FINDER_EDGE
+                               ? width - 2U * FINDER_EDGE : 1U;
+  unsigned int text_width;
+  int x, y, baseline, line_h, ascender, count;
+  unsigned int result_bh;
+  float r, g, b;
+
+  if (!text || !*text || !color || alpha <= 0.001f)
+    return;
+  finder_gl_text_copy(text, display_text, sizeof(display_text));
+  if (!display_text[0])
+    return;
+  if (!font)
+    font = gl_font;
+  if (!font)
+    return;
+  line_h = MAX(font->height, 1);
+  result_bh = finder_result_line_height();
+  ascender = MAX(1, (int)(font->faces[0].face->size->metrics.ascender >> 6));
+  r = (float)color->color.red / 65535.0f;
+  g = (float)color->color.green / 65535.0f;
+  b = (float)color->color.blue / 65535.0f;
+  count = finder_wrap_result(display_text,
+                             finder_result_font ? finder_result_font : drw->fonts,
+                             available, finder_display_rows() - 1, lines);
+
+  /* Blur repeats HarfBuzz shaping and glyph drawing.  Keep the effect for
+   * short labels, but draw long OCR/translation strings in a single pass. */
+  for (int row = 0; row < count; row++) {
+    text_width = gl_font_text_width_for(font, lines[row]);
+    x = FINDER_EDGE + (text_width < available
+                           ? (int)(available - text_width) / 2 : 0);
+    y = (int)lroundf(row_y) + row * (int)result_bh;
+    baseline = y + ((int)result_bh - line_h) / 2 + ascender;
+    /* Translation results stay crisp; bloom is reserved for the waiting OCR
+     * query in finder_gl_draw(). */
+    glPushMatrix();
+    glTranslatef((float)width / 2.0f,
+                 (float)y + (float)result_bh / 2.0f, 0.0f);
+    glScalef(scale_x, scale_y, 1.0f);
+    glTranslatef(-(float)width / 2.0f,
+                 -((float)y + (float)result_bh / 2.0f), 0.0f);
+    gl_font_draw_text_alpha_for(font, lines[row], x, baseline, available,
+                                r, g, b, alpha, 0);
+    glPopMatrix();
+  }
+}
+
+/* Upload each decoded Finder icon once, then let the GPU reuse its texture on
+ * every animation frame. Keep the XRender Picture as a fallback. */
+static int finder_gl_icon(FinderApp *app, int x, int y, float alpha) {
+  if (!app)
+    return 0;
+  if (!app->icon_texture && app->icon_pixels) {
+    glGenTextures(1, &app->icon_texture);
+    if (app->icon_texture) {
+      glBindTexture(GL_TEXTURE_2D, app->icon_texture);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, FINDER_ICON_SIZE,
+                   FINDER_ICON_SIZE, 0, GL_BGRA, GL_UNSIGNED_BYTE,
+                   app->icon_pixels);
+      free(app->icon_pixels);
+      app->icon_pixels = NULL;
+    }
+  }
+  if (!app->icon_texture)
+    return 0;
+
+  glEnable(GL_TEXTURE_2D);
+  glEnable(GL_BLEND);
+  notification_gl_blend_separate();
+  glColor4f(1.0f, 1.0f, 1.0f, alpha);
+  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+  glBindTexture(GL_TEXTURE_2D, app->icon_texture);
+  glBegin(GL_QUADS);
+  /* The input's first row is the image top and maps to v=0 for this texture. */
+  glTexCoord2f(0.0f, 0.0f); glVertex2f((float)x, (float)y);
+  glTexCoord2f(1.0f, 0.0f); glVertex2f((float)x + FINDER_ICON_SIZE, (float)y);
+  glTexCoord2f(1.0f, 1.0f); glVertex2f((float)x + FINDER_ICON_SIZE,
+                                        (float)y + FINDER_ICON_SIZE);
+  glTexCoord2f(0.0f, 1.0f); glVertex2f((float)x,
+                                        (float)y + FINDER_ICON_SIZE);
+  glEnd();
+  glDisable(GL_BLEND);
+  glDisable(GL_TEXTURE_2D);
+  return 1;
+}
+
+static int finder_gl_draw_kawase_app_text(const char *text, int x, int y,
+                                          unsigned int text_w,
+                                          unsigned int text_h,
+                                          unsigned int width, float alpha,
+                                          float scale_x, float scale_y,
+                                           double row_y, const Clr *color,
+                                           float blur) {
+  /* Two downsample-style passes followed by three upsample-style passes. */
+  static const float pass_scale[] = { 0.5f, 1.0f, 1.5f, 1.0f, 0.5f };
+  GLuint input, output;
+  GLboolean scissor_enabled;
+
+  if (!finder_bloom_ready || !text || !*text || !color || alpha <= 0.001f ||
+      !finder_gl_bloom_buffers(width, finder_bloom_h))
+    return 0;
+  scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0, width, finder_bloom_h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  finder_gl_bind_framebuffer(GL_FRAMEBUFFER, finder_bloom_fbo);
+  finder_gl_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, finder_bloom_source, 0);
+  glViewport(0, 0, (GLsizei)width, (GLsizei)finder_bloom_h);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnable(GL_BLEND);
+  notification_gl_blend_separate();
+  glPushMatrix();
+  glTranslatef((float)width / 2.0f,
+               (float)row_y + (float)text_h / 2.0f, 0.0f);
+  glScalef(scale_x, scale_y, 1.0f);
+  glTranslatef(-(float)width / 2.0f,
+               -((float)row_y + (float)text_h / 2.0f), 0.0f);
+  finder_gl_text_alpha(text, x, y, text_w, text_w, text_h, color, 0, alpha);
+  glPopMatrix();
+  glDisable(GL_BLEND);
+
+  input = finder_bloom_source;
+  output = finder_bloom_ping;
+  finder_gl_use_program(finder_bloom_program);
+  glEnable(GL_TEXTURE_2D);
+  finder_gl_uniform1i(finder_bloom_texture_uniform, 0);
+  finder_gl_uniform1i(finder_bloom_mode_uniform, 0);
+  for (int pass = 0; pass < (int)LENGTH(pass_scale); pass++) {
+    if (pass == 2)
+      finder_gl_uniform1i(finder_bloom_mode_uniform, 1);
+    finder_gl_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                     GL_TEXTURE_2D, output, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, input);
+    finder_gl_uniform2f(finder_bloom_texel_uniform,
+                        blur * pass_scale[pass] / (float)width,
+                        blur * pass_scale[pass] / (float)finder_bloom_h);
+    finder_gl_bloom_quad();
+    input = output;
+    output = output == finder_bloom_ping ? finder_bloom_pong
+                                         : finder_bloom_ping;
+  }
+  finder_gl_use_program(0);
+  finder_gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+  glEnable(GL_BLEND);
+  notification_gl_blend_separate();
+  glBindTexture(GL_TEXTURE_2D, input);
+  glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+  finder_gl_bloom_quad();
+  glDisable(GL_BLEND);
+  glDisable(GL_TEXTURE_2D);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glMatrixMode(GL_MODELVIEW);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+  if (scissor_enabled)
+    glEnable(GL_SCISSOR_TEST);
+  return 1;
+}
+
+static int finder_gl_draw_kawase_app_icon(FinderApp *app, int x, int y,
+                                          unsigned int width, float alpha,
+                                          float scale_x, float scale_y,
+                                          double row_y, float blur) {
+  static const float pass_scale[] = { 0.5f, 1.0f, 1.5f, 1.0f, 0.5f };
+  GLuint input, output;
+
+  if (!app || !finder_bloom_ready || alpha <= 0.001f ||
+      !finder_gl_bloom_buffers(width, finder_bloom_h))
+    return 0;
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0, width, finder_bloom_h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  finder_gl_bind_framebuffer(GL_FRAMEBUFFER, finder_bloom_fbo);
+  finder_gl_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, finder_bloom_source, 0);
+  glViewport(0, 0, (GLsizei)width, (GLsizei)finder_bloom_h);
+  glClearColor(0, 0, 0, 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glPushMatrix();
+  glTranslatef((float)width / 2.0f, (float)row_y + (float)bh / 2.0f, 0);
+  glScalef(scale_x, scale_y, 1);
+  glTranslatef(-(float)width / 2.0f, -((float)row_y + (float)bh / 2.0f), 0);
+  (void)finder_gl_icon(app, x, y, alpha);
+  glPopMatrix();
+
+  input = finder_bloom_source;
+  output = finder_bloom_ping;
+  finder_gl_use_program(finder_bloom_program);
+  glEnable(GL_TEXTURE_2D);
+  finder_gl_uniform1i(finder_bloom_texture_uniform, 0);
+  finder_gl_uniform1i(finder_bloom_mode_uniform, 0);
+  for (int pass = 0; pass < (int)LENGTH(pass_scale); pass++) {
+    if (pass == 2)
+      finder_gl_uniform1i(finder_bloom_mode_uniform, 1);
+    finder_gl_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                     GL_TEXTURE_2D, output, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, input);
+    finder_gl_uniform2f(finder_bloom_texel_uniform,
+                        blur * pass_scale[pass] / (float)width,
+                        blur * pass_scale[pass] / (float)finder_bloom_h);
+    finder_gl_bloom_quad();
+    input = output;
+    output = output == finder_bloom_ping ? finder_bloom_pong : finder_bloom_ping;
+  }
+  finder_gl_use_program(0);
+  finder_gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+  glEnable(GL_BLEND);
+  notification_gl_blend_separate();
+  glBindTexture(GL_TEXTURE_2D, input);
+  glColor4f(1, 1, 1, 1);
+  finder_gl_bloom_quad();
+  glDisable(GL_BLEND);
+  glDisable(GL_TEXTURE_2D);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glMatrixMode(GL_MODELVIEW);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+  return 1;
+}
+
+static int finder_gl_draw_kawase_app_icon(FinderApp *app, int x, int y,
+                                          unsigned int width, float alpha,
+                                          float scale_x, float scale_y,
+                                          double row_y, float blur);
+
+static void finder_gl_draw_app(FinderApp *app, double row_y, float alpha,
+                               float scale_x, float scale_y, float blur,
+                               const Clr *color,
+                               unsigned int width) {
+  int text_x = FINDER_EDGE + clockpad / 2 + FINDER_ICON_SIZE + FINDER_ICON_GAP;
+  int icon_x = FINDER_EDGE + clockpad / 2;
+  int y = (int)lround(row_y);
+  unsigned int text_w = width > (unsigned int)text_x + FINDER_EDGE
+      ? width - (unsigned int)text_x - FINDER_EDGE : 1U;
+
+  if (!app || alpha <= 0.001f || scale_x <= 0.001f || scale_y <= 0.001f)
+    return;
+  glPushMatrix();
+  glTranslatef((float)width / 2.0f,
+               (float)row_y + (float)bh / 2.0f, 0.0f);
+  glScalef(scale_x, scale_y, 1.0f);
+  glTranslatef(-(float)width / 2.0f,
+               -((float)row_y + (float)bh / 2.0f), 0.0f);
+   if (blur <= 0.001f || !finder_bloom_ready)
+     (void)finder_gl_icon(app, icon_x,
+                          y + (bh - FINDER_ICON_SIZE) / 2, alpha);
+   if (blur <= 0.001f || !finder_bloom_ready)
+     finder_gl_text_alpha(app->name, text_x, y, text_w, text_w,
+                          (unsigned int)bh, color, 0, alpha);
+  glPopMatrix();
+
+   if (blur > 0.001f && finder_bloom_ready)
+     (void)finder_gl_draw_kawase_app_icon(
+         app, icon_x, y + (bh - FINDER_ICON_SIZE) / 2, width, alpha,
+         scale_x, scale_y, row_y, blur *
+         (FINDER_FILTER_IMAGE_BLUR_MAX / FINDER_FILTER_TEXT_BLUR_MAX));
+   if (blur > 0.001f && finder_bloom_ready)
+     (void)finder_gl_draw_kawase_app_text(app->name, text_x, y, text_w,
+                                         (unsigned int)bh, width, alpha,
+                                         scale_x, scale_y, row_y, color,
+                                         blur);
+}
+
+static int finder_gl_draw_waiting_backdrop(GLFont *font, const char *text,
+                                           int query_x, unsigned int query_w,
+                                           unsigned int bh, unsigned int w,
+                                           float pulse, float query_pose,
+                                           float query_scale) {
+  static const float pass_scale[] = { 0.5f, 1.0f, 1.5f, 1.0f, 0.5f };
+  const float strength = 8.0f;
+  GLuint input, output;
+  GLboolean scissor_enabled;
+  int line_h;
+  float top;
+
+  if (!font || !text || !*text || query_w == 0 || pulse <= 0.001f ||
+      !finder_bloom_ready || !finder_gl_bloom_buffers(w, finder_bloom_h))
+    return 0;
+
+  line_h = MIN(MAX(font->height, 1), (int)bh);
+  top = ((float)bh - (float)line_h) / 2.0f;
+  scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glOrtho(0, w, finder_bloom_h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+  finder_gl_bind_framebuffer(GL_FRAMEBUFFER, finder_bloom_fbo);
+  finder_gl_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, finder_bloom_source, 0);
+  glViewport(0, 0, (GLsizei)w, (GLsizei)finder_bloom_h);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glDisable(GL_TEXTURE_2D);
+  glEnable(GL_BLEND);
+  notification_gl_blend_separate();
+  glPushMatrix();
+  glTranslatef((float)w / 2.0f,
+               (float)bh / 2.0f + 6.0f * query_pose, 0.0f);
+  glScalef(query_scale, query_scale, 1.0f);
+  glTranslatef(-(float)w / 2.0f, -(float)bh / 2.0f, 0.0f);
+  glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+  glBegin(GL_QUADS);
+  glVertex2f((float)query_x, top);
+  glVertex2f((float)query_x + (float)query_w, top);
+  glVertex2f((float)query_x + (float)query_w, top + (float)line_h);
+  glVertex2f((float)query_x, top + (float)line_h);
+  glEnd();
+  glDisable(GL_BLEND);
+  glPopMatrix();
+  input = finder_bloom_source;
+  output = finder_bloom_ping;
+  finder_gl_use_program(finder_bloom_program);
+  glEnable(GL_TEXTURE_2D);
+  finder_gl_uniform1i(finder_bloom_texture_uniform, 0);
+  finder_gl_uniform1i(finder_bloom_mode_uniform, 0);
+  for (int pass = 0; pass < (int)LENGTH(pass_scale); pass++) {
+    if (pass == 2)
+      finder_gl_uniform1i(finder_bloom_mode_uniform, 1);
+    finder_gl_framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                     GL_TEXTURE_2D, output, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, input);
+    finder_gl_uniform2f(finder_bloom_texel_uniform,
+                        strength * pass_scale[pass] / (float)w,
+                        strength * pass_scale[pass] / (float)finder_bloom_h);
+    finder_gl_bloom_quad();
+    input = output;
+    output = output == finder_bloom_ping ? finder_bloom_pong : finder_bloom_ping;
+  }
+  finder_gl_use_program(0);
+  finder_gl_bind_framebuffer(GL_FRAMEBUFFER, 0);
+  glViewport(0, 0, (GLsizei)w, (GLsizei)finder_bloom_h);
+  glEnable(GL_BLEND);
+  notification_gl_blend_separate();
+  glBindTexture(GL_TEXTURE_2D, input);
+  /* The pulse reaches at most 80% opacity. */
+  glColor4f(1.0f, 1.0f, 1.0f, 1.0f * pulse);
+  finder_gl_bloom_quad();
+  glDisable(GL_BLEND);
+  glDisable(GL_TEXTURE_2D);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glMatrixMode(GL_MODELVIEW);
+  glPopMatrix();
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+  glViewport(0, 0, (GLsizei)w, (GLsizei)finder_bloom_h);
+  if (scissor_enabled)
+    glEnable(GL_SCISSOR_TEST);
+  return 1;
+}
+
+static int finder_gl_draw(Drawable target, unsigned int w, unsigned int h,
+                          const char *query_display, Clr *query_color,
+                          Clr *row_color,
+                          Clr *selected_color, int cursor_visible) {
+  XRenderPictFormat *format;
+  Picture dest;
+  unsigned int query_w, query_view_width;
+  int line_h, query_x, first, list_bottom, query_scroll;
+  size_t cursor_pos;
+  char display_query[FINDER_GL_TEXT_MAX + 1];
+  char cursor_text[FINDER_GL_TEXT_MAX + 1];
+  float query_pose, query_scale, query_font_scale;
+  unsigned int query_draw_w;
+  int center_query;
+  GLFont *query_font;
+  uint64_t now_ms = finder_monotonic_ms();
+
+  if (!notification_gl_init(w, h))
+    return 0;
+  if (!gl_font && !(gl_font = gl_font_create()))
+    return 0;
+  if (!finder_gl_surface_create(w, h))
+    return 0;
+  if (!finder_bloom_ready && finder_gl_bloom_load_procs() &&
+      finder_gl_bloom_program_init())
+    finder_bloom_ready = 1;
+  if (finder_bloom_ready)
+    (void)finder_gl_bloom_buffers(w, h);
+
+  glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrtho(0, w, h, 0, -1, 1);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_TEXTURE_2D);
+  glDisable(GL_SCISSOR_TEST);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+
+  query_pose = finder_query_pose_update(now_ms);
+  /* Animate the size with the native atlas, then switch to glyphs rasterized
+   * at the final waiting size so the settled text is not texture-scaled. */
+  query_font = query_pose >= 1.0f ? finder_gl_query_font() : gl_font;
+  query_scale = query_font != gl_font ? 1.0f
+                                      : 1.0f + 0.15f * query_pose;
+  query_font_scale = query_font != gl_font ? 1.15f : query_scale;
+  /* Use the final waiting scale for clipping from the first waiting frame.
+   * Otherwise the shrinking viewport changes the visible slice as the query
+   * grows, which looks like the text itself is scrolling during the pose. */
+  if (finder_translate_pending)
+    query_font_scale = 1.15f;
+  line_h = MAX(query_font->height, 1);
+  query_draw_w = (unsigned int)ceilf(
+      (float)MAX(w - 2U * FINDER_EDGE, 1U) / query_scale);
+  query_view_width = (unsigned int)MAX(1, (int)floorf(
+      (float)MAX(w - 2U * FINDER_EDGE, 1U) / query_font_scale));
+  query_scroll = finder_query[0] &&
+      finder_query_total_width(drw->fonts) > (int)query_view_width;
+  if (finder_query[0])
+    finder_query_viewport(finder_query, drw->fonts, query_view_width,
+                          display_query, sizeof(display_query), &cursor_pos);
+  else {
+    finder_gl_text_copy(query_display, display_query, sizeof(display_query));
+    cursor_pos = 0;
+  }
+
+  /* The viewport above is measured with the Xft font, while the waiting
+   * query is drawn with the OpenGL atlas.  Their advances can differ enough
+   * for the last glyph to be clipped during the zoom.  Trim the already
+   * selected UTF-8 slice against the actual GL width before drawing it. */
+  if (finder_translate_pending) {
+    size_t visible_len = strlen(display_query);
+    size_t query_len = strlen(finder_query);
+    size_t source_end = finder_query_view_start + visible_len;
+
+    while (visible_len > 0 &&
+           gl_font_text_width_for(query_font, display_query) > query_draw_w) {
+      visible_len = finder_cursor_prev(display_query, visible_len);
+      display_query[visible_len] = '\0';
+    }
+    /* Xft and the GL atlas do not always have identical advances.  The
+     * Xft-sized slice can therefore leave a visible gap on the right even
+     * though more query text would fit in the GL viewport.  Extend the slice
+     * with complete UTF-8 codepoints until the actual rendered width is full.
+     */
+    source_end = finder_query_view_start + visible_len;
+    while (source_end < query_len && visible_len < sizeof(display_query) - 1) {
+      size_t next = finder_cursor_next(finder_query, source_end);
+      size_t added = next - source_end;
+
+      memcpy(display_query + visible_len, finder_query + source_end, added);
+      display_query[visible_len + added] = '\0';
+      if (gl_font_text_width_for(query_font, display_query) > query_draw_w) {
+        display_query[visible_len] = '\0';
+        break;
+      }
+      visible_len += added;
+      source_end = next;
+    }
+    cursor_pos = MIN(cursor_pos, visible_len);
+  }
+  query_w = gl_font_text_width_for(query_font, display_query);
+  /* Keep the original-language query centred throughout translation mode.
+   * The viewport still clips long UTF-8 text safely, but its visible slice
+   * should not become left-anchored when the result changes the popup width. */
+  center_query = !query_scroll || finder_translate_active;
+  query_x = FINDER_EDGE + (center_query && query_w < w - 2U * FINDER_EDGE
+                               ? (int)(w - 2U * FINDER_EDGE - query_w) / 2
+                               : 0);
+  if (display_query[0])
+    (void)finder_gl_draw_waiting_backdrop(query_font, display_query, query_x,
+                                          query_w, (unsigned int)bh, w,
+                                          finder_translation_glow_pulse(now_ms),
+                                          query_pose, query_scale);
+  glPushMatrix();
+  glTranslatef((float)w / 2.0f, (float)bh / 2.0f + 6.0f * query_pose, 0.0f);
+  glScalef(query_scale, query_scale, 1.0f);
+  glTranslatef(-(float)w / 2.0f, -(float)bh / 2.0f, 0.0f);
+  /* Draw the original-language text after the GPU bloom, keeping the glyphs
+   * crisp and ensuring the bloom remains behind them. */
+  finder_gl_text_alpha_for(query_font, display_query, query_x, 0,
+                           w - 2U * FINDER_EDGE, query_draw_w,
+                           (unsigned int)bh, query_color, 0, 1.0f, 0);
+  if (display_query[0] && cursor_visible) {
+    cursor_pos = MIN(cursor_pos, strlen(display_query));
+    memcpy(cursor_text, display_query, cursor_pos);
+    cursor_text[cursor_pos] = '\0';
+    query_x += (int)gl_font_text_width_for(query_font, cursor_text) +
+               (cursor_pos == strlen(display_query) ? 2 : 1);
+    query_x = MIN(query_x, (int)w - FINDER_EDGE - 2);
+    glColor4f((float)query_color->color.red / 65535.0f,
+              (float)query_color->color.green / 65535.0f,
+              (float)query_color->color.blue / 65535.0f, 1.0f);
+    glBegin(GL_QUADS);
+    glVertex2f((float)query_x, (float)((bh - MIN(line_h, bh)) / 2));
+    glVertex2f((float)query_x + 2.0f, (float)((bh - MIN(line_h, bh)) / 2));
+    glVertex2f((float)query_x + 2.0f,
+               (float)((bh + MIN(line_h, bh)) / 2));
+    glVertex2f((float)query_x, (float)((bh + MIN(line_h, bh)) / 2));
+    glEnd();
+  }
+  glPopMatrix();
+
+  if (finder_math_active) {
+    finder_gl_draw_result(finder_math_result,
+                          finder_math_result_started_ms, 0,
+                          selected_color, w);
+  } else if (finder_math_help_active) {
+    for (unsigned int i = 0; i < LENGTH(finder_math_help); i++)
+      finder_gl_text(finder_math_help[i], FINDER_EDGE,
+                     (int)(i + 1) * bh, w - 2U * FINDER_EDGE,
+                     (unsigned int)bh, row_color, 0);
+  } else {
+    if (finder_translate_outgoing[0])
+      finder_gl_draw_result(finder_translate_outgoing,
+                            finder_translate_outgoing_started_ms, 1,
+                            selected_color, w);
+    if (finder_translate_active && finder_translate_result[0])
+      finder_gl_draw_result(finder_translate_result,
+                            finder_translate_result_started_ms, 0,
+                            selected_color, w);
+    list_bottom = (int)h - FINDER_EDGE;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, (GLint)FINDER_EDGE, (GLsizei)w,
+              (GLsizei)MAX(0, list_bottom - bh));
+    if (finder_filter_animating) {
+      double progress = finder_filter_progress();
+
+      for (unsigned int app_index = 0; app_index < finder_app_count;
+           app_index++) {
+        FinderFilterAnim *anim = &finder_filter_anim[app_index];
+        float row, alpha, scale_x, scale_y, blur;
+
+        if (!anim->active || !anim->outgoing)
+          continue;
+        finder_filter_eval(anim, progress, &row, &alpha, &scale_x, &scale_y,
+                           &blur);
+        row = (float)bh + row * (float)bh;
+        if (row >= list_bottom || row + bh <= bh)
+          continue;
+        finder_gl_draw_app(&finder_apps[app_index], row, alpha, scale_x,
+                           scale_y, blur, row_color, w);
+      }
+      for (int i = 0; i < (int)finder_visible && i < finder_rows; i++) {
+        unsigned int app_index = finder_order[i];
+        FinderFilterAnim *anim = &finder_filter_anim[app_index];
+        float row, alpha, scale_x, scale_y, blur;
+        Clr *color = i == finder_selected ? selected_color : row_color;
+
+        if (!anim->active)
+          continue;
+        finder_filter_eval(anim, progress, &row, &alpha, &scale_x, &scale_y,
+                           &blur);
+        row = (float)bh + row * (float)bh;
+        if (row >= list_bottom || row + bh <= bh)
+          continue;
+        finder_gl_draw_app(&finder_apps[app_index], row, alpha, scale_x,
+                           scale_y, blur, color, w);
+      }
+    } else {
+      first = MAX(0, (int)floor(finder_scroll_visual));
+      for (int i = first; i < (int)finder_visible; i++) {
+        double row_y = bh + ((double)i - finder_scroll_visual) * bh;
+        Clr *color = i == finder_selected ? selected_color : row_color;
+        if (row_y >= list_bottom)
+          break;
+        finder_gl_draw_app(&finder_apps[finder_order[i]], row_y, 1.0f, 1.0f,
+                           1.0f, 0.0f, color, w);
+      }
+    }
+    glDisable(GL_SCISSOR_TEST);
+  }
+  notification_present_gl(w, h, finder_gl_pixmap);
+  format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+  dest = format ? XRenderCreatePicture(dpy, target, format, 0, NULL) : None;
+  if (!dest)
+    return 0;
+  XRenderComposite(dpy, PictOpOver, finder_gl_picture, None, dest,
+                   0, 0, 0, 0, 0, 0, w, h);
+  XRenderFreePicture(dpy, dest);
+  return 1;
+}
+
+/* Redraw only Finder's center surface for animation and content updates.
+ * Running drawbar() here also reconfigures every bar section and repaints the
+ * clock, tags and title on every scroll frame, which causes unrelated flicker. */
+static int drawfinder_frame(Monitor *m) {
+  unsigned int w, h;
+  unsigned int query_bg_shrink;
+  int first, clip_bottom, query_bg_y, query_bg_h;
+  int geometry_changed;
+  const char *query_display;
+  float query_pose;
+
+  if (!m || m != selmon || !m->barcenterwin || !finder_active ||
+      !finder_argb_visual)
+    return 0;
+
+  w = finder_popup_width();
+  if (finder_presented_w != w)
+    resizebarwin(m);
+  h = finder_popup_height();
+  if (!w || !h)
+    return 0;
+  geometry_changed = finder_presented_w != w || finder_presented_h != h ||
+                     finder_presented_x != finder_window_x ||
+                     finder_presented_y != finder_window_y;
+
+  if (!finder_frame_surface_create(w, h))
+    return 0;
+
+  query_pose = finder_query_pose_update(finder_monotonic_ms());
+  query_bg_shrink = MIN((unsigned int)MAX(0, bh - 1),
+                        (unsigned int)lroundf(40.0f * query_pose));
+  query_bg_y = (int)(query_bg_shrink / 2U);
+  query_bg_h = MAX(1, bh - (int)query_bg_shrink);
+  query_display = finder_query[0] ? finder_query : clockstr;
+  XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
+  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, w, h);
+  if (query_bg_shrink) {
+    XSetForeground(drw->dpy, drw->gc, scheme[SchemeNorm][ColBg].pixel);
+    XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, w, bh);
+  }
+  XSetForeground(drw->dpy, drw->gc, scheme[SchemeTitle][ColBg].pixel);
+  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, query_bg_y, w,
+                 (unsigned int)query_bg_h);
+  XSetForeground(drw->dpy, drw->gc, scheme[SchemeNorm][ColBg].pixel);
+  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, bh, w,
+                 h - bh);
+  /* Compose the complete frame off-screen, preserving the existing XRender
+   * gradient and icon passes. Only the finished ARGB image touches the window. */
+  map_center_window(finder_frame_pixmap, 0, 0, w, h, 3);
+
+  if (!finder_gl_draw(finder_frame_pixmap, w, h, query_display,
+                      &scheme[SchemeTitle][ColFg], &finder_text_clr,
+                      &scheme[SchemeTitle][ColFg],
+                      finder_query[0] && finder_cursor_visible))
+    return 0;
+  if (!finder_filter_animating &&
+      !finder_math_active && !finder_math_help_active &&
+      !finder_translate_active) {
+    first = MAX(0, (int)floor(finder_scroll_visual));
+    clip_bottom = bh * finder_display_rows();
+    for (int i = first; i < (int)finder_visible; i++) {
+      FinderApp *app = &finder_apps[finder_order[i]];
+      int icon_y = (int)lround(bh +
+          ((double)i - finder_scroll_visual) * bh + (bh - 22) / 2.0);
+      if (bh + ((double)i - finder_scroll_visual) * bh >= clip_bottom)
+        break;
+      if (app->icon && !app->icon_texture)
+        finder_window_icon_clipped(finder_frame_pixmap,
+                                   FINDER_EDGE + clockpad / 2, icon_y,
+                                   FINDER_ICON_SIZE, FINDER_ICON_SIZE,
+                                   app->icon, bh, clip_bottom);
+    }
+  }
+  {
+    XRenderPictFormat *format = XRenderFindVisualFormat(dpy, finder_argb_visual);
+    Picture dest = format ? XRenderCreatePicture(dpy, m->barcenterwin,
+                                                  format, 0, NULL) : None;
+    if (!dest)
+      return 0;
+    /* Keep the old, complete frame visible until its replacement is ready.
+     * The compositor cannot observe the resized window before the matching
+     * ARGB frame has been copied. */
+    XGrabServer(dpy);
+    if (geometry_changed)
+      XMoveResizeWindow(dpy, m->barcenterwin, finder_window_x,
+                        finder_window_y, w, h);
+    XRenderComposite(dpy, PictOpSrc, finder_frame_picture, None, dest,
+                     0, 0, 0, 0, 0, 0, w, h);
+    XUngrabServer(dpy);
+    XRenderFreePicture(dpy, dest);
+  }
+  XFlush(dpy);
+  finder_presented_w = w;
+  finder_presented_h = h;
+  finder_presented_x = finder_window_x;
+  finder_presented_y = finder_window_y;
+  finder_dirty = 0;
+  return 1;
+}
+
+static int finder_argb_error(Display *display, XErrorEvent *event) {
+  (void)display;
+  if (event->request_code == 1)
+    finder_argb_create_failed = 1;
+  return 0;
+}
+
 void drawbar(Monitor *m) {
   int y = borderpx;
   int bh_n = bh - borderpx * 2;
   int boxs = drw->fonts->h / 9;
   int boxw = drw->fonts->h / 6 + 2;
   int x, w;
-  unsigned int i, occ = 0, urg = 0;
+  unsigned int i, occ = 0;
   unsigned int tw, tlw, cw, kw, rw;
   Client *c;
 
@@ -4427,8 +11069,6 @@ void drawbar(Monitor *m) {
 
   for (c = m->clients; c; c = c->next) {
     occ |= (c->issticky ? c->oldtags : c->tags);
-    if (c->isurgent)
-      urg |= (c->issticky ? c->oldtags : c->tags);
   }
 
   barwidths(m, &tw, &tlw, &cw, &kw, &rw);
@@ -4444,7 +11084,7 @@ void drawbar(Monitor *m) {
     drw_setscheme(
         drw, scheme[occ & 1 << i ? (m->colorfultag ? tagschemes[i] : SchemeSel)
                                  : SchemeTag]);
-    drw_text(drw, x, y, w, bh_n, lrpad / 2, tags[i], urg & 1 << i);
+    drw_text(drw, x, y, w, bh_n, lrpad / 2, tags[i], 0);
     if (ulineall ||
         m->tagset[m->seltags] &
             1 << i) /* if there are conflicts, just move these lines directly
@@ -4486,28 +11126,239 @@ void drawbar(Monitor *m) {
 
   /* center bar: clock in normal mode, notification panel when active */
    notification_update_wm_class(m->barcenterwin,
-                               m == selmon && notification_center_active(),
-                               notify_history_active && !notify_active);
-   unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
-                                     : ((clockbar_dynw && !notify_clock_hovered &&
-                                         !fullscreen_st && m == selmon)
-                                           ? clockbar_dynw : cw);
-  unsigned int tcw = clockbar_cw;
-  XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
-  XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, dcw, bh);
-   if (notify_active && m == selmon) {
-     notification_draw();
-     drw_map(drw, m->barcenterwin, 0, 0, notify_width, notify_height);
-   } else if (notify_history_active && m == selmon) {
-     notification_history_draw();
-     drw_map(drw, m->barcenterwin, 0, 0, notify_width, notify_height);
-  } else {
+                                 m == selmon && (notification_center_active() || finder_active),
+                                 notify_history_active && !notify_active,
+                                 m == selmon && finder_active);
+   /* Finder must override a notification that was already open. */
+    unsigned int dcw = (finder_active && m == selmon) ? finder_popup_width()
+                                      : ((notification_center_active() && m == selmon) ? notify_width
+                                       : ((clockbar_dynw && !notify_clock_hovered &&
+                                          m == selmon)
+                                             ? clockbar_dynw : cw));
+   unsigned int tcw = clockbar_cw;
+   XSetForeground(drw->dpy, drw->gc, clrborder.pixel);
+   /* Finder owns several bar rows.  Clear the complete backing-surface area
+    * before drawing it; clearing only the normal bar height leaves stale
+    * pixels in the lower rows when the pointer is not generating expose
+    * events for the center window. */
+      XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, dcw,
+                    (finder_active && m == selmon)
+                         ? finder_popup_height() : bh);
+       if (finder_active && m == selmon && finder_dirty) {
+         if (!drawfinder_frame(m)) {
+          /* Keep the legacy XRender/text path usable if GL composition is
+           * unavailable.  resizebarwin() defers this configure for Finder. */
+          XMoveResizeWindow(dpy, m->barcenterwin, finder_window_x,
+                            finder_window_y, dcw,
+                            finder_popup_height());
+          int row = 1;
+          Clr finder_row_scheme[3];
+          const char *query_display = finder_query[0] ? finder_query : clockstr;
+          char visible_query[FINDER_GL_TEXT_MAX + 1];
+           size_t visible_cursor = 0;
+           int query_scrolled = finder_query[0] &&
+               finder_query_total_width(drw->fonts) >
+                   (int)(dcw > 2 * FINDER_EDGE
+                             ? dcw - 2 * FINDER_EDGE : 1U);
+            if (finder_query[0])
+              finder_query_viewport(finder_query, drw->fonts,
+                                    dcw > 2 * FINDER_EDGE
+                                        ? dcw - 2 * FINDER_EDGE : 1U,
+                                   visible_query, sizeof(visible_query),
+                                   &visible_cursor);
+          else
+            finder_gl_text_copy(query_display, visible_query,
+                                sizeof(visible_query));
+          unsigned int query_width = drw_fontset_getwidth(drw, visible_query);
+          unsigned int query_pad = !query_scrolled &&
+                                   query_width < dcw - 2 * FINDER_EDGE
+                                       ? (dcw - 2 * FINDER_EDGE - query_width) / 2
+                                       : 0;
+          /* First map only opaque background rectangles.  Applying the
+           * gradient to the complete drw surface also fades glyphs and
+           * icons, so Finder's foreground is rendered directly into the
+           * ARGB window after this pass. */
+          if (finder_argb_visual) {
+            XSetForeground(drw->dpy, drw->gc, scheme[SchemeTitle][ColBg].pixel);
+            XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, 0, dcw, bh);
+            XSetForeground(drw->dpy, drw->gc, scheme[SchemeNorm][ColBg].pixel);
+             XFillRectangle(drw->dpy, drw->drawable, drw->gc, 0, bh, dcw,
+                             finder_popup_height() - bh);
+             map_center_window(m->barcenterwin, 0, 0, dcw,
+                               finder_popup_height(), 3);
+             if (finder_gl_draw(m->barcenterwin, dcw,
+                                 finder_popup_height(),
+                                query_display, &scheme[SchemeTitle][ColFg],
+                                 &finder_text_clr,
+                                 &scheme[SchemeTitle][ColFg],
+                                   finder_query[0] && finder_cursor_visible)) {
+                 if (!finder_math_active && !finder_math_help_active &&
+                     !finder_translate_active) {
+                 int first = MAX(0, (int)floor(finder_scroll_visual));
+                 int clip_bottom = bh * finder_display_rows();
+                 for (i = (unsigned int)first; i < finder_visible; i++) {
+                   FinderApp *app = &finder_apps[finder_order[i]];
+                   int icon_y = (int)lround(bh +
+                       ((double)i - finder_scroll_visual) * bh + (bh - 22) / 2.0);
+                   if (bh + ((double)i - finder_scroll_visual) * bh >=
+                       clip_bottom)
+                     break;
+                    if (app->icon && !app->icon_texture)
+                      finder_window_icon_clipped(
+                          m->barcenterwin, FINDER_EDGE + clockpad / 2,
+                          icon_y, FINDER_ICON_SIZE, FINDER_ICON_SIZE, app->icon, bh,
+                          clip_bottom);
+                 }
+               }
+             } else {
+                 finder_window_query(m->barcenterwin, FINDER_EDGE, 0,
+                                     dcw - 2 * FINDER_EDGE, bh, query_display,
+                                     &scheme[SchemeTitle][ColFg], drw->fonts,
+                                     finder_query[0] && finder_cursor_visible,
+                                     finder_cursor);
+                  if (finder_math_active) {
+                    finder_window_text_alpha_at(
+                        m->barcenterwin, FINDER_EDGE, bh,
+                        dcw - 2 * FINDER_EDGE, bh, finder_math_result,
+                        &scheme[SchemeTitle][ColFg],
+                        finder_result_font ? finder_result_font : drw->fonts,
+                        1, finder_result_fade_alpha(
+                               finder_math_result_started_ms,
+                               finder_monotonic_ms()));
+                 } else if (!finder_math_help_active) {
+                   finder_translation_text(m->barcenterwin, dcw);
+                 }
+               if (finder_math_help_active) {
+                 for (i = 0; i < LENGTH(finder_math_help) &&
+                             row < finder_display_rows(); i++, row++)
+                   finder_window_text_at(m->barcenterwin, FINDER_EDGE, row * bh,
+                                         dcw - 2 * FINDER_EDGE, bh,
+                                         finder_math_help[i], &finder_text_clr,
+                                         drw->fonts, 0);
+               }
+               for (i = (unsigned int)finder_scroll;
+                     !finder_math_active && !finder_math_help_active &&
+                     !finder_translate_active &&
+                     i < finder_visible && row < finder_display_rows();
+                    i++) {
+                 FinderApp *app = &finder_apps[finder_order[i]];
+                 finder_window_text_at(m->barcenterwin,
+                                        FINDER_EDGE + clockpad / 2 + 22 + FINDER_ICON_GAP,
+                                        row * bh, dcw, bh, app->name,
+                                         ((int)i == finder_selected)
+                                           ? &scheme[SchemeTitle][ColFg]
+                                           : &finder_text_clr,
+                                        drw->fonts, 0);
+                 if (app->icon)
+                   finder_window_icon(m->barcenterwin, FINDER_EDGE + clockpad / 2,
+                                      row * bh + (bh - 22) / 2, 22, 22,
+                                      app->icon);
+                 row++;
+               }
+             }
+          } else {
+             drw_setscheme(drw, scheme[SchemeTitle]);
+             drw_text(drw, FINDER_EDGE, 0, dcw - 2 * FINDER_EDGE, bh,
+                      query_pad, visible_query, 0);
+               if (finder_query[0] && finder_cursor_visible) {
+               XGlyphInfo cursor_ext;
+               size_t query_len = strlen(visible_query);
+               size_t cursor_pos = MIN(visible_cursor, query_len);
+              int cursor_h = (int)drw->fonts->h;
+              int cursor_x;
+
+              memset(&cursor_ext, 0, sizeof(cursor_ext));
+              if (cursor_pos > 0)
+                XftTextExtentsUtf8(dpy, drw->fonts->xfont,
+                                    (const FcChar8 *)visible_query, cursor_pos,
+                                   &cursor_ext);
+              cursor_x = FINDER_EDGE + (int)query_pad +
+                         (int)cursor_ext.xOff +
+                         (cursor_pos == query_len ? 2 : 1);
+              if (cursor_h > bh - 4)
+                cursor_h = bh - 4;
+              if (cursor_h < 2)
+                cursor_h = 2;
+              if (cursor_x + 2 <= (int)dcw - FINDER_EDGE)
+                drw_rect(drw, cursor_x, (bh - cursor_h) / 2, 2,
+                         (unsigned int)cursor_h, 1, 0);
+            }
+                if (finder_math_active || finder_translate_active) {
+                  const char *result = finder_math_active
+                      ? finder_math_result : finder_translate_result;
+                  uint64_t started_ms = finder_math_active
+                      ? finder_math_result_started_ms
+                      : finder_translate_result_started_ms;
+                  finder_result_text_fallback(dcw, result, started_ms);
+            }
+            if (finder_math_help_active) {
+              finder_row_scheme[ColFg] = finder_text_clr;
+              finder_row_scheme[ColBg] = scheme[SchemeNorm][ColBg];
+              finder_row_scheme[ColBorder] = scheme[SchemeNorm][ColBorder];
+              drw_setscheme(drw, finder_row_scheme);
+              for (i = 0; i < LENGTH(finder_math_help) &&
+                          row < finder_display_rows(); i++, row++)
+                drw_text(drw, 0, row * bh, dcw, bh, FINDER_EDGE,
+                         finder_math_help[i], 0);
+            }
+            for (i = (unsigned int)finder_scroll;
+                 !finder_math_active && !finder_math_help_active &&
+                 !finder_translate_active &&
+                 i < finder_visible && row < finder_display_rows();
+                 i++) {
+              FinderApp *app = &finder_apps[finder_order[i]];
+              finder_row_scheme[ColFg] = finder_text_clr;
+              finder_row_scheme[ColBg] = scheme[SchemeNorm][ColBg];
+              finder_row_scheme[ColBorder] = scheme[SchemeNorm][ColBorder];
+              if ((int)i == finder_selected)
+                finder_row_scheme[ColFg] = scheme[SchemeTitle][ColFg];
+              drw_setscheme(drw, finder_row_scheme);
+              drw_text(drw, 0, row * bh, dcw, bh,
+                       FINDER_EDGE + clockpad / 2 + 22 + FINDER_ICON_GAP,
+                       app->name, 0);
+              if (app->icon)
+                drw_pic(drw, FINDER_EDGE + clockpad / 2,
+                        row * bh + (bh - 22) / 2, 22, 22,
+                        app->icon);
+              row++;
+            }
+            map_center_window(m->barcenterwin, 0, 0, dcw,
+                               finder_popup_height(), 3);
+           }
+         }
+           finder_presented_w = dcw;
+           finder_presented_h = finder_popup_height();
+           finder_presented_x = finder_window_x;
+           finder_presented_y = finder_window_y;
+           finder_marker(m, finder_visible_count() > finder_scroll &&
+                           finder_selected >= finder_scroll &&
+                           finder_selected < finder_scroll + finder_rows
+                             ? finder_selected - finder_scroll + 1 : 0);
+          finder_dirty = 0;
+      } else if (finder_active && m == selmon) {
+        notify_render_cache_valid = 0;
+        /* The Finder surface is already current. Keep its marker and backing
+        * window untouched while the other bar sections continue updating. */
+         finder_marker(m, finder_visible_count() > finder_scroll &&
+                         finder_selected >= finder_scroll &&
+                        finder_selected < finder_scroll + finder_rows
+                           ? finder_selected - finder_scroll + 1 : 0);
+         } else if (notify_active && m == selmon) {
+          finder_marker(m, 0);
+          notification_present_layers(0);
+         } else if (notify_history_active && m == selmon) {
+         finder_marker(m, 0);
+         notification_present_layers(1);
+    } else {
+      if (m == selmon)
+        notify_render_cache_valid = 0;
+      finder_marker(m, 0);
     drw_setscheme(drw, scheme[m == selmon ? SchemeTitle : SchemeNorm]);
     drw_rect(drw, 0, borderpx, dcw, bh_n, 1, 1);
     drw_text(drw, dcw > tcw ? (int)((dcw - tcw) / 2) : 0,
              borderpx + vertpadbar / 2, tcw, bh - vertpadbar, clockpad, clockstr,
              0);
-    drw_map(drw, m->barcenterwin, 0, 0, dcw, bh);
+    map_center_window(m->barcenterwin, 0, 0, dcw, bh, 0);
   }
 
   /* center bar: keyboard layout */
@@ -4519,9 +11370,35 @@ void drawbar(Monitor *m) {
            kbstr, 0);
   drw_map(drw, m->barkbwin, 0, 0, kw, bh);
 
-  /* right bar: status produced by the lock-free worker */
-  drawstatusbar(m, bh_n, stext);
-  drw_map(drw, m->barrightwin, 0, 0, rw, bh);
+  drawrightbar(m, rw);
+}
+
+static void drawrightbar(Monitor *m, unsigned int rw) {
+  /* Keep the right/status surface independent from Finder's center surface.
+   * This lets status and MPRIS updates continue while Finder is open without
+   * redrawing or restacking the Finder. */
+  if (m == selmon && mpris_hovered && mpris_active) {
+    mpris_panel_draw(m, rw, bh * MPRIS_PANEL_HOVER_H);
+    /* Draw the normal status once, above the artwork.  Drawing it before
+     * the panel as well leaves stale glyphs visible through transparent
+     * gaps between ^b status segments. */
+    drawstatusbar(m, bh - borderpx * 2, stext);
+    drw_map(drw, m->barrightwin, 0, 0, rw, bh * MPRIS_PANEL_HOVER_H);
+  } else {
+    if (m->mpris_volume_markerwin)
+      XUnmapWindow(dpy, m->mpris_volume_markerwin);
+    drawstatusbar(m, bh - borderpx * 2, stext);
+    drw_map(drw, m->barrightwin, 0, 0, rw, bh);
+  }
+}
+
+static void drawrightbar_only(void) {
+  if (!selmon || !selmon->barrightwin)
+    return;
+  /* Recompute the right-bar geometry for status strings whose width changed,
+   * but leave Finder's center surface and marker untouched. */
+  resizebarwin(selmon);
+  drawrightbar(selmon, statuswidth(stext));
 }
 
 static uint32_t prealpha(uint32_t p) {
@@ -4914,6 +11791,23 @@ void enternotify(XEvent *e) {
   Monitor *m;
   XCrossingEvent *ev = &e->xcrossing;
 
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    if (!mpris_marker_pressed && !mpris_marker_hovered) {
+      mpris_marker_hovered = 1;
+      drawbars();
+    }
+    return;
+  }
+
+  if (ev->window == selmon->barrightwin) {
+    if (mpris_active && !mpris_hovered) {
+      mpris_hovered = 1;
+		  drawbars();
+      resizebarwin(selmon);
+    }
+    return;
+  }
+
   if (ev->window == selmon->barcenterwin) {
     if (!notification_center_active() &&
         !notification_clock_hit(ev->x,
@@ -4942,6 +11836,36 @@ void enternotify(XEvent *e) {
 static void leavenotify(XEvent *e) {
   XCrossingEvent *ev = &e->xcrossing;
 
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    mpris_marker_pressed = 0;
+    mpris_marker_hovered = 0;
+    if (mpris_pointer_over_bar(selmon))
+      return;
+    if (mpris_volume_drag)
+      return;
+    mpris_volume_drag = 0;
+    if (mpris_hovered) {
+      mpris_hovered = 0;
+      drawbars();
+      resizebarwin(selmon);
+    }
+    return;
+  }
+
+  if (ev->window == selmon->barrightwin) {
+    if (mpris_active && mpris_pointer_over_marker(selmon))
+      return;
+    if (mpris_volume_drag)
+      return;
+    mpris_volume_drag = 0;
+    if (mpris_hovered) {
+      mpris_hovered = 0;
+      drawbars();
+      resizebarwin(selmon);
+    }
+    return;
+  }
+
   if (ev->window == selmon->barcenterwin) {
     notify_clock_hovered = 0;
     if (notify_active)
@@ -4959,6 +11883,9 @@ void expose(XEvent *e) {
   XExposeEvent *ev = &e->xexpose;
 
   if (ev->count == 0 && (m = wintomon(ev->window))) {
+    if (m == selmon && ev->window == m->barcenterwin &&
+        (notify_active || notify_history_active))
+      notify_render_cache_valid = 0;
     drawbar(m);
     if (m == selmon)
       updatesystray();
@@ -4974,7 +11901,7 @@ void write_fullscreen(int value) {
   fclose(f);
 }
 
-static volatile bool fullscreen_st = false;
+static _Atomic bool fullscreen_st = false;
 
 static void updatefullscreenstatus(Client *c) {
   bool isfullscreen = c && c->isfullscreen && !c->issticky;
@@ -4984,6 +11911,17 @@ static void updatefullscreenstatus(Client *c) {
 
   write_fullscreen(isfullscreen);
   fullscreen_st = isfullscreen;
+	/* Wake the status and clock workers to pause/resume their background work. */
+	pthread_mutex_lock(&fullscreen_mutex);
+	pthread_cond_broadcast(&fullscreen_cond);
+	pthread_mutex_unlock(&fullscreen_mutex);
+	if (isfullscreen) {
+		/* Keep incoming notifications in history, but never leave a popup over
+		 * fullscreen content. */
+		notification_clear_queue();
+		notify_transition_pending = 0;
+	}
+	sound_monitor_pause(isfullscreen);
 }
 
 void focus(Client *c) {
@@ -5308,8 +12246,14 @@ void keypress(XEvent *e) {
   /* only KeyPress triggers normal keybindings (avoid double-fire on KeyRelease) */
   if (ev->type != KeyPress)
     return;
+  if (finder_keypress(ev))
+    return;
   if (notification_input_keypress(ev))
     return;
+  if (notify_history_active && keysym == XK_Escape) {
+    notification_history_hide();
+    return;
+  }
 
   for (i = 0; i < LENGTH(keys); i++)
     if (keysym == keys[i].keysym &&
@@ -5863,6 +12807,29 @@ void motionnotify(XEvent *e) {
   Monitor *m;
   XMotionEvent *ev = &e->xmotion;
 
+  if (finder_active) {
+    finder_motion(ev);
+    return;
+  }
+
+  if (ev->window == selmon->mpris_volume_markerwin) {
+    XMotionEvent forwarded = *ev;
+    Window child;
+    XTranslateCoordinates(dpy, root, selmon->barrightwin,
+                          ev->x_root, ev->y_root, &forwarded.x,
+                          &forwarded.y, &child);
+    forwarded.window = selmon->barrightwin;
+    if (mpris_hovered && mpris_active)
+      mpris_panel_motion(&forwarded);
+    return;
+  }
+
+  if (ev->window == selmon->barrightwin) {
+    if (mpris_hovered && mpris_active && ev->y >= bh)
+      mpris_panel_motion(ev);
+    return;
+  }
+
   if (ev->window == selmon->barcenterwin) {
     if (!notification_center_active() &&
         !notification_clock_hit(ev->x,
@@ -6023,7 +12990,7 @@ static void on_process(void *userdata) {
     return;
   }
    /* frozen in fullscreen: node stays connected, no peak is computed */
-    if (fullscreen_st || notification_center_active()) {
+      if (fullscreen_st || notification_center_active() || finder_active) {
     clockbar_peak = 0.0f;
     pw_stream_queue_buffer(sound_stream, b);
     return;
@@ -6059,8 +13026,19 @@ static void *clock_draw_loop(void *data) {
   struct timespec ts;
   uint64_t frame_ns = 1000000000ULL / DRAW_FPS;
 
-  clock_gettime(CLOCK_MONOTONIC, &ts);
   while (clock_draw_running) {
+	  pthread_mutex_lock(&fullscreen_mutex);
+	  while (clock_draw_running && fullscreen_st)
+		  pthread_cond_wait(&fullscreen_cond, &fullscreen_mutex);
+	  if (!clock_draw_running) {
+		  pthread_mutex_unlock(&fullscreen_mutex);
+		  break;
+	  }
+	  pthread_mutex_unlock(&fullscreen_mutex);
+
+    /* Rebase after a fullscreen pause rather than trying to catch up missed
+     * frames against an old absolute deadline. */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_nsec += frame_ns;
     while (ts.tv_nsec >= 1000000000L) {
       ts.tv_nsec -= 1000000000L;
@@ -6076,6 +13054,10 @@ static void *clock_draw_loop(void *data) {
 
     if (notification_center_active()) {
       clockbar_dynw = notify_width;
+      continue;
+    }
+    if (finder_active) {
+      clockbar_dynw = 0;
       continue;
     }
 
@@ -6106,6 +13088,13 @@ static void updateclockbar(void) {
   width = clockbar_dynw;
   if (!width || width == last_width)
     return;
+
+  /* Finder has replaced the clock surface and fixes its own width, so clock
+   * animation frames must not invalidate and repaint the whole bar behind it. */
+  if (finder_active) {
+    last_width = width;
+    return;
+  }
 
   /* Request one coordinated redraw after the animation and status updates
    * for this frame.  Resizing alone exposes stale pixels in the bar. */
@@ -6201,6 +13190,9 @@ static void sound_monitor_start(void) {
 static void sound_monitor_stop(void) {
   if (clock_draw_running) {
     clock_draw_running = 0;
+	pthread_mutex_lock(&fullscreen_mutex);
+	pthread_cond_broadcast(&fullscreen_cond);
+	pthread_mutex_unlock(&fullscreen_mutex);
     pthread_join(clock_draw_thread, NULL);
   }
   if (sound_loop) {
@@ -6213,6 +13205,18 @@ static void sound_monitor_stop(void) {
     pw_deinit();
     clockanim_running = 0;
   }
+}
+
+static void sound_monitor_pause(int paused) {
+  if (!sound_loop || !sound_stream)
+    return;
+
+  /* Stop receiving audio buffers while the visualizer is hidden.  PipeWire
+   * objects are synchronized through their thread loop. */
+  pw_thread_loop_lock(sound_loop);
+  if (sound_stream)
+    pw_stream_set_active(sound_stream, !paused);
+  pw_thread_loop_unlock(sound_loop);
 }
 
 void movemouse(const Arg *arg) {
@@ -6638,6 +13642,8 @@ void resizebarwin(Monitor *m) {
       XMoveResizeWindow(dpy, m->barkbwin, m->wx, m->by, 1, bh);
     if (m->barrightwin)
       XMoveResizeWindow(dpy, m->barrightwin, m->wx, m->by, 1, bh);
+    if (m->mpris_volume_markerwin)
+      XUnmapWindow(dpy, m->mpris_volume_markerwin);
     if (m == selmon)
       clockbar_win = 0;
     return;
@@ -6653,11 +13659,13 @@ void resizebarwin(Monitor *m) {
 	if (!kw) kw = 1;
 	if (!rw) rw = 1;
 	{
-   unsigned int dcw = (notification_center_active() && m == selmon) ? notify_width
-                                     : ((clockbar_dynw && !notify_clock_hovered &&
-                                         !fullscreen_st && m == selmon)
-                                           ? clockbar_dynw : cw);
-	   unsigned int fcw = (notification_center_active() && m == selmon) ? notify_width : clockbar_cw;
+   unsigned int dcw = (finder_active && m == selmon) ? finder_popup_width() :
+                                      ((notification_center_active() && m == selmon) ? notify_width
+                                       : ((clockbar_dynw && !notify_clock_hovered &&
+                                          !fullscreen_st && m == selmon)
+                                            ? clockbar_dynw : cw));
+   unsigned int fcw = (finder_active && m == selmon) ? finder_popup_width() :
+                      ((notification_center_active() && m == selmon) ? notify_width : clockbar_cw);
 	   if (!dcw) dcw = 1;
 	   if (!fcw) fcw = 1;
 
@@ -6691,18 +13699,31 @@ void resizebarwin(Monitor *m) {
         cx = clock_cx - (int)(fcw + 2 * bargap) / 2;
       }
       int center_y = m->by;
-       unsigned int center_h = (notification_center_active() && m == selmon) ? notify_height : bh;
+         unsigned int center_h = (finder_active && m == selmon) ? finder_popup_height() :
+                               ((notification_center_active() && m == selmon) ? notify_height : bh);
       if (m->barcenterwin) {
-        XMoveResizeWindow(dpy, m->barcenterwin,
-                          cx + (int)(fcw + 2 * bargap) / 2 - (int)dcw / 2,
-                          center_y, dcw, center_h);
+        finder_window_x = cx + (int)(fcw + 2 * bargap) / 2 - (int)dcw / 2;
+        finder_window_y = center_y;
+        if (finder_active && m == selmon) {
+          if (finder_presented_w != dcw ||
+              finder_presented_h != center_h ||
+              finder_presented_x != finder_window_x ||
+              finder_presented_y != finder_window_y)
+            finder_dirty = 1;
+        } else {
+          XMoveResizeWindow(dpy, m->barcenterwin, finder_window_x,
+                            finder_window_y, dcw, center_h);
+        }
         XMapWindow(dpy, m->barcenterwin);
         /* Keep the center window above fullscreen clients as soon as the
          * fullscreen transition lays it out.  The visualizer also needs to
          * stay above the neighboring bar sections while it grows. */
-           if (notification_center_active() ||
-               (clockbar_dynw && !fullscreen_st))
-            XRaiseWindow(dpy, m->barcenterwin);
+             if ((finder_active && m == selmon && finder_dirty) ||
+                (notification_center_active() &&
+                 !(m == selmon && mpris_hovered && mpris_active)) ||
+               (clockbar_dynw && !fullscreen_st &&
+                !(m == selmon && mpris_hovered && mpris_active)))
+             XRaiseWindow(dpy, m->barcenterwin);
            else if (fullscreen_st && m == selmon && m->sel &&
                     m->sel->isfullscreen) {
              /* The notification center uses this same X window and is raised
@@ -6731,8 +13752,25 @@ void resizebarwin(Monitor *m) {
   }
 
   if (m->barrightwin) {
-    XMoveResizeWindow(dpy, m->barrightwin, rx, m->by, rw, bh);
+    XMoveResizeWindow(dpy, m->barrightwin, rx, m->by, rw,
+                      (m == selmon && mpris_hovered && mpris_active)
+                           ? bh * MPRIS_PANEL_HOVER_H : bh);
     XMapWindow(dpy, m->barrightwin);
+    restack_mpris_panel(m);
+  }
+
+  /* Mapping the neighboring bar windows can put them above a center window
+   * which was just opened.  Finder must remain above those windows even when
+   * the pointer is elsewhere, so do the final raise after all bar sections
+   * have been mapped. */
+   if (m->barcenterwin && finder_active && m == selmon && finder_dirty) {
+    XRaiseWindow(dpy, m->barcenterwin);
+    if (m->finder_markerwin && m->finder_marker_mapped) {
+      /* The center window was just raised, so restore the marker's position
+       * once. Do not restack it during ordinary Finder redraws. */
+      XRaiseWindow(dpy, m->finder_markerwin);
+      m->finder_marker_stacked = 1;
+    }
   }
 }
 
@@ -7037,10 +14075,14 @@ void prepare_workspace_switch(Monitor *m, unsigned int oldtags, unsigned int new
 void run(void) {
   XEvent ev;
   int xfd = ConnectionNumber(dpy);
-  int timeout;
+  int timeout, pending_events;
   const int clockbar_timeout = 1000 / DRAW_FPS;
+  const int history_scroll_timeout = 1000 / NOTIFY_HISTORY_FPS;
+  const int finder_glow_timeout = 1000 / 30;
   time_t next_clock_update = 0;
-  struct pollfd pfd[3] = {{.fd = xfd, .events = POLLIN},
+  struct pollfd pfd[5] = {{.fd = xfd, .events = POLLIN},
+                          {.fd = -1, .events = POLLIN},
+                          {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN}};
 
@@ -7053,10 +14095,23 @@ void run(void) {
     time_t minimize_deadline = next_minimize_deadline();
     time_t next_deadline = now - now % 60 + 60;
 
+    if (finder_active && finder_loading) {
+      finder_load_apps();
+      finder_loading = 0;
+      finder_icons_pending = 1;
+      finder_dirty = 1;
+    } else if (finder_active && finder_icons_pending) {
+      if (!finder_load_next_icon())
+        finder_icons_pending = 0;
+      else
+        finder_dirty = 1;
+    }
+    finder_translation_tick();
+
     if (minimize_deadline && minimize_deadline < next_deadline)
       next_deadline = minimize_deadline;
     timeout = next_deadline > now ? (int)((next_deadline - now) * 1000) : 0;
-    if (CLOCK_ANIMATE && timeout > clockbar_timeout)
+    if (CLOCK_ANIMATE && !fullscreen_st && timeout > clockbar_timeout)
       timeout = clockbar_timeout;
     if (notify_current && timeout > 100)
       timeout = 100;
@@ -7064,33 +14119,129 @@ void run(void) {
       timeout = NOTIFY_TRANSITION_MS;
     if (notify_history_active &&
         notify_history_scroll != notify_history_scroll_target &&
-        timeout > clockbar_timeout)
+        timeout > history_scroll_timeout)
+      timeout = history_scroll_timeout;
+    if (finder_active && fabs(finder_scroll_visual - finder_scroll) >= 0.001 &&
+        timeout > history_scroll_timeout)
+      timeout = history_scroll_timeout;
+    if (finder_active && finder_filter_animating &&
+        timeout > history_scroll_timeout)
+      timeout = history_scroll_timeout;
+    if (finder_active && finder_translate_pending &&
+        timeout > finder_glow_timeout)
+      timeout = finder_glow_timeout;
+    if (finder_active && (finder_translate_glow_fade_started_ms ||
+                          finder_translate_result_started_ms ||
+                          finder_translate_outgoing_started_ms ||
+                          finder_math_result_started_ms) &&
+        timeout > finder_glow_timeout)
+      timeout = finder_glow_timeout;
+    if (finder_active && finder_translate_due_ms) {
+      uint64_t now_ms = finder_monotonic_ms();
+      int wait = finder_translate_due_ms > now_ms
+                   ? (int)(finder_translate_due_ms - now_ms) : 0;
+      if (timeout > wait)
+        timeout = wait;
+    }
+    /* Animation ticks run after poll; don't sleep past a final dirty frame
+     * when a transition or eased scroll has just completed. */
+    if (finder_active && finder_dirty)
+      timeout = 0;
+    if (mpris_active && !fullscreen_st && timeout > clockbar_timeout)
       timeout = clockbar_timeout;
-    if (mpris_active && timeout > clockbar_timeout)
-      timeout = clockbar_timeout;
+    if (!fullscreen_st && hasurgentclients() && timeout > 300)
+      timeout = 300;
+    if (finder_active && (finder_loading || finder_icons_pending))
+      timeout = 0;
+    if (finder_active && finder_query[0]) {
+      uint64_t elapsed = finder_monotonic_ms() - finder_cursor_base_ms;
+      uint64_t wait = FINDER_CURSOR_BLINK_MS -
+                      elapsed % FINDER_CURSOR_BLINK_MS;
+      if (timeout > (int)wait)
+        timeout = (int)wait;
+    }
     pfd[1].fd = notify_fd;
     pfd[2].fd = status_event_fd;
-    poll(pfd, status_event_fd >= 0 ? 3 : (notify_fd >= 0 ? 2 : 1), timeout);
+    pfd[3].fd = finder_translate_fd;
+    pfd[4].fd = finder_ocr_fd;
+    poll(pfd, LENGTH(pfd), timeout);
     if (notify_fd >= 0 && (pfd[1].revents & POLLIN))
       notification_dispatch();
     if (status_event_fd >= 0 && (pfd[2].revents & POLLIN))
       status_consume();
+    if (finder_translate_fd >= 0 &&
+        (pfd[3].revents & (POLLIN | POLLHUP | POLLERR)))
+      finder_translation_read();
+    if (finder_ocr_fd >= 0 &&
+        (pfd[4].revents & (POLLIN | POLLHUP | POLLERR)))
+      finder_ocr_read();
+    {
+      struct timespec now_mono;
+      int urgent_redraw = 0;
+
+      clock_gettime(CLOCK_MONOTONIC, &now_mono);
+      if (!fullscreen_st && hasurgentclients()) {
+        long elapsed_ms = (now_mono.tv_sec - urgentflash_last.tv_sec) * 1000L +
+                          (now_mono.tv_nsec - urgentflash_last.tv_nsec) / 1000000L;
+        if (!urgentflash_last.tv_sec || elapsed_ms >= 300) {
+          urgentflash = !urgentflash;
+          urgentflash_last = now_mono;
+          updateurgentborders();
+          urgent_redraw = 1;
+        }
+      } else {
+        urgentflash = 1;
+        urgentflash_last.tv_sec = 0;
+        urgentflash_last.tv_nsec = 0;
+      }
+      if (urgent_redraw)
+        bar_dirty = 1;
+    }
     if (CLOCK_ANIMATE)
       updateclockbar();
+    if (finder_active && finder_query[0]) {
+      int visible = finder_cursor_state();
+      if (visible != finder_cursor_visible) {
+        finder_cursor_visible = visible;
+        finder_dirty = 1;
+      }
+    }
+    if (finder_active && finder_translate_pending)
+      finder_dirty = 1;
     {
       int redraw = bar_dirty;
       bar_dirty = 0;
       if (update_mpris_scroll())
         redraw = 1;
-      if (redraw)
-      drawbars();
+      /* Finder frames update only its center surface.  Keep unrelated bar
+       * windows (including the clock) out of the high-frequency scroll path. */
+      if (finder_active) {
+        if (finder_dirty) {
+          if (!drawfinder_frame(selmon)) {
+            drawbars();
+            redraw = 0;
+          } else {
+            finder_marker(selmon, finder_visible_count() > finder_scroll &&
+                                      finder_selected >= finder_scroll &&
+                                      finder_selected < finder_scroll + finder_rows
+                                    ? finder_selected - finder_scroll + 1 : 0);
+          }
+        }
+        if (redraw)
+          drawrightbar_only();
+      } else if (redraw)
+        drawbars();
 	    }
 	    if (!mpris_active) {
 			mpris_scroll_clock_valid = 0;
 			mpris_scroll_accum_ns = 0;
 		}
-    while (XPending(dpy)) {
+    /* Do not let a sustained stream of pointer events starve animation ticks.
+     * Any remaining events stay queued and make the next poll return at once. */
+    pending_events = 0;
+    while (pending_events < 64 && XPending(dpy)) {
       XNextEvent(dpy, &ev);
+      pending_events++;
 
       /* Xkb StateNotify for Alt sidebar tracking */
       if (xkb_event_base && ev.type == xkb_event_base) {
@@ -7120,6 +14271,9 @@ void run(void) {
     now = time(NULL);
     notification_tick();
     notification_history_tick();
+    finder_filter_tick();
+    finder_translation_anim_tick();
+    finder_scroll_tick();
     if (minimize_deadline && now >= minimize_deadline)
       checkminimize();
     if (now >= next_clock_update) {
@@ -7140,6 +14294,8 @@ void updateclock(void) {
   if (strcmp(buf, clockstr) == 0)
     return;
   strcpy(clockstr, buf);
+  if (finder_active && !finder_query[0])
+    finder_dirty = 1;
   drawbars();
 }
 
@@ -7827,9 +14983,56 @@ void setup(void) {
   sw = DisplayWidth(dpy, screen);
   sh = DisplayHeight(dpy, screen);
   root = RootWindow(dpy, screen);
+  {
+    XVisualInfo template = {0}, *visuals;
+    int nvisuals, i;
+    template.screen = screen;
+    template.depth = 32;
+    template.class = TrueColor;
+    visuals = XGetVisualInfo(dpy, VisualScreenMask | VisualDepthMask |
+                             VisualClassMask, &template, &nvisuals);
+    for (i = 0; visuals && i < nvisuals; i++) {
+      XRenderPictFormat *format = XRenderFindVisualFormat(dpy,
+                                                           visuals[i].visual);
+      if (format && format->type == PictTypeDirect &&
+          format->direct.alphaMask) {
+        finder_argb_visual = visuals[i].visual;
+        finder_argb_depth = visuals[i].depth;
+        finder_argb_colormap = XCreateColormap(dpy, root,
+                                               finder_argb_visual, AllocNone);
+        break;
+      }
+    }
+    if (visuals)
+      XFree(visuals);
+  }
   drw = drw_create(dpy, screen, root, sw, sh);
   if (!drw_fontset_create(drw, fonts, LENGTH(fonts)))
     die("no fonts could be loaded.");
+  {
+    Fnt *normal_fonts = drw->fonts;
+    const char *result_fonts[LENGTH(fonts) + 1];
+    FcChar8 *resized_fonts[LENGTH(fonts)] = {0};
+
+    result_fonts[0] = "Iosevka Medium:style:medium:size=16";
+    for (i = 0; i < LENGTH(fonts); i++) {
+      FcPattern *pattern = FcNameParse((const FcChar8 *)fonts[i]);
+      if (pattern) {
+        FcPatternDel(pattern, FC_SIZE);
+        FcPatternAddDouble(pattern, FC_SIZE, 16.0);
+        resized_fonts[i] = FcNameUnparse(pattern);
+        FcPatternDestroy(pattern);
+      }
+      result_fonts[i + 1] = resized_fonts[i]
+                                ? (const char *)resized_fonts[i] : fonts[i];
+    }
+    finder_result_font = drw_fontset_create(drw, result_fonts,
+                                            LENGTH(result_fonts));
+    for (i = 0; i < LENGTH(fonts); i++)
+      if (resized_fonts[i])
+        FcStrFree(resized_fonts[i]);
+    drw->fonts = normal_fonts;
+  }
   lrpad = drw->fonts->h;
   bh = drw->fonts->h + 2 + vertpadbar + borderpx * 2;
   th = vertpadtab;
@@ -7894,12 +15097,16 @@ void setup(void) {
   scheme[LENGTH(colors)] = drw_scm_create(drw, colors[0], 3);
   for (i = 0; i < LENGTH(colors); i++)
     scheme[i] = drw_scm_create(drw, colors[i], 3);
-  drw_clr_create(drw, &clrborder, col_borderbar);
-  drw_clr_create(drw, &mpris_scroll_bg_clr, "#a6da95");
-  drw_clr_create(drw, &mpris_progress_clr, "#B8E9B4");
-  drw_clr_create(drw, &notify_bg, "#1E1D2D");
-  drw_clr_create(drw, &notify_fg, "#FFFFFF");
-  drw_clr_create(drw, &notify_body, "#CDD6F4");
+   drw_clr_create(drw, &clrborder, col_borderbar);
+     /* Keep the unplayed portion darker than the light-green progress fill. */
+     drw_clr_create(drw, &mpris_scroll_bg_clr, "#A6DA95");
+   drw_clr_create(drw, &mpris_progress_clr, "#B8E9B4");
+   drw_clr_create(drw, &mpris_volume_fill_clr, "#FFFFFF");
+   drw_clr_create(drw, &mpris_volume_empty_clr, "#777777");
+   drw_clr_create(drw, &notify_bg, "#1E1D2D");
+    drw_clr_create(drw, &notify_fg, "#FFFFFF");
+    drw_clr_create(drw, &notify_body, "#CDD6F4");
+    drw_clr_create(drw, &finder_text_clr, finder_text);
   {
     Clr control, control_hover, action_text;
     drw_clr_create(drw, &control, "#363449");
@@ -7928,6 +15135,12 @@ void setup(void) {
   notify_body_scheme[ColFg] = notify_body;
   notify_body_scheme[ColBg] = notify_bg;
   notify_body_scheme[ColBorder] = notify_bg;
+  drw_clr_create(drw, &notify_summary_dim_scheme[ColFg], "#B0B9D2");
+  drw_clr_create(drw, &notify_summary_dim_scheme[ColBg], "#1E1D2D");
+  drw_clr_create(drw, &notify_summary_dim_scheme[ColBorder], "#1E1D2D");
+  drw_clr_create(drw, &notify_body_dim_scheme[ColFg], "#929CB8");
+  drw_clr_create(drw, &notify_body_dim_scheme[ColBg], "#1E1D2D");
+  drw_clr_create(drw, &notify_body_dim_scheme[ColBorder], "#1E1D2D");
   /* init system tray */
   updatesystray();
   /* init bars */
@@ -7988,6 +15201,49 @@ void seturgent(Client *c, int urg) {
   wmh->flags = urg ? (wmh->flags | XUrgencyHint) : (wmh->flags & ~XUrgencyHint);
   XSetWMHints(dpy, c->win, wmh);
   XFree(wmh);
+}
+
+static int hasurgentclients(void) {
+  Monitor *m;
+  Client *c;
+
+  for (m = mons; m; m = m->next)
+    for (c = m->clients; c; c = c->next)
+      if (c->isurgent)
+        return 1;
+  return 0;
+}
+
+static void demandattention(Client *c) {
+  Arg a;
+
+  if (!c)
+    return;
+  if (!c->isurgent)
+    seturgent(c, 1);
+
+  XSetWindowBorder(dpy, c->win,
+                   urgentflash ? scheme[SchemeSel][ColBorder].pixel
+                               : scheme[SchemeNorm][ColBorder].pixel);
+
+  /* Show the client's tag(s), but deliberately leave the focused client
+   * unchanged.  The user can focus the requesting client when ready. */
+  a.ui = c->tags & TAGMASK;
+  if (a.ui)
+    view(&a);
+  drawbars();
+}
+
+static void updateurgentborders(void) {
+  Monitor *m;
+  Client *c;
+
+  for (m = mons; m; m = m->next)
+    for (c = m->clients; c; c = c->next)
+      if (c->isurgent)
+        XSetWindowBorder(dpy, c->win,
+                         urgentflash ? scheme[SchemeSel][ColBorder].pixel
+                                     : scheme[SchemeNorm][ColBorder].pixel);
 }
 
 void show(Client *c) {
@@ -8441,10 +15697,13 @@ void updatebars(void) {
   XSetWindowAttributes wa = {.override_redirect = True,
                              .background_pixmap = ParentRelative,
                              .event_mask = ButtonPressMask | KeyPressMask |
-                                           ExposureMask | PointerMotionMask |
+                              ExposureMask | PointerMotionMask | ButtonReleaseMask |
                                            EnterWindowMask | LeaveWindowMask};
 
   XClassHint ch = {"dwm", "dwm"};
+  XClassHint marker_ch = {"dwm-mpris-volume-marker",
+                          "dwm-mpris-volume-marker"};
+  XClassHint finder_marker_ch = {"dwm-finder-marker", "dwm-finder-marker"};
   for (m = mons; m; m = m->next) {
     if (m->barwin)
       continue;
@@ -8464,10 +15723,48 @@ void updatebars(void) {
     XDefineCursor(dpy, m->bartitlewin, cursor[CurNormal]->cursor);
     XUnmapWindow(dpy, m->bartitlewin);
     XSetClassHint(dpy, m->bartitlewin, &ch);
-    m->barcenterwin = XCreateWindow(
-        dpy, root, m->wx, m->by, 1, bh, 0, DefaultDepth(dpy, screen),
-        CopyFromParent, DefaultVisual(dpy, screen),
-        CWOverrideRedirect | CWBackPixmap | CWEventMask, &wa);
+    {
+      XSetWindowAttributes cwa = {0};
+      unsigned long cmask = CWOverrideRedirect | CWEventMask;
+      int depth = DefaultDepth(dpy, screen);
+      Visual *visual = DefaultVisual(dpy, screen);
+      if (finder_argb_visual) {
+        cwa.background_pixel = 0;
+        cwa.border_pixel = 0;
+        cwa.colormap = finder_argb_colormap;
+        cmask |= CWColormap | CWBackPixel | CWBorderPixel;
+        depth = finder_argb_depth;
+        visual = finder_argb_visual;
+      } else {
+        cwa.background_pixmap = ParentRelative;
+        cmask |= CWBackPixmap;
+      }
+      cwa.override_redirect = True;
+      cwa.event_mask = wa.event_mask;
+      if (finder_argb_visual)
+        finder_argb_create_failed = 0;
+      if (finder_argb_visual)
+        XSetErrorHandler(finder_argb_error);
+      m->barcenterwin = XCreateWindow(dpy, root, m->wx, m->by, 1, bh, 0,
+                                      depth, InputOutput, visual, cmask,
+                                      &cwa);
+      XSync(dpy, False);
+      if (finder_argb_visual)
+        XSetErrorHandler(xerror);
+      if (finder_argb_create_failed && finder_argb_visual) {
+        finder_argb_visual = NULL;
+        finder_argb_depth = 0;
+        if (finder_argb_colormap) {
+          XFreeColormap(dpy, finder_argb_colormap);
+          finder_argb_colormap = None;
+        }
+        cwa = wa;
+        cmask = CWOverrideRedirect | CWBackPixmap | CWEventMask;
+        m->barcenterwin = XCreateWindow(dpy, root, m->wx, m->by, 1, bh, 0,
+                                        DefaultDepth(dpy, screen), InputOutput,
+                                        DefaultVisual(dpy, screen), cmask, &cwa);
+      }
+    }
     XDefineCursor(dpy, m->barcenterwin, cursor[CurNormal]->cursor);
     XUnmapWindow(dpy, m->barcenterwin);
     XSetClassHint(dpy, m->barcenterwin, &ch);
@@ -8485,6 +15782,41 @@ void updatebars(void) {
     XDefineCursor(dpy, m->barrightwin, cursor[CurNormal]->cursor);
     XUnmapWindow(dpy, m->barrightwin);
     XSetClassHint(dpy, m->barrightwin, &ch);
+    {
+      XSetWindowAttributes mwa = {
+        .override_redirect = True,
+        .background_pixel = mpris_volume_fill_clr.pixel,
+        .border_pixel = 0,
+        .event_mask = ButtonPressMask | ButtonReleaseMask |
+                      PointerMotionMask | EnterWindowMask | LeaveWindowMask
+      };
+      m->mpris_volume_markerwin = XCreateWindow(
+          dpy, root, 0, 0, 24, 16, 0, DefaultDepth(dpy, screen),
+          CopyFromParent, DefaultVisual(dpy, screen),
+          CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask,
+          &mwa);
+      XSetClassHint(dpy, m->mpris_volume_markerwin, &marker_ch);
+      XStoreName(dpy, m->mpris_volume_markerwin, "dwm-mpris-volume-marker");
+      XUnmapWindow(dpy, m->mpris_volume_markerwin);
+    }
+    /* Keep Finder's selection indicator in its own fixed native X11 window.
+     * It is 300x38 pixels and pointer motion never changes the selection. */
+    {
+      XSetWindowAttributes fwa = {
+        .override_redirect = True,
+        .background_pixel = scheme[SchemeTitle][ColFg].pixel,
+        .border_pixel = 0,
+        .event_mask = 0
+      };
+      m->finder_markerwin = XCreateWindow(
+          dpy, root, 0, 0, 300, 38, 0, DefaultDepth(dpy, screen),
+          CopyFromParent, DefaultVisual(dpy, screen),
+          CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask,
+          &fwa);
+      XSetClassHint(dpy, m->finder_markerwin, &finder_marker_ch);
+      XStoreName(dpy, m->finder_markerwin, "dwm-finder-marker");
+      XUnmapWindow(dpy, m->finder_markerwin);
+    }
     /* keep the clock above the status bar so the animation can grow over it */
     {
       XWindowChanges wc = {0};
@@ -9059,6 +16391,7 @@ int main(int argc, char *argv[]) {
     die("dwm: cannot open display");
   checkotherwm();
   setup();
+  finder_load_recent();
 #ifdef __OpenBSD__
   if (pledge("stdio rpath proc exec", NULL) == -1)
     die("pledge");

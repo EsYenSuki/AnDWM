@@ -1,0 +1,38 @@
+  if (anim->easing == FINDER_FILTER_EASE_IN)
+  else if (anim->easing == FINDER_FILTER_EASE_OUT) {
+  *y = anim->from_y + (anim->to_y - anim->from_y) * move_eased;
+  *alpha = anim->from_alpha +
+           (anim->to_alpha - anim->from_alpha) * eased;
+  *scale_x = anim->from_scale_x +
+             (anim->to_scale_x - anim->from_scale_x) * eased;
+  *scale_y = anim->from_scale_y +
+             (anim->to_scale_y - anim->from_scale_y) * eased;
+  *blur = anim->from_blur + (anim->to_blur - anim->from_blur) * eased;
+    if (!finder_filter_animating || !anim->active || !anim->outgoing)
+    if (finder_filter_animating && anim->active)
+    anim->from_y = finder_filter_start_present[app_index]
+    anim->to_y = (float)rank;
+    anim->from_alpha = finder_filter_start_present[app_index]
+    anim->to_alpha = 1.0f;
+    anim->from_scale_x = finder_filter_start_present[app_index]
+    anim->to_scale_x = 1.0f;
+    anim->from_scale_y = finder_filter_start_present[app_index]
+    anim->to_scale_y = 1.0f;
+    anim->from_blur = finder_filter_start_present[app_index]
+    anim->to_blur = 0.0f;
+    anim->easing = FINDER_FILTER_EASE_IN_OUT;
+    anim->active = 1;
+    if (anim->active || !finder_filter_start_present[app_index])
+    anim->from_y = anim->to_y = y;
+    anim->from_alpha = finder_filter_start_alpha[app_index];
+    anim->to_alpha = 0.0f;
+    anim->from_scale_x = finder_filter_start_scale_x[app_index];
+    anim->to_scale_x = 0.9f;
+    anim->from_scale_y = finder_filter_start_scale_y[app_index];
+    anim->to_scale_y = 0.7f;
+    anim->from_blur = finder_filter_start_blur[app_index];
+    anim->to_blur = FINDER_FILTER_BLUR_MAX;
+    anim->active = anim->outgoing = 1;
+    anim->easing = FINDER_FILTER_EASE_IN_OUT;
+        if (!anim->active || !anim->outgoing)
+        if (!anim->active)
