@@ -35,6 +35,16 @@ static const char *finder_app_dirs[] = {
     NULL,
 };
 static const int notification_gl    = 1;   /* 1: use OpenGL GPU acceleration for notification and history, 0: use XRender fallback */
+static const char *notification_ignore_apps[] = {
+    NULL,
+};
+static const char *notification_ignore_summaries[] = {
+    NULL,
+};
+static const char *notification_ignore_bodies[] = {
+    "You have unseen notifications.",
+    NULL,
+};
 static const int kblayoutpad        = 17;   /* padding inside the keyboard layout bar */
 static const int vertpadtab         = 35;
 static const int horizpadtabi       = 16;
@@ -195,6 +205,7 @@ static const Key keys[] = {
 
     // screenshot fullscreen and cropped
     { MODKEY|ShiftMask,     		    XK_s,       spawn,          SHCMD("/home/Hi/.config/AnDWM/scripts/bin/znap") },
+    { MODKEY,                           XK_s,       finder_ocr,     {0} },
     { MODKEY,                           XK_a,       finder,         {0} },
     { MODKEY,                           XK_Return,  spawn,          SHCMD("kitty") },
     { MODKEY,                           XK_e,       spawn,          SHCMD("nemo") },
