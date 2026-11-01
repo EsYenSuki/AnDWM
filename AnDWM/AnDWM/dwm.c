@@ -15857,11 +15857,12 @@ void toggletag(const Arg *arg) {
 void toggleview(const Arg *arg) {
   unsigned int newtagset =
       selmon->tagset[selmon->seltags] ^ (arg->ui & TAGMASK);
+  unsigned int oldtagset;
   int i;
 
   if (newtagset) {
-    prepare_workspace_switch(selmon, selmon->tagset[selmon->seltags], newtagset);
-    switchtag();
+    oldtagset = selmon->tagset[selmon->seltags];
+    selmon->seltags ^= 1;
     selmon->tagset[selmon->seltags] = newtagset;
 
     if (newtagset == ~0) {
@@ -15877,6 +15878,12 @@ void toggleview(const Arg *arg) {
       selmon->pertag->curtag = i + 1;
     }
 
+    updatecurrentdesktop(selmon->tagset[selmon->seltags]);
+    drawbars();
+    XFlush(dpy);
+    prepare_workspace_switch(selmon, oldtagset, newtagset);
+    switchtag();
+
     /* apply settings for this view */
     selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
     selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
@@ -15889,7 +15896,6 @@ void toggleview(const Arg *arg) {
     if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag])
       togglebar(NULL);
 
-    updatecurrentdesktop(selmon->tagset[selmon->seltags]);
     focus(NULL);
     arrange(selmon);
   }
@@ -16604,15 +16610,13 @@ void view(const Arg *arg) {
   int i;
   unsigned int tmptag;
   unsigned int newtagset;
+  unsigned int oldtagset;
 
   if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
     return;
-  
+
   newtagset = arg->ui & TAGMASK ? arg->ui & TAGMASK : selmon->pertag->prevtag;
-  updatecurrentdesktop(newtagset);
-   XFlush(dpy);
-  prepare_workspace_switch(selmon, selmon->tagset[selmon->seltags], newtagset);
-  switchtag();
+  oldtagset = selmon->tagset[selmon->seltags];
   selmon->seltags ^= 1; /* toggle sel tagset */
 
   if (arg->ui & TAGMASK) {
@@ -16631,6 +16635,11 @@ void view(const Arg *arg) {
     selmon->pertag->prevtag = selmon->pertag->curtag;
     selmon->pertag->curtag = tmptag;
   }
+
+  updatecurrentdesktop(selmon->tagset[selmon->seltags]);
+  drawbars();
+  XFlush(dpy);
+  prepare_workspace_switch(selmon, oldtagset, newtagset);
 
   selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
   selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
