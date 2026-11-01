@@ -75,7 +75,6 @@
 
 #define SIDEBAR_WIDTH 64
 #define SIDEBAR_CLICK_THRESH 5
-#define DIALOG_ONTOP_PRIORITY 1000
 
 #define FIFO_PATH "/tmp/dwm-pipn.fifo"
 static void
@@ -629,6 +628,10 @@ struct Client {
   int isfixed, iscentered, isfloating, isurgent, neverfocus, oldstate,
       isfullscreen;
   int isontop;
+  int ispassive; /* overlay: clicks go to the app, but dwm never focuses or drags it */
+  int mapw, maph; /* size at map time, used to recognise small toolbars */
+  unsigned int zoomprevtags; /* normal tags while a Zoom overlay uses TAGMASK */
+  int zoomalltags;
   int issticky;     /* sticky to background */
   int stickeystate; /* previous state before being sticky */
   int prevfloating;
@@ -695,6 +698,13 @@ typedef struct {
 /* function declarations */
 static Client *find_pipparent(Client *c);
 static void applyrules(Client *c);
+static int iszoomvideo(Client *c);
+static int iszoompassive(Client *c);
+static int iszoomdragontop(Client *c);
+static void applyzoomflags(Client *c);
+static void raiseontop(Monitor *m);
+static void raisefloating(Monitor *m);
+static void raisemru(Client *c);
 static int applysizehints(Client *c, int *x, int *y, int *w, int *h,
                           int interact);
 static void arrange(Monitor *m);
@@ -921,7 +931,6 @@ typedef struct {
 	char mpris_service[128];
 	char mpris_art[PATH_MAX];
 	double mpris_progress;
-	double mpris_volume;
 	int mpris_playing;
 	int mpris_present;
 } StatusSlot;
@@ -929,6 +938,15 @@ static StatusSlot status_slots[STATUS_SLOTS];
 static pthread_t status_thread;
 static _Atomic int status_running;
 static int status_event_fd = -1;
+static pthread_mutex_t mpris_volume_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char mpris_volume_request_service[128];
+static char mpris_volume_result_service[128];
+static uint64_t mpris_volume_request_serial;
+static uint64_t mpris_volume_change_serial;
+static uint64_t mpris_volume_result_serial;
+static double mpris_volume_result;
+static int mpris_volume_request_pending;
+static int mpris_volume_result_ready;
 static char stext[1024];
 static char mpris_text[768];
 static int mpris_scroll_px;
@@ -1325,6 +1343,8 @@ static int mpris_set_volume(double volume) {
 	const char *signature = "d";
 	if (!mpris_service[0]) return 0;
 	volume = MAX(0.0, MIN(1.0, volume));
+	if (fabs(volume - mpris_volume) < 1e-6)
+		return 0;
 	connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
 	if (!connection) return 0;
 	message = dbus_message_new_method_call(mpris_service, "/org/mpris/MediaPlayer2",
@@ -1352,6 +1372,9 @@ static int mpris_set_volume(double volume) {
 	dbus_message_unref(message);
 	dbus_connection_unref(connection);
 	mpris_volume = volume;
+	pthread_mutex_lock(&mpris_volume_mutex);
+	mpris_volume_change_serial++;
+	pthread_mutex_unlock(&mpris_volume_mutex);
 	return 1;
 }
 
@@ -1462,7 +1485,7 @@ next:
 static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
                         char *service_out, size_t service_len,
                         char *art, size_t artlen, double *progress,
-                        double *volume, int *playing) {
+                        int *playing) {
 	DBusConnection *connection;
 	DBusMessage *reply;
 	DBusMessageIter iter, names;
@@ -1504,8 +1527,6 @@ static int status_mpris(char *out, size_t outlen, char *raw, size_t rawlen,
 		return 0;
 	}
 	snprintf(service_out, service_len, "%s", service);
-	*volume = 1.0;
-	(void)status_dbus_property_double(connection, service, "Volume", volume);
 	if (length_us > 0 && status_dbus_property_int64(connection, service,
 	                                                  "Position", &position_us)) {
 		if (position_us < 0) position_us = 0;
@@ -1575,7 +1596,7 @@ static int status_fan(char *icon, size_t iconlen) {
 static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_len,
                         char *mpris_service_out, size_t mpris_service_len,
                         char *mpris_art_out, size_t mpris_art_len,
-                        double *mpris_progress_out, double *mpris_volume_out,
+                        double *mpris_progress_out,
                         int *mpris_playing_out,
                         int *mpris_present_out,
                         unsigned long long *last_total, unsigned long long *last_active) {
@@ -1635,13 +1656,12 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 	if (mpris_progress_out) *mpris_progress_out = -1.0;
 	if (mpris_service_out && mpris_service_len) mpris_service_out[0] = '\0';
 	if (mpris_art_out && mpris_art_len) mpris_art_out[0] = '\0';
-	if (mpris_volume_out) *mpris_volume_out = 1.0;
 	if (mpris_playing_out) *mpris_playing_out = 0;
 	if (mpris_present_out) *mpris_present_out = 0;
 	has_player = status_mpris(player, sizeof player, mpris_out, mpris_len,
 	                          mpris_service_out, mpris_service_len,
 	                          mpris_art_out, mpris_art_len,
-	                          mpris_progress_out, mpris_volume_out,
+	                          mpris_progress_out,
 	                          mpris_playing_out);
 	if (mpris_present_out) *mpris_present_out = has_player;
 	sav_icon[0] = '\0';
@@ -1670,11 +1690,25 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 	}
 }
 
+static void mpris_request_volume_refresh(void) {
+	if (!mpris_service[0])
+		return;
+	pthread_mutex_lock(&fullscreen_mutex);
+	pthread_mutex_lock(&mpris_volume_mutex);
+	snprintf(mpris_volume_request_service, sizeof mpris_volume_request_service,
+	         "%s", mpris_service);
+	mpris_volume_request_serial = mpris_volume_change_serial;
+	mpris_volume_request_pending = 1;
+	mpris_volume_result_ready = 0;
+	pthread_mutex_unlock(&mpris_volume_mutex);
+	pthread_cond_broadcast(&fullscreen_cond);
+	pthread_mutex_unlock(&fullscreen_mutex);
+}
+
 static void *status_worker(void *arg) {
 	char local[STATUS_SIZE], local_mpris[768], local_service[128], local_art[PATH_MAX];
 	char last_mpris[768] = "";
 	double local_mpris_progress;
-	double local_mpris_volume;
 	int local_mpris_playing;
 	int local_mpris_present;
 	double last_mpris_progress = -1.0;
@@ -1694,7 +1728,7 @@ static void *status_worker(void *arg) {
 
 		status_make(local, sizeof local, local_mpris, sizeof local_mpris,
 		            local_service, sizeof local_service, local_art, sizeof local_art,
-		            &local_mpris_progress, &local_mpris_volume,
+		            &local_mpris_progress,
 		            &local_mpris_playing,
 		            &local_mpris_present,
 		            &last_total, &last_active);
@@ -1720,7 +1754,6 @@ static void *status_worker(void *arg) {
 				memcpy(status_slots[i].mpris_service, local_service, sizeof local_service);
 				memcpy(status_slots[i].mpris_art, local_art, sizeof local_art);
 				status_slots[i].mpris_progress = local_mpris_progress;
-				status_slots[i].mpris_volume = local_mpris_volume;
 				status_slots[i].mpris_playing = local_mpris_playing;
 				status_slots[i].mpris_present = local_mpris_present;
 				atomic_store_explicit(&status_slots[i].state, STATUS_PUBLISHED, memory_order_release);
@@ -1728,16 +1761,61 @@ static void *status_worker(void *arg) {
 				break;
 			}
 		}
-		/* Sleep between regular updates, but wake immediately on fullscreen
-		 * transitions so hidden status polling can stay completely paused. */
+		/* Sleep between regular updates, but wake immediately for a requested
+		 * one-shot volume read or fullscreen transition. */
 		pthread_mutex_lock(&fullscreen_mutex);
 		if (atomic_load_explicit(&status_running, memory_order_acquire) &&
 		    !fullscreen_st) {
-			clock_gettime(CLOCK_REALTIME, &deadline);
-			deadline.tv_sec++;
-			pthread_cond_timedwait(&fullscreen_cond, &fullscreen_mutex, &deadline);
+			int volume_pending;
+			pthread_mutex_lock(&mpris_volume_mutex);
+			volume_pending = mpris_volume_request_pending;
+			pthread_mutex_unlock(&mpris_volume_mutex);
+			if (!volume_pending) {
+				clock_gettime(CLOCK_REALTIME, &deadline);
+				deadline.tv_sec++;
+				pthread_cond_timedwait(&fullscreen_cond, &fullscreen_mutex, &deadline);
+			}
 		}
 		pthread_mutex_unlock(&fullscreen_mutex);
+		/* A volume request wakes the timed wait. Service it here so the wake
+		 * does not trigger an extra status poll before the volume-only query. */
+		{
+			char service[sizeof mpris_volume_request_service];
+			uint64_t request_serial = 0;
+			int requested = 0;
+			pthread_mutex_lock(&mpris_volume_mutex);
+			if (mpris_volume_request_pending) {
+				snprintf(service, sizeof service, "%s", mpris_volume_request_service);
+				request_serial = mpris_volume_request_serial;
+				mpris_volume_request_pending = 0;
+				requested = 1;
+			}
+			pthread_mutex_unlock(&mpris_volume_mutex);
+			if (requested && service[0]) {
+				DBusConnection *connection = dbus_bus_get(DBUS_BUS_SESSION, NULL);
+				double volume;
+				int got_volume = connection &&
+					status_dbus_property_double(connection, service, "Volume", &volume);
+				if (connection)
+					dbus_connection_unref(connection);
+				if (got_volume) {
+					volume = MAX(0.0, MIN(1.0, volume));
+					pthread_mutex_lock(&mpris_volume_mutex);
+					snprintf(mpris_volume_result_service,
+					         sizeof mpris_volume_result_service, "%s", service);
+					mpris_volume_result = volume;
+					mpris_volume_result_ready = 1;
+					/* Carry the request's serial so the UI can discard a stale
+					 * result if the user moved the slider while it was in flight. */
+					mpris_volume_result_serial = request_serial;
+					pthread_mutex_unlock(&mpris_volume_mutex);
+					if (status_event_fd >= 0) {
+						uint64_t one = 1;
+						(void)write(status_event_fd, &one, sizeof one);
+					}
+				}
+			}
+		}
 	}
 	return NULL;
 }
@@ -1766,7 +1844,10 @@ static void status_stop(void) {
 
 static void status_consume(void) {
 	uint64_t value;
-	if (status_event_fd >= 0) while (read(status_event_fd, &value, sizeof value) == sizeof value) ;
+	if (status_event_fd >= 0) {
+		while (read(status_event_fd, &value, sizeof value) == sizeof value)
+			;
+	}
 	for (int i = 0; i < STATUS_SLOTS; i++) {
 		int expected = STATUS_PUBLISHED;
 		if (atomic_compare_exchange_strong_explicit(&status_slots[i].state, &expected,
@@ -1797,7 +1878,6 @@ static void status_consume(void) {
 				mpris_art_w = mpris_art_h = 0;
 			}
 			mpris_progress = status_slots[i].mpris_progress;
-			mpris_volume = status_slots[i].mpris_volume;
 			mpris_playing = status_slots[i].mpris_playing;
 			mpris_present = status_slots[i].mpris_present;
 			/* Paused players have no scrolling title, but remain available to
@@ -1820,6 +1900,26 @@ static void status_consume(void) {
 			if (!fullscreen_st)
 				bar_dirty = 1;
 			break;
+		}
+	}
+	{
+		char service[sizeof mpris_volume_result_service];
+		double volume = 0.0;
+		uint64_t result_serial = 0;
+		int ready = 0;
+		pthread_mutex_lock(&mpris_volume_mutex);
+		if (mpris_volume_result_ready) {
+			snprintf(service, sizeof service, "%s", mpris_volume_result_service);
+			volume = mpris_volume_result;
+			result_serial = mpris_volume_result_serial;
+			mpris_volume_result_ready = 0;
+			ready = 1;
+		}
+		pthread_mutex_unlock(&mpris_volume_mutex);
+		if (ready && !strcmp(service, mpris_service) &&
+		    result_serial == mpris_volume_change_serial) {
+			mpris_volume = volume;
+			bar_dirty = 1;
 		}
 	}
 }
@@ -2444,6 +2544,24 @@ struct NumTags {
 };
 
 /* function implementations */
+
+/* Overlay clients stack by spawn order: each new overlay gets a priority one
+ * higher than every overlay that came before it, so later windows appear above
+ * older ones. Zero means "not an overlay". */
+static int ontop_priority_counter;
+
+static int nextontoppriority(void) {
+  if (ontop_priority_counter < 1 || ontop_priority_counter == INT_MAX)
+    ontop_priority_counter = 1;
+  return ontop_priority_counter++;
+}
+
+static void promoteontop(Client *c) {
+  if (!c)
+    return;
+  c->isontop = nextontoppriority();
+}
+
 void applyrules(Client *c) {
   const char *class, *instance;
   unsigned int i;
@@ -2467,7 +2585,7 @@ void applyrules(Client *c) {
         (!r->instance || strstr(instance, r->instance))) {
       c->iscentered = r->iscentered;
       c->isfloating = r->isfloating;
-      c->isontop = r->isontop;
+      c->isontop = r->isontop ? nextontoppriority() : 0;
       if (c->isontop)
         c->isfloating = 1;
       c->tags |= r->tags;
@@ -2483,6 +2601,87 @@ void applyrules(Client *c) {
     XFree(ch.res_name);
   c->tags =
       c->tags & TAGMASK ? c->tags & TAGMASK : c->mon->tagset[c->mon->seltags];
+}
+
+/* Zoom's floating video window (PiP-style). It keeps its own geometry and is
+ * visible on every tag. */
+static int iszoomvideo(Client *c) {
+  return c && c->name[0] &&
+         strcmp(c->name, "zoom_linux_float_video_window") == 0;
+}
+
+/* Zoom's overlay toolbars follow the PiP stacking rule: they remain above the
+ * client being dragged instead of being temporarily lowered. */
+static int iszoomdragontop(Client *c) {
+  return iszoomvideo(c) ||
+         (c && c->name[0] &&
+          (strcmp(c->name, "annotate_toolbar") == 0 ||
+           strcmp(c->name, "as_toolbar") == 0));
+}
+
+/* Zoom's small floating toolbars: the annotation toolbar and the compact
+ * control bar whose _NET_WM_NAME is just "zoom". These are click targets; dwm
+ * must not focus, move or resize them. */
+static int iszoompassive(Client *c) {
+  if (!c || !c->name[0])
+    return 0;
+  /* Once recognised, keep the classification while it still has a toolbar
+   * title, even if Zoom later resizes it. */
+  if (c->ispassive &&
+      (strcmp(c->name, "annotate_toolbar") == 0 ||
+       strcmp(c->name, "as_toolbar") == 0 ||
+       strcmp(c->name, "zoom") == 0))
+    return 1;
+  if (strcmp(c->name, "annotate_toolbar") == 0 ||
+      strcmp(c->name, "as_toolbar") == 0)
+    return 1;
+  if (strcmp(c->name, "zoom") != 0)
+    return 0;
+  /* The control bar is a small window; check both its current size and the
+   * size it had when it was mapped, since the title can arrive after dwm has
+   * already resized it for a tiled layout. */
+  return (c->w > 0 && c->w <= 900 && c->h > 0 && c->h <= 200) ||
+         (c->mapw > 0 && c->mapw <= 900 && c->maph > 0 && c->maph <= 200);
+}
+
+static void applyzoomflags(Client *c) {
+  int zoomoverlay;
+
+  if (!c)
+    return;
+
+  zoomoverlay = iszoomvideo(c) || iszoompassive(c);
+  if (zoomoverlay && !c->zoomalltags) {
+    /* Keep the ordinary assignment so a later title change cannot leave this
+     * client permanently on every tag. */
+    c->zoomprevtags = c->tags & TAGMASK;
+    if (!c->zoomprevtags)
+      c->zoomprevtags = c->mon->tagset[c->mon->seltags] & TAGMASK;
+    c->zoomalltags = 1;
+  }
+
+  if (iszoomvideo(c)) {
+    c->iscentered = 0;
+    c->isfloating = 1;
+    c->tags = TAGMASK;
+    if (!c->isontop)
+      promoteontop(c);
+  } else if (iszoompassive(c)) {
+    c->iscentered = 0;
+    c->isfloating = 1;
+    c->ispassive = 1;
+    c->neverfocus = 1;
+    /* Like the Zoom PiP video, the toolbars stay visible on every tag. */
+    c->tags = TAGMASK;
+    if (!c->isontop)
+      promoteontop(c);
+  } else if (!zoomoverlay && c->zoomalltags) {
+    c->tags = c->zoomprevtags & TAGMASK;
+    if (!c->tags)
+      c->tags = c->mon->tagset[c->mon->seltags] & TAGMASK;
+    c->zoomalltags = 0;
+    setclienttagprop(c);
+  }
 }
 
 int applysizehints(Client *c, int *x, int *y, int *w, int *h, int interact) {
@@ -2750,7 +2949,7 @@ void buttonpress(XEvent *e) {
     i = 0;
     x = 0;
     for (c = selmon->clients; c; c = c->next) {
-      if (!ISVISIBLE(c))
+      if (!ISVISIBLE(c) || c->ispassive)
         continue;
       x += selmon->tab_widths[i];
       if (ev->x > x)
@@ -11051,6 +11250,16 @@ static int finder_argb_error(Display *display, XErrorEvent *event) {
   return 0;
 }
 
+/* Tag bits a client contributes to the "this tag has windows" indicator.
+ * Clients shown on every tag (Zoom overlays and other helpers with
+ * tags == TAGMASK) contribute nothing, so the tag indicators stay grey.
+ * Sticky clients keep lighting the tags they came from. */
+static unsigned int occupiedtags(Client *c) {
+  if (c->issticky)
+    return c->oldtags;
+  return c->tags == TAGMASK ? 0 : c->tags;
+}
+
 void drawbar(Monitor *m) {
   int y = borderpx;
   int bh_n = bh - borderpx * 2;
@@ -11068,7 +11277,7 @@ void drawbar(Monitor *m) {
   }
 
   for (c = m->clients; c; c = c->next) {
-    occ |= (c->issticky ? c->oldtags : c->tags);
+    occ |= occupiedtags(c);
   }
 
   barwidths(m, &tw, &tlw, &cw, &kw, &rw);
@@ -11541,7 +11750,7 @@ void drawtab(Monitor *m) {
   /* Calculates number of labels and their width */
   m->ntabs = 0;
   for (c = m->clients; c; c = c->next) {
-    if (!ISVISIBLE(c))
+    if (!ISVISIBLE(c) || c->ispassive)
       continue;
     m->tab_widths[m->ntabs] =
         MIN(TEXTW(c->name) - lrpad + horizpadtabi + horizpadtabo, 250);
@@ -11572,7 +11781,7 @@ void drawtab(Monitor *m) {
   drw_rect(drw, 0, 0, mw, th, 1, 1);
 
   for (c = m->clients; c; c = c->next) {
-    if (!ISVISIBLE(c))
+    if (!ISVISIBLE(c) || c->ispassive)
       continue;
     if (i >= m->ntabs)
       break;
@@ -11802,7 +12011,8 @@ void enternotify(XEvent *e) {
   if (ev->window == selmon->barrightwin) {
     if (mpris_active && !mpris_hovered) {
       mpris_hovered = 1;
-		  drawbars();
+		mpris_request_volume_refresh();
+		drawbars();
       resizebarwin(selmon);
     }
     return;
@@ -11925,8 +12135,13 @@ static void updatefullscreenstatus(Client *c) {
 }
 
 void focus(Client *c) {
+  /* Passive overlays are click targets, never keyboard focus targets. */
+  if (c && c->ispassive)
+    return;
   if (!c || (!ISVISIBLE(c) || HIDDEN(c)))
-    for (c = selmon->stack; c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky); c = c->snext)
+    for (c = selmon->stack;
+         c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky || c->ispassive || c->isontop);
+         c = c->snext)
       ;
   if (selmon->sel && selmon->sel != c)
     unfocus(selmon->sel, 0);
@@ -11978,19 +12193,21 @@ void focusstack(const Arg *arg) {
     return;
   if (arg->i > 0) {
     for (c = selmon->sel->next;
-         c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky); c = c->next)
+         c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky || c->ispassive || c->isontop);
+         c = c->next)
       ;
     if (!c)
       for (c = selmon->clients;
-           c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky); c = c->next)
+           c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky || c->ispassive || c->isontop);
+           c = c->next)
         ;
   } else {
     for (i = selmon->clients; i != selmon->sel; i = i->next)
-      if (ISVISIBLE(i) && !HIDDEN(i) && !i->issticky)
+      if (ISVISIBLE(i) && !HIDDEN(i) && !i->issticky && !i->ispassive && !i->isontop)
         c = i;
     if (!c)
       for (; i; i = i->next)
-        if (ISVISIBLE(i) && !HIDDEN(i) && !i->issticky)
+        if (ISVISIBLE(i) && !HIDDEN(i) && !i->issticky && !i->ispassive && !i->isontop)
           c = i;
   }
   if (c) {
@@ -12006,7 +12223,7 @@ void focuswin(const Arg *arg) {
   int iwin = arg->i;
   Client *c = NULL;
   for (c = selmon->clients; c && (iwin || !ISVISIBLE(c)); c = c->next) {
-    if (ISVISIBLE(c) && !c->issticky)
+    if (ISVISIBLE(c) && !c->issticky && !c->ispassive)
       --iwin;
   };
   if (c) {
@@ -12100,6 +12317,10 @@ void grabbuttons(Client *c, int focused) {
     unsigned int modifiers[] = {0, LockMask, numlockmask,
                                 numlockmask | LockMask};
     XUngrabButton(dpy, AnyButton, AnyModifier, c->win);
+    /* Passive overlays receive mouse clicks directly; dwm must not intercept
+     * them for focus, moving or resizing. */
+    if (c->ispassive)
+      return;
     if (!focused)
       XGrabButton(dpy, AnyButton, AnyModifier, c->win, False, BUTTONMASK,
                   GrabModeAsync, GrabModeAsync, None, None);
@@ -12623,6 +12844,8 @@ void manage(Window w, XWindowAttributes *wa) {
   c->y = c->oldy = wa->y;
   c->w = c->oldw = wa->width;
   c->h = c->oldh = wa->height;
+  c->mapw = wa->width;
+  c->maph = wa->height;
   c->oldbw = wa->border_width;
   c->cfact = 1.0;
   updateicon(c);
@@ -12649,8 +12872,8 @@ void manage(Window w, XWindowAttributes *wa) {
   XSetWindowBorder(dpy, w, scheme[SchemeNorm][ColBorder].pixel);
   configure(c); /* propagates border_width, if size doesn't change */
   updatewindowtype(c);
-  if (trans != None)
-    c->isontop = DIALOG_ONTOP_PRIORITY;
+  if (trans != None && !c->isontop)
+    promoteontop(c);
   updatesizehints(c);
   updatewmhints(c);
   {
@@ -12673,6 +12896,7 @@ void manage(Window w, XWindowAttributes *wa) {
     if (n > 0)
       XFree(data);
   }
+  applyzoomflags(c);
   setclienttagprop(c);
 
   if (c->iscentered) {
@@ -12712,9 +12936,9 @@ void manage(Window w, XWindowAttributes *wa) {
     XMapWindow(dpy, c->win);
 
   /* Mapping can reset the window's position in the X stacking order. Keep
-   * managed dialogs above existing floating windows after they are visible. */
-  if (!HIDDEN(c) && c->isontop == DIALOG_ONTOP_PRIORITY) {
-    XRaiseWindow(dpy, c->win);
+   * managed overlays above existing floating windows after they are visible. */
+  if (!HIDDEN(c) && c->isontop) {
+    raiseontop(c->mon);
     XFlush(dpy);
   }
 
@@ -12728,8 +12952,26 @@ void manage(Window w, XWindowAttributes *wa) {
     if (XQueryPointer(dpy, root, &dummy, &pointerwin, &pointerx, &pointery,
                       &pointerxwin, &pointerywin, &pointermask))
       pointerc = wintoclient(pointerwin);
+    if (pointerc && pointerc->ispassive)
+      pointerc = selmon->sel;
     focus(pointerc);
   }
+
+  /* A newly mapped ordinary floating window must stay above the floating
+   * windows that already existed. focus() moves the pointer client to the top
+   * of the stack, so move the new one back to the top afterwards. */
+  if (!HIDDEN(c) && c->isfloating && !c->ispassive && !c->isontop &&
+      !c->issticky) {
+    detachstack(c);
+    attachstack(c);
+    XRaiseWindow(dpy, c->win);
+    XFlush(dpy);
+  }
+
+  /* updatewmhints() runs before this client is attached to the client list,
+   * so handle urgency present at map time after the client is fully managed. */
+  if (c->isurgent)
+    demandattention(c);
 }
 
 void mappingnotify(XEvent *e) {
@@ -13230,12 +13472,13 @@ void movemouse(const Arg *arg) {
 
   if (!(c = selmon->sel))
     return;
-  if (c->isfullscreen || c->issticky) /* no support moving fullscreen or sticky windows by mouse */
+  if (c->isfullscreen || c->issticky || c->ispassive) /* no support moving fullscreen, sticky or passive windows by mouse */
     return;
   if (!c->isfloating && selmon->lt[selmon->sellt]->arrange) {
     was_tiled = 1;
     togglefloating_noarrange(c);
   }
+  raisemru(c);
   restack(selmon);
   XFlush(dpy);
   lastw = c->w;
@@ -13245,6 +13488,9 @@ void movemouse(const Arg *arg) {
                    None, cursor[CurMove]->cursor, last_ev_time) != GrabSuccess)
     return;
   dragclient = c;
+  /* Restack once more after marking the drag client so passive toolbars are
+   * lowered during the actual drag, not only after it finishes. */
+  restack(selmon);
   setnoanimation_async(c, 1);
   if (!getrootptr(&x, &y)) {
     XUngrabPointer(dpy, CurrentTime);
@@ -13359,7 +13605,7 @@ void placemouse(const Arg *arg) {
       !c->mon->lt[c->mon->sellt]->arrange) /* no support for placemouse when
                                               floating layout is used */
     return;
-  if (c->isfullscreen || c->issticky) /* no support placing fullscreen or sticky windows by mouse */
+  if (c->isfullscreen || c->issticky || c->ispassive) /* no support placing fullscreen, sticky or passive windows by mouse */
     return;
   restack(selmon);
   prevr = c;
@@ -13367,6 +13613,8 @@ void placemouse(const Arg *arg) {
                    None, cursor[CurMove]->cursor, CurrentTime) != GrabSuccess)
     return;
   dragclient = c;
+  /* Keep passive toolbars below the window while it is being placed. */
+  restack(selmon);
   XFlush(dpy);
   setnoanimation_async(c, 1);
 
@@ -13531,7 +13779,7 @@ void propertynotify(XEvent *e) {
     case XA_WM_TRANSIENT_FOR:
       if (XGetTransientForHint(dpy, c->win, &trans)) {
         if ((c->isfloating = (wintoclient(trans)) != NULL))
-          c->isontop = DIALOG_ONTOP_PRIORITY;
+          promoteontop(c);
         arrange(c->mon);
         XRaiseWindow(dpy, c->win);
       }
@@ -13547,6 +13795,21 @@ void propertynotify(XEvent *e) {
     }
     if (ev->atom == XA_WM_NAME || ev->atom == netatom[NetWMName]) {
       updatetitle(c);
+      /* Zoom sets the titles of its floating toolbars after mapping. Re-apply
+       * their flags once the real name is known. Re-evaluate non-Zoom titles
+       * too, so a client changing from an overlay title is restored to its
+       * ordinary tag assignment. */
+      {
+        int waszoom = c->zoomalltags;
+        applyzoomflags(c);
+        if (waszoom || iszoomvideo(c) || iszoompassive(c)) {
+          setclienttagprop(c);
+          if (iszoomvideo(c) || iszoompassive(c)) {
+            grabbuttons(c, 0);
+            raiseontop(c->mon);
+          }
+        }
+      }
       if (c == c->mon->sel)
         drawbar(c->mon);
       drawtab(c->mon);
@@ -13828,9 +14091,10 @@ void resizemouse(const Arg *arg) {
   int last_quadrant = -1;
   int quadrant;
 
-  if (!(c = selmon->sel) || c->isfullscreen || c->issticky)
+  if (!(c = selmon->sel) || c->isfullscreen || c->issticky || c->ispassive)
     return;
 
+  raisemru(c);
   restack(selmon);
 
   /* original position and size */
@@ -13913,6 +14177,7 @@ void resizemouse(const Arg *arg) {
     selmon = m;
     focus(NULL);
   }
+  restack(c->mon);
 }
 
 void resizerequest(XEvent *e) {
@@ -13923,6 +14188,84 @@ void resizerequest(XEvent *e) {
     updatesystrayicongeom(i, ev->width, ev->height);
     resizebarwin(selmon);
     updatesystray();
+  }
+}
+
+/* Raise ordinary floating clients in most-recently-used order. m->stack is
+ * newest first, so raise the oldest first and leave the newest on top. Newly
+ * spawned floating windows are attached at the head of that list and therefore
+ * appear above the floating windows that already existed. */
+static void raisefloating(Monitor *m) {
+  Client *c;
+  Client *floating[256];
+  int count = 0, i;
+
+  if (!m)
+    return;
+
+  for (c = m->stack; c && count < 256; c = c->snext)
+    if (ISVISIBLE(c) && !HIDDEN(c) && !c->isfullscreen && !c->issticky &&
+        !c->isontop && (c->isfloating || !m->lt[m->sellt]->arrange))
+      floating[count++] = c;
+
+  for (i = count - 1; i >= 0; i--)
+    XRaiseWindow(dpy, floating[i]->win);
+}
+
+/* Make c the most recent normal floating window so restack() raises it above
+ * the other floating windows while dragging or resizing it. Overlays stay on
+ * top because raiseontop() runs after raisefloating() and c is not promoted
+ * to an isontop client here. */
+static void raisemru(Client *c) {
+  if (!c)
+    return;
+  detachstack(c);
+  attachstack(c);
+  c->mon->sel = c;
+}
+
+/* Raise overlay clients by priority. Within the same priority the most
+ * recently focused window stays on top. Called after fullscreen windows are
+ * raised so overlays (Zoom toolbars, dialogs) remain visible above them. */
+static void raiseontop(Monitor *m) {
+  Client *c;
+  Client *ontop_clients[256];
+  int ontop_count = 0;
+  XWindowChanges wc;
+  Window sibling = None;
+
+  if (!m)
+    return;
+
+  for (c = m->stack; c && ontop_count < 256; c = c->snext)
+    if (c->isontop && !c->issticky && !c->isfullscreen && ISVISIBLE(c) &&
+        !HIDDEN(c) &&
+        (!dragclient || !c->ispassive || iszoomdragontop(c)))
+      ontop_clients[ontop_count++] = c;
+
+  if (!ontop_count)
+    return;
+
+  for (int i = 1; i < ontop_count; i++) {
+    Client *key = ontop_clients[i];
+    int j = i - 1;
+    while (j >= 0 && ontop_clients[j]->isontop < key->isontop) {
+      ontop_clients[j + 1] = ontop_clients[j];
+      j--;
+    }
+    ontop_clients[j + 1] = key;
+  }
+
+  for (int i = 0; i < ontop_count; i++) {
+    c = ontop_clients[i];
+    if (sibling == None) {
+      XRaiseWindow(dpy, c->win);
+    } else {
+      wc.sibling = sibling;
+      wc.stack_mode = Below;
+      XConfigureWindow(dpy, c->win, CWSibling | CWStackMode, &wc);
+    }
+    sibling = c->win;
   }
 }
 
@@ -13958,34 +14301,16 @@ void restack(Monitor *m) {
         wc.sibling = c->win;
       }
   }
-  {
-    Client *ontop_clients[256];
-    int ontop_count = 0;
+  raisefloating(m);
+  raiseontop(m);
+  /* Passive toolbars must not cover the client being dragged.  Lower them
+   * only for the active drag; the normal overlay stacking is restored by the
+   * restack after ButtonRelease. */
+  if (dragclient)
     for (c = m->stack; c; c = c->snext)
-      if (c->isontop && !c->issticky && !c->isfullscreen && ISVISIBLE(c))
-        ontop_clients[ontop_count++] = c;
-    for (int i = 1; i < ontop_count; i++) {
-      Client *key = ontop_clients[i];
-      int j = i - 1;
-      while (j >= 0 && ontop_clients[j]->isontop < key->isontop) {
-        ontop_clients[j + 1] = ontop_clients[j];
-        j--;
-      }
-      ontop_clients[j + 1] = key;
-    }
-    Window isontop_sibling = None;
-    for (int i = 0; i < ontop_count; i++) {
-      c = ontop_clients[i];
-      if (isontop_sibling == None) {
-        XRaiseWindow(dpy, c->win);
-      } else {
-        wc.sibling = isontop_sibling;
-        wc.stack_mode = Below;
-        XConfigureWindow(dpy, c->win, CWSibling | CWStackMode, &wc);
-      }
-      isontop_sibling = c->win;
-    }
-  }
+      if (c->ispassive && !iszoomdragontop(c) && ISVISIBLE(c) &&
+          !HIDDEN(c))
+        XLowerWindow(dpy, c->win);
   XFlush(dpy);
   while (XCheckMaskEvent(dpy, EnterWindowMask, &ev))
     ;
@@ -13997,13 +14322,9 @@ void restack(Monitor *m) {
  * compositor/WM-owned overlays.  Keep these above fullscreen after a client
  * or the WM changes the stacking order. */
 static void raisefullscreenoverlays(Monitor *m) {
-  Client *c;
-
   if (!m)
     return;
-  for (c = m->stack; c; c = c->snext)
-    if (c->isontop && !c->isfullscreen && ISVISIBLE(c) && !HIDDEN(c))
-      XRaiseWindow(dpy, c->win);
+  raiseontop(m);
   if (m->sidebarvisible)
     XRaiseWindow(dpy, m->sidebarwin);
   if (m == selmon && notification_center_active() && m->barcenterwin)
@@ -15216,6 +15537,7 @@ static int hasurgentclients(void) {
 
 static void demandattention(Client *c) {
   Arg a;
+  int changedmon;
 
   if (!c)
     return;
@@ -15226,11 +15548,33 @@ static void demandattention(Client *c) {
                    urgentflash ? scheme[SchemeSel][ColBorder].pixel
                                : scheme[SchemeNorm][ColBorder].pixel);
 
-  /* Show the client's tag(s), but deliberately leave the focused client
-   * unchanged.  The user can focus the requesting client when ready. */
   a.ui = c->tags & TAGMASK;
-  if (a.ui)
+  if (a.ui == TAGMASK && c->isontop) {
+    /* An always-on-top client such as Zoom PiP is already visible on every
+     * workspace.  Never turn its attention request into the special all-tags
+     * view, and do not move to its monitor just because it requested focus. */
+    drawbars();
+    return;
+  }
+
+  /* Switch to the requesting client's monitor before showing its tag(s).
+   * Do not explicitly focus the requesting client. */
+  changedmon = c->mon != selmon;
+  if (changedmon) {
+    unfocus(selmon->sel, 0);
+    selmon = c->mon;
+  }
+  /* TAGMASK means the client is deliberately visible on every tag (for
+   * example Zoom's PiP).  Passing TAGMASK to view() changes the desktop into
+   * the special "all tags" view, which makes every normal window appear on
+   * the current tag.  Such a client is already visible, so do not switch the
+   * workspace for its attention request.  A normal client, such as Zoom's
+   * Meeting window with tags=4, still switches to its assigned tag. */
+  if (a.ui && a.ui != TAGMASK &&
+      (!changedmon || a.ui != selmon->tagset[selmon->seltags]))
     view(&a);
+  else if (changedmon)
+    focus(NULL);
   drawbars();
 }
 
@@ -15369,7 +15713,7 @@ void switchtag(void) {
   Imlib_Image image;
 
   for (c = selmon->clients; c; c = c->next)
-    occ |= c->tags;
+    occ |= occupiedtags(c);
   for (i = 0; i < LENGTH(tags); i++) {
     if (selmon->tagset[selmon->seltags] & 1 << i) {
       if (selmon->tagmap[i] != 0) {
@@ -15445,7 +15789,7 @@ void togglebar(const Arg *arg) {
 }
 
 void togglefloating_noarrange(Client *c) {
-  if (!c || c->isfullscreen || c->issticky)
+  if (!c || c->isfullscreen || c->issticky || c->ispassive)
     return;
   c->isfloating = !c->isfloating || c->isfixed;
   if (c->isfloating)
@@ -15457,7 +15801,7 @@ void togglefloating(const Arg *arg) {
 
   if (!c)
     return;
-  if (c->isfullscreen || c->issticky) /* no support for fullscreen or sticky windows */
+  if (c->isfullscreen || c->issticky || c->ispassive) /* no support for fullscreen, sticky or passive windows */
     return;
 
   c->isfloating = !c->isfloating || c->isfixed;
@@ -16218,17 +16562,20 @@ void updatewindowtype(Client *c) {
   if (wtype == netatom[NetWMWindowTypeDialog]) {
     c->iscentered = 1;
     c->isfloating = 1;
-    c->isontop = DIALOG_ONTOP_PRIORITY;
+    if (!c->isontop)
+      promoteontop(c);
   }
 }
 
 void updatewmhints(Client *c) {
   XWMHints *wmh;
+  int wasurgent = c->isurgent;
 
   if ((wmh = XGetWMHints(dpy, c->win))) {
     if (c == selmon->sel && wmh->flags & XUrgencyHint) {
       wmh->flags &= ~XUrgencyHint;
       XSetWMHints(dpy, c->win, wmh);
+      c->isurgent = 0;
     } else
       c->isurgent = (wmh->flags & XUrgencyHint) ? 1 : 0;
     if (wmh->flags & InputHint)
@@ -16237,6 +16584,20 @@ void updatewmhints(Client *c) {
       c->neverfocus = 0;
     XFree(wmh);
   }
+  /* Passive overlays must never become the keyboard focus target. */
+  if (c->ispassive)
+    c->neverfocus = 1;
+
+  if (wasurgent && !c->isurgent)
+    XSetWindowBorder(dpy, c->win,
+                     c == c->mon->sel ? scheme[SchemeSel][ColBorder].pixel
+                                      : scheme[SchemeNorm][ColBorder].pixel);
+
+  /* A newly urgent managed client should be brought into view. During
+   * manage(), hints are read before the client is attached; manage() handles
+   * that initial-urgency case once setup is complete. */
+  if (!wasurgent && c->isurgent && wintoclient(c->win) == c)
+    demandattention(c);
 }
 
 void view(const Arg *arg) {
@@ -16246,7 +16607,7 @@ void view(const Arg *arg) {
 
   if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
     return;
-  
+
   newtagset = arg->ui & TAGMASK ? arg->ui & TAGMASK : selmon->pertag->prevtag;
   updatecurrentdesktop(newtagset);
    XFlush(dpy);
