@@ -141,7 +141,8 @@ static const Rule rules[] = {
     { "wired",    NULL,       NULL,       0,            0,           1,           10,       -1 },
     { "highlight-pointer",    NULL,       NULL,       0,            0,           1,           99,       -1 },
     { "mpv",      NULL,       NULL,       0,            1,           1,           1,        -1 },
-    { "MainKt",      NULL,       NULL,       1,            1,           1,           1,        -1 }
+    { "MainKt",      NULL,       NULL,       1,            1,           1,           1,        -1 },
+    { "Overlayed", NULL,       NULL,       ~0,           0,           1,           1,        -1 }
 
 };
 
@@ -213,6 +214,7 @@ static const Key keys[] = {
     { MODKEY,                           XK_v,       spawn,          SHCMD("/home/Hi/.config/AnDWM/scripts/bin/clyp") },
     { MODKEY,                           XK_period,  spawn,          SHCMD("rofi -modi \"emoji:rofimoji --action copy --hidden-descriptions\" -show emoji -theme /home/Hi/.config/AnDWM/rofi/moji.rasi") },
     { MODKEY|ShiftMask,                 XK_c,       spawn,          SHCMD("picom cursor toggle") },
+    { MODKEY|ShiftMask,                 XK_d,       toggleoverlayed, {0} },
 
     // zoom keybind
     { MODKEY,                           XK_equal,   spawn,          SHCMD("picom-zoom +0.2") },

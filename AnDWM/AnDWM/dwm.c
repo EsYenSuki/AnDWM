@@ -72,6 +72,8 @@
 #include FT_LCD_FILTER_H
 #include <hb.h>
 #include <hb-ft.h>
+#include <libinput.h>
+#include <libudev.h>
 
 #define SIDEBAR_WIDTH 64
 #define SIDEBAR_CLICK_THRESH 5
@@ -629,6 +631,7 @@ struct Client {
       isfullscreen;
   int isontop;
   int ispassive; /* overlay: clicks go to the app, but dwm never focuses or drags it */
+  int isoverlayed; /* borderless app overlay with a dedicated visibility toggle */
   int mapw, maph; /* size at map time, used to recognise small toolbars */
   unsigned int zoomprevtags; /* normal tags while a Zoom overlay uses TAGMASK */
   int zoomalltags;
@@ -716,6 +719,14 @@ static void buttonrelease(XEvent *e);
 static void checkotherwm(void);
 static void cleanup(void);
 static void prepare_workspace_switch(Monitor *m, unsigned int oldtags, unsigned int newtags);
+static void init_touchpad_swipes(void);
+static void cleanup_touchpad_swipes(void);
+static void dispatch_touchpad_swipes(void);
+static void handle_touchpad_swipe(struct libinput_event *event);
+static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
+                                 double device_width_mm);
+static void update_touchpad_swipe(double dx_mm);
+static void finish_touchpad_swipe(int cancelled);
 static void checkminimize(void);
 static time_t next_minimize_deadline(void);
 static void cleanupmon(Monitor *mon);
@@ -846,6 +857,7 @@ static void freeicon(Client *c);
 static void hidewin(const Arg *arg);
 static void restorewin(const Arg *arg);
 static void togglewin(const Arg *arg);
+static void toggleoverlayed(const Arg *arg);
 static void unfocus(Client *c, int setfocus);
 static void unmanage(Client *c, int destroyed);
 static void unmapnotify(XEvent *e);
@@ -2216,12 +2228,37 @@ static void (*handler[LASTEvent])(XEvent *) = {
     [UnmapNotify] = unmapnotify};
 static Atom wmatom[WMLast], netatom[NetLast], xatom[XLast];
 static int running = 1;
+static struct libinput *touchpad_input;
+static struct udev *touchpad_udev;
+static struct libinput_device *touchpad_swipe_device;
+static int touchpad_swipe_active;
+static Monitor *touchpad_swipe_monitor;
+static unsigned int touchpad_swipe_oldtag;
+static unsigned int touchpad_swipe_newtag;
+static int touchpad_swipe_direction;
+static double touchpad_swipe_dx_mm;
+static double touchpad_swipe_dy_mm;
+static double touchpad_swipe_width_mm;
+#define TOUCHPAD_SWIPE_SPEED 0.20
+typedef struct {
+  Window win;
+  int x, y, w, h;
+  int target_x, target_y, target_w, target_h;
+  int is_current, is_target, was_mapped;
+  int was_iconic, was_autominimized, was_wm_unmapped, preview_mapped;
+  time_t lastvisible;
+} TouchpadSwipeClient;
+static TouchpadSwipeClient *touchpad_swipe_clients;
+static size_t touchpad_swipe_client_count;
 static int urgentflash = 1;
 static struct timespec urgentflash_last;
 static int xkb_event_base = 0;
 static int alt_held = 0;
 /* Client currently being dragged; used to keep it visible across tag views. */
 static Client *dragclient = NULL;
+/* A drag raises its client at start; release restacks must not raise ordinary
+ * floating clients again, but must still restore the on-top overlay layer. */
+static int suppressfloatingraise;
 /* When non-zero, tiled-resizes use animated transitions via
  * resizeclient_animated. You can temporarily disable it to have
  * instant resize via resizeclient. */
@@ -2573,6 +2610,7 @@ void applyrules(Client *c) {
   c->iscentered = 0;
   c->isfloating = 0;
   c->isontop = 0;
+  c->isoverlayed = 0;
   c->tags = 0;
   XGetClassHint(dpy, c->win, &ch);
   class = ch.res_class ? ch.res_class : broken;
@@ -2586,6 +2624,7 @@ void applyrules(Client *c) {
       c->iscentered = r->iscentered;
       c->isfloating = r->isfloating;
       c->isontop = r->isontop ? nextontoppriority() : 0;
+      c->isoverlayed = !strcmp(class, "Overlayed");
       if (c->isontop)
         c->isfloating = 1;
       c->tags |= r->tags;
@@ -3040,6 +3079,7 @@ void cleanup(void) {
   Monitor *m;
   size_t i;
 
+  cleanup_touchpad_swipes();
   status_stop();
   if (CLOCK_ANIMATE)
     sound_monitor_stop();
@@ -3255,7 +3295,7 @@ void configurerequest(XEvent *e) {
 
   if ((c = wintoclient(ev->window))) {
     if (ev->value_mask & CWBorderWidth)
-      c->bw = ev->border_width;
+      c->bw = c->isoverlayed ? 0 : ev->border_width;
     else if (c->isfloating || !selmon->lt[selmon->sellt]->arrange) {
       m = c->mon;
       if (ev->value_mask & CWX) {
@@ -11268,6 +11308,7 @@ void drawbar(Monitor *m) {
   int x, w;
   unsigned int i, occ = 0;
   unsigned int tw, tlw, cw, kw, rw;
+  unsigned int selectedtags;
   Client *c;
 
   if (!m->showbar) {
@@ -11279,6 +11320,9 @@ void drawbar(Monitor *m) {
   for (c = m->clients; c; c = c->next) {
     occ |= occupiedtags(c);
   }
+  selectedtags = touchpad_swipe_active && touchpad_swipe_monitor == m
+                     ? touchpad_swipe_newtag
+                     : m->tagset[m->seltags];
 
   barwidths(m, &tw, &tlw, &cw, &kw, &rw);
   resizebarwin(m);
@@ -11295,7 +11339,7 @@ void drawbar(Monitor *m) {
                                  : SchemeTag]);
     drw_text(drw, x, y, w, bh_n, lrpad / 2, tags[i], 0);
     if (ulineall ||
-        m->tagset[m->seltags] &
+        selectedtags &
             1 << i) /* if there are conflicts, just move these lines directly
                        underneath both 'drw_setscheme' and 'drw_text' :) */
       drw_rect(drw, x + ulinepad, bh_n - ulinestroke - ulinevoffset,
@@ -12865,7 +12909,7 @@ void manage(Window w, XWindowAttributes *wa) {
     c->y = c->mon->wy + c->mon->wh - HEIGHT(c);
   c->x = MAX(c->x, c->mon->wx);
   c->y = MAX(c->y, c->mon->wy);
-  c->bw = c->mon->borderpx;
+  c->bw = c->isoverlayed ? 0 : c->mon->borderpx;
 
   wc.border_width = c->bw;
   XConfigureWindow(dpy, w, CWBorderWidth, &wc);
@@ -13579,11 +13623,13 @@ void movemouse(const Arg *arg) {
   }
 
   // If window was originally tiled, return to tiled after drag
+  suppressfloatingraise = 1;
   if (was_tiled && c->isfloating) {
     togglefloating(NULL);
   } else {
     arrange(c->mon);
   }
+  suppressfloatingraise = 0;
 }
 
 Client *nexttiled(Client *c) {
@@ -13607,6 +13653,7 @@ void placemouse(const Arg *arg) {
     return;
   if (c->isfullscreen || c->issticky || c->ispassive) /* no support placing fullscreen, sticky or passive windows by mouse */
     return;
+  raisemru(c);
   restack(selmon);
   prevr = c;
   if (XGrabPointer(dpy, root, False, MOUSEMASK, GrabModeAsync, GrabModeAsync,
@@ -13746,6 +13793,9 @@ void placemouse(const Arg *arg) {
   if (nx != -9999)
     resize(c, nx, ny, c->w, c->h, 0);
   arrangemon(c->mon);
+  suppressfloatingraise = 1;
+  restack(c->mon);
+  suppressfloatingraise = 0;
 }
 
 void pop(Client *c) {
@@ -14177,7 +14227,9 @@ void resizemouse(const Arg *arg) {
     selmon = m;
     focus(NULL);
   }
+  suppressfloatingraise = 1;
   restack(c->mon);
+  suppressfloatingraise = 0;
 }
 
 void resizerequest(XEvent *e) {
@@ -14290,7 +14342,9 @@ void restack(Monitor *m) {
     if (c->issticky && c != stickywin && ISVISIBLE(c))
       XLowerWindow(dpy, c->win);
 
-  if (m->sel && !m->sel->issticky && !m->sel->isontop && (m->sel->isfloating || !m->lt[m->sellt]->arrange))
+  if (!suppressfloatingraise && m->sel && !m->sel->issticky &&
+      !m->sel->isontop &&
+      (m->sel->isfloating || !m->lt[m->sellt]->arrange))
     XRaiseWindow(dpy, m->sel->win);
   if (m->lt[m->sellt]->arrange) {
     wc.stack_mode = Below;
@@ -14301,7 +14355,8 @@ void restack(Monitor *m) {
         wc.sibling = c->win;
       }
   }
-  raisefloating(m);
+  if (!suppressfloatingraise)
+    raisefloating(m);
   raiseontop(m);
   /* Passive toolbars must not cover the client being dragged.  Lower them
    * only for the active drag; the normal overlay stacking is restored by the
@@ -14393,6 +14448,396 @@ void prepare_workspace_switch(Monitor *m, unsigned int oldtags, unsigned int new
     XSync(dpy, False);
 }
 
+static int touchpad_open_restricted(const char *path, int flags, void *data) {
+  (void)data;
+  return open(path, flags | O_CLOEXEC);
+}
+
+static void touchpad_close_restricted(int fd, void *data) {
+  (void)data;
+  close(fd);
+}
+
+static const struct libinput_interface touchpad_libinput_interface = {
+    .open_restricted = touchpad_open_restricted,
+    .close_restricted = touchpad_close_restricted};
+
+static void init_touchpad_swipes(void) {
+  touchpad_udev = udev_new();
+  if (!touchpad_udev)
+    return;
+  touchpad_input = libinput_udev_create_context(&touchpad_libinput_interface,
+                                                 NULL, touchpad_udev);
+  if (!touchpad_input || libinput_udev_assign_seat(touchpad_input, "seat0")) {
+    fprintf(stderr, "dwm: unable to initialize libinput touchpad gestures\n");
+    if (touchpad_input)
+      libinput_unref(touchpad_input);
+    touchpad_input = NULL;
+    udev_unref(touchpad_udev);
+    touchpad_udev = NULL;
+    return;
+  }
+  libinput_dispatch(touchpad_input);
+}
+
+static void cleanup_touchpad_swipes(void) {
+  if (touchpad_swipe_active)
+    finish_touchpad_swipe(1);
+  if (touchpad_swipe_device) {
+    libinput_device_unref(touchpad_swipe_device);
+    touchpad_swipe_device = NULL;
+  }
+  if (touchpad_input) {
+    libinput_unref(touchpad_input);
+    touchpad_input = NULL;
+  }
+  if (touchpad_udev) {
+    udev_unref(touchpad_udev);
+    touchpad_udev = NULL;
+  }
+}
+
+/* Calculate the adjacent tag's layout without changing the selected tag or
+ * mapping any windows. The saved geometry lets the gesture render both tags
+ * side-by-side while the regular view/keybinding path remains unchanged. */
+static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
+                                 double device_width_mm) {
+  Client *c;
+  size_t i = 0;
+  int tagindex = 0;
+  int oldnmaster, oldsellt, oldshowbar;
+  float oldmfact;
+  const Layout *oldlt0, *oldlt1;
+  unsigned int oldtagset;
+  char oldltsymbol[sizeof(m->ltsymbol)];
+
+  if (!m || finder_active || m != selmon || m->pertag->curtag == 0 ||
+      m->pertag->curtag > LENGTH(tags) ||
+      (m->tagset[m->seltags] & (m->tagset[m->seltags] - 1)))
+    return;
+
+  for (c = m->clients; c; c = c->next)
+    touchpad_swipe_client_count++;
+  if (!touchpad_swipe_client_count)
+    return;
+  touchpad_swipe_clients = ecalloc(touchpad_swipe_client_count,
+                                   sizeof(*touchpad_swipe_clients));
+  oldtagset = m->tagset[m->seltags];
+  for (c = m->clients; c; c = c->next, i++) {
+    XWindowAttributes wa;
+    TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
+    saved->win = c->win;
+    saved->x = c->x;
+    saved->y = c->y;
+    saved->w = c->w;
+    saved->h = c->h;
+    saved->is_current = !!(c->tags & oldtagset);
+    saved->is_target = !!(c->tags & targettag);
+    saved->was_mapped = XGetWindowAttributes(dpy, c->win, &wa) &&
+                        wa.map_state != IsUnmapped;
+    saved->was_iconic = c->isiconic;
+    saved->was_autominimized = c->isautominimized;
+    saved->was_wm_unmapped = c->wm_unmapped;
+    saved->lastvisible = c->lastvisible;
+  }
+
+  for (tagindex = 0; tagindex < LENGTH(tags); tagindex++)
+    if (targettag & (1U << tagindex))
+      break;
+  if (tagindex == LENGTH(tags))
+    goto fail;
+
+  oldnmaster = m->nmaster;
+  oldmfact = m->mfact;
+  oldsellt = m->sellt;
+  oldlt0 = m->lt[0];
+  oldlt1 = m->lt[1];
+  oldshowbar = m->showbar;
+  memcpy(oldltsymbol, m->ltsymbol, sizeof(oldltsymbol));
+  m->tagset[m->seltags] = targettag;
+  m->nmaster = m->pertag->nmasters[tagindex + 1];
+  m->mfact = m->pertag->mfacts[tagindex + 1];
+  m->sellt = m->pertag->sellts[tagindex + 1];
+  m->lt[0] = m->pertag->ltidxs[tagindex + 1][0];
+  m->lt[1] = m->pertag->ltidxs[tagindex + 1][1];
+  m->showbar = m->pertag->showbars[tagindex + 1];
+
+  {
+    int old_animate_tiled = animate_tiled;
+    animate_tiled = 0;
+    updatebarpos(m);
+    if (m->lt[m->sellt]->arrange)
+      m->lt[m->sellt]->arrange(m);
+    animate_tiled = old_animate_tiled;
+  }
+  for (i = 0; i < touchpad_swipe_client_count; i++) {
+    TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
+    c = wintoclient(saved->win);
+    if (c && saved->is_target) {
+      saved->target_x = c->x;
+      saved->target_y = c->y;
+      saved->target_w = c->w;
+      saved->target_h = c->h;
+    }
+  }
+
+  m->tagset[m->seltags] = oldtagset;
+  m->nmaster = oldnmaster;
+  m->mfact = oldmfact;
+  m->sellt = oldsellt;
+  m->lt[0] = oldlt0;
+  m->lt[1] = oldlt1;
+  m->showbar = oldshowbar;
+  memcpy(m->ltsymbol, oldltsymbol, sizeof(m->ltsymbol));
+  updatebarpos(m);
+
+  touchpad_swipe_width_mm = device_width_mm > 1.0 ? device_width_mm : 100.0;
+  touchpad_swipe_oldtag = oldtagset;
+  touchpad_swipe_newtag = targettag;
+  touchpad_swipe_monitor = m;
+  touchpad_swipe_active = 1;
+  drawbars();
+  XFlush(dpy);
+
+  /* Keep current clients at their saved geometry. Put incoming clients at the
+   * off-screen start edge before mapping them, so xmapclient() cannot expose
+   * them at their saved on-screen positions before the first swipe update. */
+  for (i = 0; i < touchpad_swipe_client_count; i++) {
+    TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
+    int x, y, w, h;
+    c = wintoclient(saved->win);
+    if (!c)
+      continue;
+    c->x = saved->x;
+    c->y = saved->y;
+    c->w = saved->w;
+    c->h = saved->h;
+    x = c->x;
+    y = c->y;
+    w = c->w;
+    h = c->h;
+    if (saved->is_target && !saved->is_current) {
+      x = saved->target_x - touchpad_swipe_direction * m->ww;
+      y = saved->target_y;
+      w = saved->target_w;
+      h = saved->target_h;
+    }
+    XMoveResizeWindow(dpy, c->win, x, y, MAX(1, w), MAX(1, h));
+    /* Tag-hidden clients are iconic too; use the normal map path so apps
+     * resume painting during the preview. Preserve state for the finish path. */
+    if (saved->is_target && !saved->is_current && !saved->was_mapped &&
+        (!HIDDEN(c) || c->isautominimized || c->lastvisible > 0) &&
+        !c->fshidden) {
+      xmapclient(c);
+      c->isautominimized = 0;
+      c->lastvisible = 0;
+      saved->preview_mapped = 1;
+    }
+  }
+  XFlush(dpy);
+  return;
+
+fail:
+  free(touchpad_swipe_clients);
+  touchpad_swipe_clients = NULL;
+  touchpad_swipe_client_count = 0;
+}
+
+static void update_touchpad_swipe(double dx_mm) {
+  size_t i;
+  double progress;
+  int px;
+
+  if (!touchpad_swipe_active || !touchpad_swipe_monitor)
+    return;
+  progress = touchpad_swipe_dx_mm * touchpad_swipe_direction *
+             touchpad_swipe_monitor->ww * TOUCHPAD_SWIPE_SPEED /
+             touchpad_swipe_width_mm;
+  progress = MAX(0.0, MIN(progress, (double)touchpad_swipe_monitor->ww));
+  px = (int)progress;
+
+  for (i = 0; i < touchpad_swipe_client_count; i++) {
+    TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
+    Client *c = wintoclient(saved->win);
+    int x;
+    if (!c || saved->is_current == saved->is_target)
+      continue;
+    if (saved->is_current)
+      x = saved->x + touchpad_swipe_direction * px;
+    else
+      x = saved->target_x - touchpad_swipe_direction * touchpad_swipe_monitor->ww +
+          touchpad_swipe_direction * px;
+    XMoveResizeWindow(dpy, c->win, x,
+                      saved->is_current ? saved->y : saved->target_y,
+                      MAX(1, saved->is_current ? saved->w : saved->target_w),
+                      MAX(1, saved->is_current ? saved->h : saved->target_h));
+  }
+  XFlush(dpy);
+  (void)dx_mm;
+}
+
+static void finish_touchpad_swipe(int cancelled) {
+  size_t i;
+  int commit;
+  Monitor *m = touchpad_swipe_monitor;
+  double progress = 0.0;
+
+  if (!touchpad_swipe_active)
+    return;
+  if (m && touchpad_swipe_width_mm > 0.0)
+    progress = fabs(touchpad_swipe_dx_mm) * m->ww * TOUCHPAD_SWIPE_SPEED /
+               touchpad_swipe_width_mm;
+  commit = !cancelled && m && m == selmon &&
+           progress >= m->ww * 0.50;
+
+  /* Publish the released desktop before restoring or unmapping preview clients. */
+  if (commit)
+    updatecurrentdesktop(touchpad_swipe_newtag);
+  else if (selmon)
+    updatecurrentdesktop(selmon->tagset[selmon->seltags]);
+  else if (m)
+    updatecurrentdesktop(touchpad_swipe_oldtag);
+  XFlush(dpy);
+
+  if (!commit) {
+    /* Restore the tag marker before unmapping preview clients. */
+    touchpad_swipe_active = 0;
+    drawbars();
+    XFlush(dpy);
+  }
+
+  /* A commit must keep the preview geometry until view() performs the normal
+   * tag transition and layout. Rolling windows back here makes them visibly
+   * jump before the old tag is unmapped. Cancellation still restores the exact
+   * pre-gesture client and mapping state. */
+  if (!commit) {
+    for (i = 0; i < touchpad_swipe_client_count; i++) {
+      TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
+      Client *c = wintoclient(saved->win);
+      XWindowAttributes wa;
+      if (!c)
+        continue;
+      c->x = saved->x;
+      c->y = saved->y;
+      c->w = saved->w;
+      c->h = saved->h;
+      XMoveResizeWindow(dpy, c->win, c->x, c->y,
+                        MAX(1, c->w), MAX(1, c->h));
+      if (XGetWindowAttributes(dpy, c->win, &wa)) {
+        if (saved->was_mapped && wa.map_state == IsUnmapped)
+          XMapWindow(dpy, c->win);
+        else if (!saved->was_mapped && wa.map_state != IsUnmapped)
+          XUnmapWindow(dpy, c->win);
+      }
+      if (saved->preview_mapped && shouldminimize(c))
+        setclientstate(c, saved->was_iconic ? IconicState : NormalState);
+      c->isiconic = saved->was_iconic;
+      c->isautominimized = saved->was_autominimized;
+      c->wm_unmapped = saved->was_wm_unmapped;
+      c->lastvisible = saved->lastvisible;
+    }
+    XFlush(dpy);
+  }
+
+  touchpad_swipe_active = 0;
+  touchpad_swipe_monitor = NULL;
+  free(touchpad_swipe_clients);
+  touchpad_swipe_clients = NULL;
+  touchpad_swipe_client_count = 0;
+  if (commit && m == selmon) {
+    Arg arg = {.ui = touchpad_swipe_newtag};
+    view(&arg);
+  }
+  /* The selected-tag marker previews the destination during the swipe.
+   * Redraw after clearing the preview so cancellation restores the old tag. */
+  drawbars();
+}
+
+static void handle_touchpad_swipe(struct libinput_event *event) {
+  enum libinput_event_type type = libinput_event_get_type(event);
+  struct libinput_event_gesture *gesture;
+  struct libinput_device *device;
+  double width = 0.0, height = 0.0;
+  int fingers;
+
+  device = libinput_event_get_device(event);
+  if (type == LIBINPUT_EVENT_DEVICE_REMOVED) {
+    if (device == touchpad_swipe_device) {
+      finish_touchpad_swipe(1);
+      libinput_device_unref(touchpad_swipe_device);
+      touchpad_swipe_device = NULL;
+      touchpad_swipe_monitor = NULL;
+      touchpad_swipe_dx_mm = touchpad_swipe_dy_mm = 0.0;
+    }
+    return;
+  }
+
+  if (type != LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN &&
+      type != LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE &&
+      type != LIBINPUT_EVENT_GESTURE_SWIPE_END)
+    return;
+  gesture = libinput_event_get_gesture_event(event);
+  fingers = libinput_event_gesture_get_finger_count(gesture);
+
+  if (type == LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN) {
+    if (fingers != 3 || touchpad_swipe_device ||
+        !libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_GESTURE))
+      return;
+    touchpad_swipe_device = libinput_device_ref(device);
+    touchpad_swipe_monitor = selmon;
+    touchpad_swipe_dx_mm = touchpad_swipe_dy_mm = 0.0;
+    touchpad_swipe_active = 0;
+    if (libinput_device_get_size(device, &width, &height) == 0 && width > 1.0)
+      touchpad_swipe_width_mm = width;
+    else
+      touchpad_swipe_width_mm = 100.0;
+    return;
+  }
+
+  if (!touchpad_swipe_device || device != touchpad_swipe_device || fingers != 3)
+    return;
+  if (type == LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE) {
+    double dx = libinput_event_gesture_get_dx(gesture);
+    double dy = libinput_event_gesture_get_dy(gesture);
+    touchpad_swipe_dx_mm += dx;
+    touchpad_swipe_dy_mm += dy;
+    if (!touchpad_swipe_active) {
+      if (fabs(touchpad_swipe_dx_mm) < 8.0 ||
+          fabs(touchpad_swipe_dx_mm) <= fabs(touchpad_swipe_dy_mm) * 1.25)
+        return;
+      touchpad_swipe_direction = touchpad_swipe_dx_mm > 0.0 ? 1 : -1;
+      if (!touchpad_swipe_monitor ||
+          touchpad_swipe_monitor->pertag->curtag == 0 ||
+          touchpad_swipe_monitor->pertag->curtag > LENGTH(tags))
+        return;
+      {
+        int current = (int)touchpad_swipe_monitor->pertag->curtag - 1;
+        int target = (current - touchpad_swipe_direction + LENGTH(tags)) % LENGTH(tags);
+        begin_touchpad_swipe(touchpad_swipe_monitor, 1U << target,
+                             touchpad_swipe_width_mm);
+      }
+    }
+    update_touchpad_swipe(dx);
+  } else {
+    int cancelled = libinput_event_gesture_get_cancelled(gesture);
+    finish_touchpad_swipe(cancelled);
+    libinput_device_unref(touchpad_swipe_device);
+    touchpad_swipe_device = NULL;
+    touchpad_swipe_monitor = NULL;
+    touchpad_swipe_dx_mm = touchpad_swipe_dy_mm = 0.0;
+  }
+}
+
+static void dispatch_touchpad_swipes(void) {
+  struct libinput_event *event;
+  if (!touchpad_input || libinput_dispatch(touchpad_input) < 0)
+    return;
+  while ((event = libinput_get_event(touchpad_input))) {
+    handle_touchpad_swipe(event);
+    libinput_event_destroy(event);
+  }
+}
+
 void run(void) {
   XEvent ev;
   int xfd = ConnectionNumber(dpy);
@@ -14401,7 +14846,8 @@ void run(void) {
   const int history_scroll_timeout = 1000 / NOTIFY_HISTORY_FPS;
   const int finder_glow_timeout = 1000 / 30;
   time_t next_clock_update = 0;
-  struct pollfd pfd[5] = {{.fd = xfd, .events = POLLIN},
+  struct pollfd pfd[6] = {{.fd = xfd, .events = POLLIN},
+                          {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
@@ -14485,6 +14931,7 @@ void run(void) {
     pfd[2].fd = status_event_fd;
     pfd[3].fd = finder_translate_fd;
     pfd[4].fd = finder_ocr_fd;
+    pfd[5].fd = touchpad_input ? libinput_get_fd(touchpad_input) : -1;
     poll(pfd, LENGTH(pfd), timeout);
     if (notify_fd >= 0 && (pfd[1].revents & POLLIN))
       notification_dispatch();
@@ -14496,6 +14943,8 @@ void run(void) {
     if (finder_ocr_fd >= 0 &&
         (pfd[4].revents & (POLLIN | POLLHUP | POLLERR)))
       finder_ocr_read();
+    if (touchpad_input && (pfd[5].revents & (POLLIN | POLLHUP | POLLERR)))
+      dispatch_touchpad_swipes();
     {
       struct timespec now_mono;
       int urgent_redraw = 0;
@@ -15928,6 +16377,34 @@ void togglewin(const Arg *arg) {
   else restorewin(arg);
 }
 
+/* Toggle Overlayed as a single group, independent of the currently focused
+ * client or selected tag. Its rule keeps it visible on every tag. */
+void toggleoverlayed(const Arg *arg) {
+  Monitor *m;
+  Client *c;
+  int found = 0, visible = 0;
+
+  (void)arg;
+  for (m = mons; m; m = m->next)
+    for (c = m->clients; c; c = c->next)
+      if (c->isoverlayed) {
+        found = 1;
+        if (!HIDDEN(c))
+          visible = 1;
+      }
+  if (!found)
+    return;
+
+  for (m = mons; m; m = m->next)
+    for (c = m->clients; c; c = c->next)
+      if (c->isoverlayed) {
+        if (visible)
+          hide(c);
+        else
+          show(c);
+      }
+}
+
 
 void unfocus(Client *c, int setfocus) {
   if (!c)
@@ -16752,6 +17229,7 @@ int main(int argc, char *argv[]) {
     die("dwm: cannot open display");
   checkotherwm();
   setup();
+  init_touchpad_swipes();
   finder_load_recent();
 #ifdef __OpenBSD__
   if (pledge("stdio rpath proc exec", NULL) == -1)
