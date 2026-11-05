@@ -58,6 +58,7 @@
 #endif /* XINERAMA */
 #include "drw.h"
 #include "util.h"
+#include "discord.h"
 #include <Imlib2.h>
 #include <X11/Xft/Xft.h>
 #include <X11/extensions/Xrender.h>
@@ -359,6 +360,29 @@ static int notify_gl_initialized = 0;
 typedef void (*NotificationGLBlendFuncSeparate)(GLenum, GLenum, GLenum,
                                                 GLenum);
 static NotificationGLBlendFuncSeparate notify_gl_blend_func_separate;
+
+#define DISCORD_AVATAR_SIZE 30
+#define DISCORD_AVATAR_WINDOW 40
+#define DISCORD_TOP_PADDING 40
+typedef struct {
+  Window win;
+  Pixmap avatar_cache_pixmap;
+  Pixmap glow_cache_pixmap;
+  Pixmap tile_cache_pixmap;
+  Picture avatar_cache_picture;
+  Picture glow_cache_picture;
+  Picture tile_cache_picture;
+  char user_id[32];
+  char avatar_path[512];
+  char cache_user_id[32];
+  char cache_avatar_path[512];
+  int x, y;
+  int visible;
+  int mapped;
+  int cache_valid;
+} DiscordAvatarOverlay;
+static DiscordAvatarOverlay discord_overlays[DWM_DISCORD_SPEAKERS];
+static int discord_overlay_hover_hidden;
 
 /* Small shader/FBO cache used by Finder's waiting-text bloom.  The text is
  * rasterized once into bloom_gl_source, then blurred with a few Kawase passes
@@ -723,9 +747,12 @@ static void init_touchpad_swipes(void);
 static void cleanup_touchpad_swipes(void);
 static void dispatch_touchpad_swipes(void);
 static void handle_touchpad_swipe(struct libinput_event *event);
-static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
-                                 double device_width_mm);
-static void update_touchpad_swipe(double dx_mm);
+static int begin_touchpad_swipe(Monitor *m, unsigned int targettag,
+                                double device_width_mm, int direction);
+static int update_touchpad_swipe(int allow_chain);
+static void position_touchpad_swipe_clients(int px);
+static void return_touchpad_swipe_preview(void);
+static void complete_touchpad_swipe_preview(void);
 static void finish_touchpad_swipe(int cancelled);
 static void checkminimize(void);
 static time_t next_minimize_deadline(void);
@@ -812,6 +839,7 @@ static void sound_monitor_stop(void);
 static void setnoanimation_async(Client *c, long val);
 static void setnoanimation_sync(Client *c, long val);
 static void setworkspaceanimation(Monitor *m, int val);
+static void set_touchpad_swipe_animation(long val);
 static void setcurrentdesktop(void);
 static void setdesktopnames(void);
 static void setfocus(Client *c);
@@ -858,6 +886,7 @@ static void hidewin(const Arg *arg);
 static void restorewin(const Arg *arg);
 static void togglewin(const Arg *arg);
 static void toggleoverlayed(const Arg *arg);
+static void togglediscord(const Arg *arg);
 static void unfocus(Client *c, int setfocus);
 static void unmanage(Client *c, int destroyed);
 static void unmapnotify(XEvent *e);
@@ -2130,6 +2159,9 @@ static void mpris_panel_draw(Monitor *m, unsigned int w, unsigned int h) {
 static void notification_init(void);
 static void notification_shutdown(void);
 static int notification_gl_init(unsigned int w, unsigned int h);
+static void discord_update_ui(void);
+static void discord_ui_cleanup(void);
+static int discord_overlay_expose(Window win);
 static GLFont *gl_font_create(void);
 static GLFont *gl_font_create_scaled(double scale);
 static int gl_font_add_face(GLFont *font, const char *file, int index,
@@ -2232,20 +2264,28 @@ static struct libinput *touchpad_input;
 static struct udev *touchpad_udev;
 static struct libinput_device *touchpad_swipe_device;
 static int touchpad_swipe_active;
+static int touchpad_swipe_marker_active;
+static int touchpad_swipe_defer_ewmh;
 static Monitor *touchpad_swipe_monitor;
 static unsigned int touchpad_swipe_oldtag;
 static unsigned int touchpad_swipe_newtag;
 static int touchpad_swipe_direction;
+static int touchpad_swipe_base_index = -1;
+static int touchpad_swipe_target_index = -1;
 static double touchpad_swipe_dx_mm;
 static double touchpad_swipe_dy_mm;
 static double touchpad_swipe_width_mm;
 #define TOUCHPAD_SWIPE_SPEED 0.20
+#define TOUCHPAD_SWIPE_EPSILON 0.5
+#define TOUCHPAD_SWIPE_RETURN_STEPS 9
+#define TOUCHPAD_SWIPE_RETURN_DELAY_NS 16000000L
 typedef struct {
   Window win;
   int x, y, w, h;
   int target_x, target_y, target_w, target_h;
   int is_current, is_target, was_mapped;
   int was_iconic, was_autominimized, was_wm_unmapped, preview_mapped;
+  int was_fshidden;
   time_t lastvisible;
 } TouchpadSwipeClient;
 static TouchpadSwipeClient *touchpad_swipe_clients;
@@ -2332,9 +2372,11 @@ static unsigned int mpris_field_width(const char *text) {
 }
 
 static int drag_next_event(XEvent *ev) {
-	struct pollfd pfd[2] = {
+	int discord_fd = discord_event_fd();
+	struct pollfd pfd[3] = {
 		{ .fd = ConnectionNumber(dpy), .events = POLLIN },
-		{ .fd = status_event_fd, .events = POLLIN }
+		{ .fd = status_event_fd, .events = POLLIN },
+		{ .fd = discord_fd, .events = POLLIN }
 	};
 	int ready;
 	int redraw;
@@ -2346,6 +2388,8 @@ static int drag_next_event(XEvent *ev) {
 		return 0;
 	if (status_event_fd >= 0 && (pfd[1].revents & POLLIN))
 		status_consume();
+	if (discord_fd >= 0 && (pfd[2].revents & POLLIN))
+		discord_update_ui();
 	updateclockbar();
 	redraw = bar_dirty;
 	bar_dirty = 0;
@@ -3080,6 +3124,8 @@ void cleanup(void) {
   size_t i;
 
   cleanup_touchpad_swipes();
+  discord_stop();
+  discord_ui_cleanup();
   status_stop();
   if (CLOCK_ANIMATE)
     sound_monitor_stop();
@@ -5754,13 +5800,25 @@ static void finder_focus_pointer(void) {
 static void finder_launch(void) {
   FinderApp *app = finder_selected_app();
   pid_t pid;
+  struct sigaction sa;
   if (!app)
     return;
   if ((pid = fork()) == 0) {
-    /* Launch the desktop entry instead of executing its Exec= value through
-     * a new shell/session.  Applications such as grub-customizer rely on
-     * the desktop launch environment and can initialize differently when
-     * started with setsid(2) and /bin/sh -c. */
+    /* Detach the application launcher from dwm's terminal session so a
+     * terminal hangup or dwm exit does not terminate the launched app.  A
+     * fork preserves dwm's environment; setsid only detaches the session. */
+    if (dpy)
+      close(ConnectionNumber(dpy));
+    if (setsid() < 0)
+      _exit(127);
+    /* dwm ignores SIGCHLD to avoid zombies; don't pass that disposition on
+     * to the launcher or application. */
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_handler = SIG_DFL;
+    sigaction(SIGCHLD, &sa, NULL);
+    /* Launch the desktop entry so it retains its normal desktop launch
+     * behavior, with the same environment inherited from dwm. */
     execlp("gio", "gio", "launch", app->file, (char *)NULL);
     /* Keep the finder usable on systems without gio. */
     execl("/bin/sh", "sh", "-c", app->exec, (char *)NULL);
@@ -7523,6 +7581,814 @@ static void notification_gl_blend_premultiplied(void) {
                                   GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
   else
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+static unsigned long discord_pack_channel(unsigned char value,
+                                          unsigned long mask) {
+  unsigned int shift = 0;
+  unsigned long max;
+  if (!mask)
+    return 0;
+  while (!(mask & 1UL)) {
+    mask >>= 1;
+    shift++;
+  }
+  max = mask;
+  return (((unsigned long)value * max + 127) / 255) << shift;
+}
+
+static unsigned int discord_hash_id(const char *id) {
+  unsigned int hash = 2166136261U;
+  for (; id && *id; id++)
+    hash = (hash ^ (unsigned char)*id) * 16777619U;
+  return hash;
+}
+
+static void discord_copy_string(char *dst, size_t size, const char *src) {
+  size_t length;
+  if (!size)
+    return;
+  if (!src)
+    src = "";
+  length = strnlen(src, size - 1);
+  memcpy(dst, src, length);
+  dst[length] = '\0';
+}
+
+static DATA32 *discord_avatar_load(const char *path) {
+  Imlib_Image image = NULL, scaled = NULL, cropped = NULL;
+  DATA32 *data = NULL, *copy = NULL;
+  int width, height, scaled_width, scaled_height;
+  int crop_x, crop_y;
+  if (!path || !*path || !(image = imlib_load_image(path)))
+    return NULL;
+  imlib_context_set_image(image);
+  width = imlib_image_get_width();
+  height = imlib_image_get_height();
+  if (width <= 0 || height <= 0)
+    goto done;
+  {
+    double scale = MAX((double)DISCORD_AVATAR_SIZE / width,
+                       (double)DISCORD_AVATAR_SIZE / height);
+    scaled_width = MAX(DISCORD_AVATAR_SIZE, (int)ceil(width * scale));
+    scaled_height = MAX(DISCORD_AVATAR_SIZE, (int)ceil(height * scale));
+  }
+  scaled = imlib_create_cropped_scaled_image(0, 0, width, height,
+                                             scaled_width, scaled_height);
+  if (!scaled)
+    goto done;
+  crop_x = (scaled_width - DISCORD_AVATAR_SIZE) / 2;
+  crop_y = (scaled_height - DISCORD_AVATAR_SIZE) / 2;
+  imlib_context_set_image(scaled);
+  cropped = imlib_create_cropped_image(crop_x, crop_y,
+                                       DISCORD_AVATAR_SIZE,
+                                       DISCORD_AVATAR_SIZE);
+  if (!cropped)
+    goto done;
+  imlib_context_set_image(cropped);
+  imlib_image_set_has_alpha(1);
+  data = imlib_image_get_data_for_reading_only();
+  if (data) {
+    copy = malloc((size_t)DISCORD_AVATAR_SIZE * DISCORD_AVATAR_SIZE *
+                  sizeof(*copy));
+    if (copy)
+      memcpy(copy, data, (size_t)DISCORD_AVATAR_SIZE * DISCORD_AVATAR_SIZE *
+                             sizeof(*copy));
+  }
+done:
+  if (cropped) {
+    imlib_context_set_image(cropped);
+    imlib_free_image();
+  }
+  if (scaled) {
+    imlib_context_set_image(scaled);
+    imlib_free_image();
+  }
+  imlib_context_set_image(image);
+  imlib_free_image();
+  return copy;
+}
+
+typedef struct {
+  float r, g, b, a;
+} DiscordBlurPixel;
+
+static DiscordBlurPixel discord_blur_sample(const DiscordBlurPixel *pixels,
+                                            int width, int height,
+                                            float x, float y) {
+  DiscordBlurPixel result = {0};
+  int x0, y0, x1, y1;
+  float fx, fy;
+  x = MAX(0.0f, MIN(x, (float)width - 1.0f));
+  y = MAX(0.0f, MIN(y, (float)height - 1.0f));
+  x0 = (int)floorf(x);
+  y0 = (int)floorf(y);
+  x1 = MIN(x0 + 1, width - 1);
+  y1 = MIN(y0 + 1, height - 1);
+  fx = x - (float)x0;
+  fy = y - (float)y0;
+#define DISCORD_BLUR_INTERPOLATE(channel)                                      \
+  result.channel =                                                           \
+      (pixels[(size_t)y0 * width + x0].channel * (1.0f - fx) +                \
+       pixels[(size_t)y0 * width + x1].channel * fx) * (1.0f - fy) +         \
+      (pixels[(size_t)y1 * width + x0].channel * (1.0f - fx) +                \
+       pixels[(size_t)y1 * width + x1].channel * fx) * fy
+  DISCORD_BLUR_INTERPOLATE(r);
+  DISCORD_BLUR_INTERPOLATE(g);
+  DISCORD_BLUR_INTERPOLATE(b);
+  DISCORD_BLUR_INTERPOLATE(a);
+#undef DISCORD_BLUR_INTERPOLATE
+  return result;
+}
+
+static void discord_kawase_down(const DiscordBlurPixel *source,
+                                int source_width, int source_height,
+                                DiscordBlurPixel *destination,
+                                int destination_width, int destination_height) {
+  for (int y = 0; y < destination_height; y++) {
+    for (int x = 0; x < destination_width; x++) {
+      float sx = ((float)x + 0.5f) * source_width / destination_width - 0.5f;
+      float sy = ((float)y + 0.5f) * source_height / destination_height - 0.5f;
+      DiscordBlurPixel sum = {0};
+      for (int oy = -1; oy <= 1; oy += 2) {
+        for (int ox = -1; ox <= 1; ox += 2) {
+          DiscordBlurPixel sample = discord_blur_sample(
+              source, source_width, source_height, sx + (float)ox,
+              sy + (float)oy);
+          sum.r += sample.r * 0.25f;
+          sum.g += sample.g * 0.25f;
+          sum.b += sample.b * 0.25f;
+          sum.a += sample.a * 0.25f;
+        }
+      }
+      destination[(size_t)y * destination_width + x] = sum;
+    }
+  }
+}
+
+static void discord_kawase_up(const DiscordBlurPixel *source,
+                              int source_width, int source_height,
+                              DiscordBlurPixel *destination,
+                              int destination_width, int destination_height) {
+  for (int y = 0; y < destination_height; y++) {
+    for (int x = 0; x < destination_width; x++) {
+      float sx = ((float)x + 0.5f) * source_width / destination_width - 0.5f;
+      float sy = ((float)y + 0.5f) * source_height / destination_height - 0.5f;
+      DiscordBlurPixel sum = {0};
+      for (int oy = -1; oy <= 1; oy += 2) {
+        for (int ox = -1; ox <= 1; ox += 2) {
+          DiscordBlurPixel sample = discord_blur_sample(
+              source, source_width, source_height, sx + 1.5f * ox,
+              sy + 1.5f * oy);
+          sum.r += sample.r / 12.0f;
+          sum.g += sample.g / 12.0f;
+          sum.b += sample.b / 12.0f;
+          sum.a += sample.a / 12.0f;
+        }
+      }
+      for (int offset = -1; offset <= 1; offset += 2) {
+        DiscordBlurPixel sample = discord_blur_sample(
+            source, source_width, source_height, sx + 1.5f * offset, sy);
+        sum.r += sample.r / 6.0f;
+        sum.g += sample.g / 6.0f;
+        sum.b += sample.b / 6.0f;
+        sum.a += sample.a / 6.0f;
+        sample = discord_blur_sample(source, source_width, source_height, sx,
+                                     sy + 1.5f * offset);
+        sum.r += sample.r / 6.0f;
+        sum.g += sample.g / 6.0f;
+        sum.b += sample.b / 6.0f;
+        sum.a += sample.a / 6.0f;
+      }
+      destination[(size_t)y * destination_width + x] = sum;
+    }
+  }
+}
+
+static unsigned char discord_blur_byte(float value) {
+  return (unsigned char)lroundf(255.0f * MAX(0.0f, MIN(value, 1.0f)));
+}
+
+static unsigned long discord_argb_pixel(DATA32 source,
+                                        XRenderPictFormat *format,
+                                        Visual *visual) {
+  unsigned int alpha = (source >> 24) & 0xffU;
+  unsigned long alpha_mask = (unsigned long)format->direct.alphaMask
+                             << format->direct.alpha;
+  return (((unsigned long)alpha << format->direct.alpha) & alpha_mask) |
+         discord_pack_channel((source >> 16) & 0xffU, visual->red_mask) |
+         discord_pack_channel((source >> 8) & 0xffU, visual->green_mask) |
+         discord_pack_channel(source & 0xffU, visual->blue_mask);
+}
+
+static void discord_overlay_cache_free(DiscordAvatarOverlay *overlay) {
+  if (!overlay)
+    return;
+  if (overlay->win)
+    XSetWindowBackgroundPixmap(dpy, overlay->win, None);
+  if (overlay->avatar_cache_picture)
+    XRenderFreePicture(dpy, overlay->avatar_cache_picture);
+  if (overlay->glow_cache_picture)
+    XRenderFreePicture(dpy, overlay->glow_cache_picture);
+  if (overlay->tile_cache_picture)
+    XRenderFreePicture(dpy, overlay->tile_cache_picture);
+  if (overlay->avatar_cache_pixmap)
+    XFreePixmap(dpy, overlay->avatar_cache_pixmap);
+  if (overlay->glow_cache_pixmap)
+    XFreePixmap(dpy, overlay->glow_cache_pixmap);
+  if (overlay->tile_cache_pixmap)
+    XFreePixmap(dpy, overlay->tile_cache_pixmap);
+  overlay->avatar_cache_pixmap = None;
+  overlay->glow_cache_pixmap = None;
+  overlay->tile_cache_pixmap = None;
+  overlay->avatar_cache_picture = None;
+  overlay->glow_cache_picture = None;
+  overlay->tile_cache_picture = None;
+  overlay->cache_user_id[0] = '\0';
+  overlay->cache_avatar_path[0] = '\0';
+  overlay->cache_valid = 0;
+}
+
+static void discord_overlay_composite_cached(DiscordAvatarOverlay *overlay) {
+  XRenderColor transparent = {0, 0, 0, 0};
+  if (!overlay || !overlay->tile_cache_picture || !overlay->cache_valid ||
+      !overlay->avatar_cache_picture || !overlay->glow_cache_picture)
+    return;
+  XRenderFillRectangle(dpy, PictOpSrc, overlay->tile_cache_picture,
+                       &transparent, 0, 0,
+                       DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW);
+  XRenderComposite(dpy, PictOpOver, overlay->glow_cache_picture, None,
+                   overlay->tile_cache_picture, 0, 0, 0, 0, 0, 0,
+                   DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW);
+  XRenderComposite(dpy, PictOpOver, overlay->avatar_cache_picture, None,
+                   overlay->tile_cache_picture, 0, 0, 0, 0, 0, 0,
+                   DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW);
+}
+
+static void discord_overlay_paint(DiscordAvatarOverlay *overlay) {
+  Visual *visual;
+  XRenderPictFormat *format;
+  Pixmap pixmap = None, glow_pixmap = None;
+  Picture avatar_picture = None, glow_picture = None;
+  GC gc = NULL;
+  unsigned int depth, hash;
+  XImage *image = NULL, *glow_image = NULL;
+  DATA32 *avatar = NULL;
+  DiscordBlurPixel source[DISCORD_AVATAR_WINDOW * DISCORD_AVATAR_WINDOW];
+  DiscordBlurPixel half[20 * 20], quarter[10 * 10];
+  DiscordBlurPixel blurred_half[20 * 20];
+  DiscordBlurPixel blurred_full[DISCORD_AVATAR_WINDOW * DISCORD_AVATAR_WINDOW];
+  DATA32 sharp_pixels[DISCORD_AVATAR_WINDOW * DISCORD_AVATAR_WINDOW];
+  DATA32 glow_pixels[DISCORD_AVATAR_WINDOW * DISCORD_AVATAR_WINDOW];
+  double center = DISCORD_AVATAR_WINDOW / 2.0;
+  double radius = DISCORD_AVATAR_SIZE / 2.0;
+  if (!overlay || !overlay->win)
+    return;
+  if (overlay->cache_valid &&
+      !strcmp(overlay->cache_user_id, overlay->user_id) &&
+      !strcmp(overlay->cache_avatar_path, overlay->avatar_path))
+    return;
+  visual = finder_argb_visual ? finder_argb_visual : DefaultVisual(dpy, screen);
+  depth = finder_argb_visual ? (unsigned int)finder_argb_depth
+                             : (unsigned int)DefaultDepth(dpy, screen);
+  format = XRenderFindVisualFormat(dpy, visual);
+  if (!format || !format->direct.alphaMask)
+    return;
+  hash = discord_hash_id(overlay->user_id);
+  avatar = discord_avatar_load(overlay->avatar_path);
+  image = XCreateImage(dpy, visual, depth, ZPixmap, 0, NULL,
+                       DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW, 32, 0);
+  glow_image = XCreateImage(dpy, visual, depth, ZPixmap, 0, NULL,
+                            DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW,
+                            32, 0);
+  if (!image || !glow_image)
+    goto done;
+  image->data = ecalloc((size_t)image->bytes_per_line,
+                        DISCORD_AVATAR_WINDOW);
+  glow_image->data = ecalloc((size_t)glow_image->bytes_per_line,
+                             DISCORD_AVATAR_WINDOW);
+  for (int y = 0; y < DISCORD_AVATAR_WINDOW; y++) {
+    for (int x = 0; x < DISCORD_AVATAR_WINDOW; x++) {
+      int ax = x - (DISCORD_AVATAR_WINDOW - DISCORD_AVATAR_SIZE) / 2;
+      int ay = y - (DISCORD_AVATAR_WINDOW - DISCORD_AVATAR_SIZE) / 2;
+      int coverage_samples = 0;
+      const int supersample = 8;
+      DATA32 pixel = 0;
+
+      /* Estimate circular edge coverage at 8x resolution. Interior avatar
+       * pixels remain fully opaque while the outside stays transparent. */
+      for (int sy = 0; sy < supersample; sy++) {
+        for (int sx = 0; sx < supersample; sx++) {
+          double dx = x + (sx + 0.5) / supersample - center;
+          double dy = y + (sy + 0.5) / supersample - center;
+          if (dx * dx + dy * dy <= radius * radius)
+            coverage_samples++;
+        }
+      }
+      if (coverage_samples) {
+        unsigned char r, g, b;
+        float coverage = (float)coverage_samples /
+                         (float)(supersample * supersample);
+        if (avatar && ax >= 0 && ay >= 0 && ax < DISCORD_AVATAR_SIZE &&
+            ay < DISCORD_AVATAR_SIZE) {
+          DATA32 source = avatar[(size_t)ay * DISCORD_AVATAR_SIZE + ax];
+          r = (unsigned char)((source >> 16) & 0xffU);
+          g = (unsigned char)((source >> 8) & 0xffU);
+          b = (unsigned char)(source & 0xffU);
+        } else {
+          /* An opaque per-user placeholder remains visible while the image
+           * downloads; the surrounding pixels stay fully transparent. */
+          r = (unsigned char)(72U + (hash & 0x7fU));
+          g = (unsigned char)(72U + ((hash >> 8) & 0x7fU));
+          b = (unsigned char)(72U + ((hash >> 16) & 0x7fU));
+        }
+        pixel = ((DATA32)discord_blur_byte(coverage) << 24) |
+                ((DATA32)discord_blur_byte(r / 255.0f * coverage) << 16) |
+                ((DATA32)discord_blur_byte(g / 255.0f * coverage) << 8) |
+                (DATA32)discord_blur_byte(b / 255.0f * coverage);
+      }
+      sharp_pixels[(size_t)y * DISCORD_AVATAR_WINDOW + x] = pixel;
+      source[(size_t)y * DISCORD_AVATAR_WINDOW + x] = (DiscordBlurPixel){
+          ((pixel >> 16) & 0xffU) / 255.0f,
+          ((pixel >> 8) & 0xffU) / 255.0f,
+          (pixel & 0xffU) / 255.0f,
+          ((pixel >> 24) & 0xffU) / 255.0f};
+    }
+  }
+
+  /* Blur a duplicate of the avatar through a down/up Kawase pyramid. Pixels
+   * stay premultiplied so the transparent tile edges do not gain dark halos. */
+  discord_kawase_down(source, DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW,
+                      half, 20, 20);
+  discord_kawase_down(half, 20, 20, quarter, 10, 10);
+  discord_kawase_up(quarter, 10, 10, blurred_half, 20, 20);
+  discord_kawase_up(blurred_half, 20, 20, blurred_full,
+                    DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW);
+  for (int y = 0; y < DISCORD_AVATAR_WINDOW; y++) {
+    for (int x = 0; x < DISCORD_AVATAR_WINDOW; x++) {
+      size_t index = (size_t)y * DISCORD_AVATAR_WINDOW + x;
+      const float glow_strength = 0.68f;
+      DiscordBlurPixel blurred = blurred_full[index];
+      glow_pixels[index] =
+          ((DATA32)discord_blur_byte(blurred.a * glow_strength) << 24) |
+          ((DATA32)discord_blur_byte(blurred.r * glow_strength) << 16) |
+          ((DATA32)discord_blur_byte(blurred.g * glow_strength) << 8) |
+          (DATA32)discord_blur_byte(blurred.b * glow_strength);
+      XPutPixel(image, x, y,
+                discord_argb_pixel(sharp_pixels[index], format, visual));
+      XPutPixel(glow_image, x, y,
+                discord_argb_pixel(glow_pixels[index], format, visual));
+    }
+  }
+
+  /* Keep both rendered layers server-side, then combine them once into the
+   * tile pixmap used as the window background. */
+  pixmap = XCreatePixmap(dpy, root, DISCORD_AVATAR_WINDOW,
+                         DISCORD_AVATAR_WINDOW, depth);
+  glow_pixmap = XCreatePixmap(dpy, root, DISCORD_AVATAR_WINDOW,
+                              DISCORD_AVATAR_WINDOW, depth);
+  if (!pixmap || !glow_pixmap)
+    goto done;
+  gc = XCreateGC(dpy, pixmap, 0, NULL);
+  if (!gc)
+    goto done;
+  XPutImage(dpy, pixmap, gc, image, 0, 0, 0, 0, DISCORD_AVATAR_WINDOW,
+            DISCORD_AVATAR_WINDOW);
+  XPutImage(dpy, glow_pixmap, gc, glow_image, 0, 0, 0, 0,
+            DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW);
+  avatar_picture = XRenderCreatePicture(dpy, pixmap, format, 0, NULL);
+  glow_picture = XRenderCreatePicture(dpy, glow_pixmap, format, 0, NULL);
+  if (!avatar_picture || !glow_picture)
+    goto done;
+  discord_overlay_cache_free(overlay);
+  overlay->tile_cache_pixmap = XCreatePixmap(
+      dpy, root, DISCORD_AVATAR_WINDOW, DISCORD_AVATAR_WINDOW, depth);
+  if (!overlay->tile_cache_pixmap)
+    goto done;
+  overlay->tile_cache_picture = XRenderCreatePicture(
+      dpy, overlay->tile_cache_pixmap, format, 0, NULL);
+  if (!overlay->tile_cache_picture) {
+    XFreePixmap(dpy, overlay->tile_cache_pixmap);
+    overlay->tile_cache_pixmap = None;
+    goto done;
+  }
+  overlay->avatar_cache_pixmap = pixmap;
+  overlay->glow_cache_pixmap = glow_pixmap;
+  overlay->avatar_cache_picture = avatar_picture;
+  overlay->glow_cache_picture = glow_picture;
+  discord_copy_string(overlay->cache_user_id, sizeof overlay->cache_user_id,
+                      overlay->user_id);
+  discord_copy_string(overlay->cache_avatar_path,
+                      sizeof overlay->cache_avatar_path,
+                      overlay->avatar_path);
+  overlay->cache_valid = 1;
+  pixmap = glow_pixmap = None;
+  avatar_picture = glow_picture = None;
+  discord_overlay_composite_cached(overlay);
+  XSetWindowBackgroundPixmap(dpy, overlay->win, overlay->tile_cache_pixmap);
+  XClearWindow(dpy, overlay->win);
+
+done:
+  if (glow_picture)
+    XRenderFreePicture(dpy, glow_picture);
+  if (avatar_picture)
+    XRenderFreePicture(dpy, avatar_picture);
+  if (gc)
+    XFreeGC(dpy, gc);
+  if (glow_pixmap)
+    XFreePixmap(dpy, glow_pixmap);
+  if (pixmap)
+    XFreePixmap(dpy, pixmap);
+  if (glow_image)
+    XDestroyImage(glow_image);
+  if (image)
+    XDestroyImage(image);
+  free(avatar);
+}
+
+static int discord_overlay_expose(Window win) {
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    if (discord_overlays[i].win == win)
+      return 1;
+  }
+  return 0;
+}
+
+static int discord_overlay_create(DiscordAvatarOverlay *overlay) {
+  XSetWindowAttributes wa = {0};
+  Visual *visual = finder_argb_visual ? finder_argb_visual
+                                      : DefaultVisual(dpy, screen);
+  unsigned int depth = finder_argb_visual
+                           ? (unsigned int)finder_argb_depth
+                           : (unsigned int)DefaultDepth(dpy, screen);
+  Colormap colormap = finder_argb_visual ? finder_argb_colormap
+                                         : DefaultColormap(dpy, screen);
+  XRenderPictFormat *format;
+  Atom type_atom, discord_atom;
+  if (!overlay)
+    return 0;
+  wa.override_redirect = True;
+  wa.colormap = colormap;
+  wa.background_pixel = 0;
+  wa.border_pixel = 0;
+  wa.event_mask = ExposureMask | EnterWindowMask | PointerMotionMask;
+  overlay->win = XCreateWindow(dpy, root, 12, 0, DISCORD_AVATAR_WINDOW,
+                               DISCORD_AVATAR_WINDOW, 0, depth, InputOutput,
+                               visual, CWOverrideRedirect | CWColormap |
+                               CWBackPixel | CWBorderPixel | CWEventMask, &wa);
+  if (!overlay->win)
+    return 0;
+  format = XRenderFindVisualFormat(dpy, visual);
+  if (!format || !format->direct.alphaMask) {
+    XDestroyWindow(dpy, overlay->win);
+    overlay->win = None;
+    return 0;
+  }
+  XStoreName(dpy, overlay->win, "AnDWM Discord speaker");
+  type_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+  discord_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DWM_DISCORD", False);
+  XChangeProperty(dpy, overlay->win, type_atom, XA_ATOM, 32,
+                  PropModeReplace, (unsigned char *)&discord_atom, 1);
+  return 1;
+}
+
+static DiscordAvatarOverlay *discord_overlay_for(const char *id) {
+  DiscordAvatarOverlay *free_slot = NULL, *reusable = NULL;
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    if (overlay->user_id[0] && !strcmp(overlay->user_id, id))
+      return overlay;
+    if (!overlay->user_id[0] && !free_slot)
+      free_slot = overlay;
+    if (!overlay->visible && !reusable)
+      reusable = overlay;
+  }
+  if (!free_slot)
+    free_slot = reusable;
+  if (free_slot) {
+    free_slot->avatar_path[0] = '\0';
+    discord_copy_string(free_slot->user_id, sizeof free_slot->user_id, id);
+  }
+  return free_slot;
+}
+
+/* Keep speaking avatars above clients, then restore DWM-owned overlays. */
+static void discord_overlay_raise(void) {
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    if (overlay->win && overlay->visible && overlay->mapped)
+      XRaiseWindow(dpy, overlay->win);
+  }
+  if (!selmon)
+    return;
+  if (selmon->sidebarvisible && selmon->sidebarwin)
+    XRaiseWindow(dpy, selmon->sidebarwin);
+  if (selmon->barcenterwin &&
+      (finder_active || notification_center_active()))
+    XRaiseWindow(dpy, selmon->barcenterwin);
+  if (finder_active && selmon->finder_markerwin &&
+      selmon->finder_marker_mapped)
+    XRaiseWindow(dpy, selmon->finder_markerwin);
+}
+
+/* Put the speaker strip beside the active center panel when one is open.
+ * Keep the whole strip on one side; when neither side fits, use the side with
+ * the most room and clamp to the screen edge. */
+static void discord_overlay_layout(int total_width, int *x, int *y) {
+  int screen_max_x = MAX(0, sw - total_width);
+
+  *x = MAX(0, (sw - total_width) / 2);
+  *y = fullscreen_st && selmon
+           ? selmon->by
+           : MIN(bh + DISCORD_TOP_PADDING,
+                 MAX(0, sh - DISCORD_AVATAR_WINDOW));
+
+  if (selmon && (finder_active || notification_center_active())) {
+    int panel_x = finder_window_x;
+    int panel_y = finder_window_y;
+    int panel_w = finder_active ? (int)finder_popup_width()
+                                : (int)notify_width;
+    int panel_h = finder_active ? (int)finder_popup_height()
+                                : (int)notify_height;
+    int gap = 16;
+    int left_room = panel_x - gap;
+    int right_x = panel_x + panel_w + gap;
+    int right_room = sw - right_x;
+    int left_fits = left_room >= total_width;
+    int right_fits = right_room >= total_width;
+    int use_right = right_fits && (!left_fits || right_room >= left_room);
+
+    if (!left_fits && !right_fits)
+      use_right = right_room > left_room;
+    *x = MIN(MAX(use_right ? right_x : panel_x - gap - total_width, 0),
+             screen_max_x);
+    if (!fullscreen_st)
+      *y = MIN(MAX(panel_y + (panel_h - DISCORD_AVATAR_WINDOW) / 2, 0),
+               MAX(0, sh - DISCORD_AVATAR_WINDOW));
+  }
+}
+
+/* When Finder or a notification surface is open, split speakers between
+ * vertical columns on both sides when both sides have room. If the panel is
+ * near an edge, use the side that can actually hold the avatars. */
+static int discord_overlay_panel_geometry(size_t count,
+                                          int *left_x, int *right_x,
+                                          int *left_y, int *right_y,
+                                          int *left_count, int *right_count,
+                                          int *step) {
+  int panel_x, panel_y, panel_w, panel_h, center_y, max_rows, total_h;
+  int left_room, right_room;
+  int gap = 16;
+
+  if (!selmon || (!finder_active && !notification_center_active()))
+    return 0;
+
+  panel_x = finder_window_x;
+  panel_y = finder_window_y;
+  panel_w = finder_active ? (int)finder_popup_width() : (int)notify_width;
+  panel_h = finder_active ? (int)finder_popup_height() : (int)notify_height;
+  left_room = panel_x - gap;
+  right_room = sw - panel_x - panel_w - gap;
+  if (left_room >= DISCORD_AVATAR_WINDOW &&
+      right_room >= DISCORD_AVATAR_WINDOW) {
+    *left_count = (int)((count + 1) / 2);
+    *right_count = (int)(count / 2);
+  } else if (left_room >= DISCORD_AVATAR_WINDOW) {
+    *left_count = (int)count;
+    *right_count = 0;
+  } else if (right_room >= DISCORD_AVATAR_WINDOW) {
+    *left_count = 0;
+    *right_count = (int)count;
+  } else if (left_room >= right_room) {
+    *left_count = (int)count;
+    *right_count = 0;
+  } else {
+    *left_count = 0;
+    *right_count = (int)count;
+  }
+  max_rows = MAX(*left_count, *right_count);
+  *step = DISCORD_AVATAR_WINDOW + 10;
+  total_h = max_rows ? DISCORD_AVATAR_WINDOW + (max_rows - 1) * *step : 0;
+  if (max_rows > 1 && total_h > sh) {
+    *step = MAX(DISCORD_AVATAR_WINDOW,
+                (sh - DISCORD_AVATAR_WINDOW) / (max_rows - 1));
+    total_h = DISCORD_AVATAR_WINDOW + (max_rows - 1) * *step;
+  }
+
+  *left_x = MIN(MAX(panel_x - gap - DISCORD_AVATAR_WINDOW, 0),
+                MAX(0, sw - DISCORD_AVATAR_WINDOW));
+  *right_x = MIN(MAX(panel_x + panel_w + gap, 0),
+                 MAX(0, sw - DISCORD_AVATAR_WINDOW));
+  center_y = panel_y + panel_h / 2;
+  *left_y = *left_count
+                ? MIN(MAX(center_y - (DISCORD_AVATAR_WINDOW +
+                                      (*left_count - 1) * *step) / 2,
+                          0),
+                      MAX(0, sh - total_h))
+                : 0;
+  *right_y = *right_count
+                 ? MIN(MAX(center_y - (DISCORD_AVATAR_WINDOW +
+                                       (*right_count - 1) * *step) / 2,
+                           0),
+                       MAX(0, sh - total_h))
+                 : 0;
+  return 1;
+}
+
+static void discord_overlay_panel_place(void) {
+  size_t count = 0, index = 0;
+  int left_x, right_x, left_y, right_y, left_count, right_count, step;
+  int left_row = 0, right_row = 0;
+
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++)
+    if (discord_overlays[i].win && discord_overlays[i].visible)
+      count++;
+  if (!discord_overlay_panel_geometry(count, &left_x, &right_x, &left_y,
+                                      &right_y, &left_count, &right_count,
+                                      &step))
+    return;
+
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    int x, y;
+
+    if (!overlay->win || !overlay->visible)
+      continue;
+    if (left_count == (int)count) {
+      x = left_x;
+      y = left_y + left_row++ * step;
+    } else if (!left_count) {
+      x = right_x;
+      y = right_y + right_row++ * step;
+    } else if (!(index % 2)) {
+      x = left_x;
+      y = left_y + left_row++ * step;
+    } else {
+      x = right_x;
+      y = right_y + right_row++ * step;
+    }
+    x = MIN(MAX(x, 0), MAX(0, sw - DISCORD_AVATAR_WINDOW));
+    y = MIN(MAX(y, 0), MAX(0, sh - DISCORD_AVATAR_WINDOW));
+    overlay->x = x;
+    overlay->y = y;
+    XMoveWindow(dpy, overlay->win, x, y);
+    index++;
+  }
+}
+
+/* Treat the small spacing between adjacent tiles as part of the hover area. */
+static int discord_overlay_pointer_near(int x, int y) {
+  const int hover_margin = 5;
+
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    if (!overlay->win || !overlay->visible)
+      continue;
+    if (x >= overlay->x - hover_margin &&
+        x < overlay->x + DISCORD_AVATAR_WINDOW + hover_margin &&
+        y >= overlay->y - hover_margin &&
+        y < overlay->y + DISCORD_AVATAR_WINDOW + hover_margin)
+      return 1;
+  }
+  return 0;
+}
+
+static void discord_overlay_hide_all(void) {
+  discord_overlay_hover_hidden = 1;
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    if (overlay->win && overlay->mapped) {
+      XUnmapWindow(dpy, overlay->win);
+      overlay->mapped = 0;
+    }
+  }
+  XFlush(dpy);
+}
+
+/* Recompute positions when a panel opens, closes, or changes geometry. */
+static void discord_overlay_relayout(void) {
+  size_t mapped = 0;
+  int total_width, x, y, panel_active;
+  int left_x, right_x, left_y, right_y, left_count, right_count, step;
+
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++)
+    if (discord_overlays[i].win && discord_overlays[i].visible)
+      mapped++;
+  if (!mapped)
+    return;
+
+  total_width = (int)mapped * DISCORD_AVATAR_WINDOW +
+                (int)(mapped - 1) * 10;
+  panel_active = discord_overlay_panel_geometry(
+      mapped, &left_x, &right_x, &left_y, &right_y, &left_count, &right_count,
+      &step);
+  if (panel_active) {
+    discord_overlay_panel_place();
+    return;
+  }
+
+  discord_overlay_layout(total_width, &x, &y);
+  for (size_t i = 0, index = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    if (!overlay->win || !overlay->visible)
+      continue;
+    overlay->x = x + index * (DISCORD_AVATAR_WINDOW + 10);
+    overlay->y = y;
+    XMoveWindow(dpy, overlay->win, overlay->x, overlay->y);
+    index++;
+  }
+}
+
+static void discord_update_ui(void) {
+  DwmDiscordSpeaker current[DWM_DISCORD_SPEAKERS];
+  size_t count;
+  uint64_t value;
+  int pointer_x, pointer_y, pointer_window_x, pointer_window_y;
+  Window pointer_root, pointer_child;
+  unsigned int pointer_mask;
+  int fd = discord_event_fd();
+  if (fd >= 0)
+    while (read(fd, &value, sizeof value) == sizeof value)
+      ;
+  count = discord_speakers(current, LENGTH(current));
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++)
+    discord_overlays[i].visible = 0;
+  for (size_t i = 0; i < count; i++) {
+    DiscordAvatarOverlay *overlay = discord_overlay_for(current[i].user_id);
+    if (!overlay)
+      continue;
+    overlay->visible = 1;
+    discord_copy_string(overlay->avatar_path, sizeof overlay->avatar_path,
+                        current[i].avatar_path);
+    if (!overlay->win && !discord_overlay_create(overlay))
+      overlay->visible = 0;
+  }
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    if (!overlay->win)
+      continue;
+    if (!overlay->visible) {
+      if (overlay->mapped) {
+        XUnmapWindow(dpy, overlay->win);
+        overlay->mapped = 0;
+      }
+      continue;
+    }
+  }
+  discord_overlay_relayout();
+  if (count && XQueryPointer(dpy, root, &pointer_root, &pointer_child,
+                             &pointer_x, &pointer_y, &pointer_window_x,
+                             &pointer_window_y, &pointer_mask) &&
+      discord_overlay_pointer_near(pointer_x, pointer_y)) {
+    discord_overlay_hide_all();
+    return;
+  }
+  discord_overlay_hover_hidden = 0;
+  /* Build or refresh each tile before mapping; the window's background pixmap
+   * paints it on map and handles later exposures without another render. */
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++)
+    if (discord_overlays[i].win && discord_overlays[i].visible)
+      discord_overlay_paint(&discord_overlays[i]);
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    if (!overlay->win || !overlay->visible)
+      continue;
+    if (!overlay->mapped) {
+      XMapWindow(dpy, overlay->win);
+      overlay->mapped = 1;
+    }
+  }
+  discord_overlay_raise();
+  XFlush(dpy);
+}
+
+static int discord_overlay_enter(Window win) {
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    if (discord_overlays[i].win == win) {
+      discord_overlay_hide_all();
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void togglediscord(const Arg *arg) {
+  (void)arg;
+  if (discord_event_fd() >= 0)
+    discord_stop();
+  else
+    (void)discord_start();
+  discord_update_ui();
+}
+
+static void discord_ui_cleanup(void) {
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    DiscordAvatarOverlay *overlay = &discord_overlays[i];
+    discord_overlay_cache_free(overlay);
+    if (overlay->win)
+      XDestroyWindow(dpy, overlay->win);
+    memset(overlay, 0, sizeof *overlay);
+  }
 }
 
 static void *finder_gl_proc(const char *name) {
@@ -11320,7 +12186,8 @@ void drawbar(Monitor *m) {
   for (c = m->clients; c; c = c->next) {
     occ |= occupiedtags(c);
   }
-  selectedtags = touchpad_swipe_active && touchpad_swipe_monitor == m
+  selectedtags = touchpad_swipe_active && touchpad_swipe_marker_active &&
+                         touchpad_swipe_monitor == m
                      ? touchpad_swipe_newtag
                      : m->tagset[m->seltags];
 
@@ -12044,6 +12911,9 @@ void enternotify(XEvent *e) {
   Monitor *m;
   XCrossingEvent *ev = &e->xcrossing;
 
+  if (discord_overlay_enter(ev->window))
+    return;
+
   if (ev->window == selmon->mpris_volume_markerwin) {
     if (!mpris_marker_pressed && !mpris_marker_hovered) {
       mpris_marker_hovered = 1;
@@ -12136,6 +13006,8 @@ void expose(XEvent *e) {
   Monitor *m;
   XExposeEvent *ev = &e->xexpose;
 
+  if (discord_overlay_expose(ev->window))
+    return;
   if (ev->count == 0 && (m = wintomon(ev->window))) {
     if (m == selmon && ev->window == m->barcenterwin &&
         (notify_active || notify_history_active))
@@ -13092,6 +13964,17 @@ void motionnotify(XEvent *e) {
   static Monitor *mon = NULL;
   Monitor *m;
   XMotionEvent *ev = &e->xmotion;
+
+  if (discord_overlay_hover_hidden) {
+    if (discord_overlay_pointer_near(ev->x_root, ev->y_root))
+      return;
+    discord_update_ui();
+    return;
+  }
+  if (discord_overlay_pointer_near(ev->x_root, ev->y_root)) {
+    discord_overlay_hide_all();
+    return;
+  }
 
   if (finder_active) {
     finder_motion(ev);
@@ -14085,6 +14968,10 @@ void resizebarwin(Monitor *m) {
       m->finder_marker_stacked = 1;
     }
   }
+  if (m == selmon) {
+    discord_overlay_relayout();
+    discord_overlay_raise();
+  }
 }
 
 void resizeclient(Client *c, int x, int y, int w, int h) {
@@ -14371,10 +15258,11 @@ void restack(Monitor *m) {
     ;
   if (m && m->sidebarvisible)
     XRaiseWindow(dpy, m->sidebarwin);
+  discord_overlay_raise();
 }
 
 /* Fullscreen clients should cover normal windows, but not dialogs and
- * compositor/WM-owned overlays.  Keep these above fullscreen after a client
+ * compositor/WM-owned overlays. Keep those above fullscreen after a client
  * or the WM changes the stacking order. */
 static void raisefullscreenoverlays(Monitor *m) {
   if (!m)
@@ -14384,6 +15272,7 @@ static void raisefullscreenoverlays(Monitor *m) {
     XRaiseWindow(dpy, m->sidebarwin);
   if (m == selmon && notification_center_active() && m->barcenterwin)
     XRaiseWindow(dpy, m->barcenterwin);
+  discord_overlay_raise();
 }
 
 void checkminimize(void) {
@@ -14500,8 +15389,8 @@ static void cleanup_touchpad_swipes(void) {
 /* Calculate the adjacent tag's layout without changing the selected tag or
  * mapping any windows. The saved geometry lets the gesture render both tags
  * side-by-side while the regular view/keybinding path remains unchanged. */
-static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
-                                 double device_width_mm) {
+static int begin_touchpad_swipe(Monitor *m, unsigned int targettag,
+                                double device_width_mm, int direction) {
   Client *c;
   size_t i = 0;
   int tagindex = 0;
@@ -14514,12 +15403,12 @@ static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
   if (!m || finder_active || m != selmon || m->pertag->curtag == 0 ||
       m->pertag->curtag > LENGTH(tags) ||
       (m->tagset[m->seltags] & (m->tagset[m->seltags] - 1)))
-    return;
+    return 0;
 
   for (c = m->clients; c; c = c->next)
     touchpad_swipe_client_count++;
   if (!touchpad_swipe_client_count)
-    return;
+    return 0;
   touchpad_swipe_clients = ecalloc(touchpad_swipe_client_count,
                                    sizeof(*touchpad_swipe_clients));
   oldtagset = m->tagset[m->seltags];
@@ -14539,6 +15428,7 @@ static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
     saved->was_autominimized = c->isautominimized;
     saved->was_wm_unmapped = c->wm_unmapped;
     saved->lastvisible = c->lastvisible;
+    saved->was_fshidden = c->fshidden;
   }
 
   for (tagindex = 0; tagindex < LENGTH(tags); tagindex++)
@@ -14595,7 +15485,9 @@ static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
   touchpad_swipe_oldtag = oldtagset;
   touchpad_swipe_newtag = targettag;
   touchpad_swipe_monitor = m;
+  touchpad_swipe_direction = direction;
   touchpad_swipe_active = 1;
+  touchpad_swipe_marker_active = 0;
   drawbars();
   XFlush(dpy);
 
@@ -14608,6 +15500,10 @@ static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
     c = wintoclient(saved->win);
     if (!c)
       continue;
+    if (saved->is_current && !saved->is_target)
+      setnoanimation_sync(c, 1);
+    else if (saved->is_target && !saved->is_current && saved->was_mapped)
+      setnoanimation_sync(c, 1);
     c->x = saved->x;
     c->y = saved->y;
     c->w = saved->w;
@@ -14629,32 +15525,236 @@ static void begin_touchpad_swipe(Monitor *m, unsigned int targettag,
         (!HIDDEN(c) || c->isautominimized || c->lastvisible > 0) &&
         !c->fshidden) {
       xmapclient(c);
+      /* Apply after mapping to keep the live preview free of compositor
+       * animations while it follows the fingers. */
+      setnoanimation_sync(c, 1);
       c->isautominimized = 0;
       c->lastvisible = 0;
       saved->preview_mapped = 1;
     }
   }
   XFlush(dpy);
-  return;
+  return 1;
 
 fail:
   free(touchpad_swipe_clients);
   touchpad_swipe_clients = NULL;
   touchpad_swipe_client_count = 0;
+  return 0;
 }
 
-static void update_touchpad_swipe(double dx_mm) {
-  size_t i;
+static double touchpad_swipe_progress(void) {
+  Monitor *m = touchpad_swipe_monitor;
   double progress;
-  int px;
 
-  if (!touchpad_swipe_active || !touchpad_swipe_monitor)
-    return;
-  progress = touchpad_swipe_dx_mm * touchpad_swipe_direction *
-             touchpad_swipe_monitor->ww * TOUCHPAD_SWIPE_SPEED /
-             touchpad_swipe_width_mm;
-  progress = MAX(0.0, MIN(progress, (double)touchpad_swipe_monitor->ww));
+  if (!m || touchpad_swipe_width_mm <= 0.0)
+    return 0.0;
+  progress = touchpad_swipe_direction * touchpad_swipe_dx_mm * m->ww *
+             TOUCHPAD_SWIPE_SPEED / touchpad_swipe_width_mm;
+  return MAX(0.0, MIN(progress, (double)m->ww));
+}
+
+static void free_touchpad_swipe_clients(void) {
+  free(touchpad_swipe_clients);
+  touchpad_swipe_clients = NULL;
+  touchpad_swipe_client_count = 0;
+}
+
+/* Disable compositor animations while clients track the fingers; restore
+ * animations before release slides and any unmap. */
+static void set_touchpad_swipe_animation(long val) {
+  size_t i;
+
+  for (i = 0; i < touchpad_swipe_client_count; i++) {
+    TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
+    Client *c = wintoclient(saved->win);
+
+    if (c && saved->is_current != saved->is_target)
+      setnoanimation_sync(c, val);
+  }
+}
+
+static int begin_touchpad_swipe_state(Monitor *m, int base, int target,
+                                      double width_mm, int direction) {
+  if (!m || base < 0 || target < 0 || base >= LENGTH(tags) ||
+      target >= LENGTH(tags))
+    return 0;
+  touchpad_swipe_base_index = base;
+  touchpad_swipe_target_index = target;
+  return begin_touchpad_swipe(m, 1U << target, width_mm, direction);
+}
+
+/* Restore every client touched by the preview to its pre-preview state.
+ * Used when reversing direction and when the gesture is cancelled. */
+static void restore_touchpad_swipe_clients(void) {
+  size_t i;
+  Monitor *m = touchpad_swipe_monitor;
+
+  for (i = 0; i < touchpad_swipe_client_count; i++) {
+    TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
+    Client *c = wintoclient(saved->win);
+    XWindowAttributes wa;
+    int x, y, w, h;
+
+    if (!c)
+      continue;
+    c->x = saved->x;
+    c->y = saved->y;
+    c->w = saved->w;
+    c->h = saved->h;
+    x = saved->x;
+    y = saved->y;
+    w = saved->w;
+    h = saved->h;
+    if (saved->preview_mapped && saved->is_target && !saved->is_current && m) {
+      x = saved->target_x - touchpad_swipe_direction * m->ww;
+      y = saved->target_y;
+      w = saved->target_w;
+      h = saved->target_h;
+    }
+    XMoveResizeWindow(dpy, c->win, x, y, MAX(1, w), MAX(1, h));
+    if (XGetWindowAttributes(dpy, c->win, &wa)) {
+      if (saved->was_mapped && wa.map_state == IsUnmapped)
+        XMapWindow(dpy, c->win);
+      else if (!saved->was_mapped && wa.map_state != IsUnmapped) {
+        setnoanimation_sync(c, 0);
+        XUnmapWindow(dpy, c->win);
+      }
+    }
+    if (saved->preview_mapped && shouldminimize(c))
+      setclientstate(c, saved->was_iconic ? IconicState : NormalState);
+    c->isiconic = saved->was_iconic;
+    c->isautominimized = saved->was_autominimized;
+    c->wm_unmapped = saved->was_wm_unmapped;
+    c->lastvisible = saved->lastvisible;
+    c->fshidden = saved->was_fshidden;
+  }
+  XFlush(dpy);
+}
+
+/* The gesture has advanced one full screen towards the previewed tag. Make
+ * that tag current and open the next preview from it, keeping the leftover
+ * movement so several tags can be crossed in one drag. */
+static int touchpad_swipe_chain_forward(void) {
+  Monitor *m = touchpad_swipe_monitor;
+  int committed, next;
+  double step_mm;
+  Arg arg;
+
+  if (!touchpad_swipe_active || !m || m != selmon ||
+      touchpad_swipe_base_index < 0 || touchpad_swipe_target_index < 0 ||
+      LENGTH(tags) < 2)
+    return 0;
+  if (m->tagset[m->seltags] != (1U << touchpad_swipe_base_index))
+    return 0;
+  committed = touchpad_swipe_target_index;
+  next = (committed - touchpad_swipe_direction + LENGTH(tags)) % LENGTH(tags);
+
+  step_mm = touchpad_swipe_width_mm / TOUCHPAD_SWIPE_SPEED;
+  touchpad_swipe_dx_mm -= touchpad_swipe_direction * step_mm;
+  set_touchpad_swipe_animation(0);
+  free_touchpad_swipe_clients();
+  touchpad_swipe_active = 0;
+  touchpad_swipe_marker_active = 0;
+
+  arg.ui = 1U << committed;
+  touchpad_swipe_defer_ewmh = 1;
+  view(&arg);
+  touchpad_swipe_defer_ewmh = 0;
+
+  touchpad_swipe_base_index = committed;
+  touchpad_swipe_target_index = next;
+  if (!begin_touchpad_swipe_state(m, committed, next,
+                                  touchpad_swipe_width_mm,
+                                  touchpad_swipe_direction)) {
+    touchpad_swipe_dx_mm = 0.0;
+    return 1;
+  }
+  return 1;
+}
+
+/* Movement crossed back through the starting point. Keep the same tag
+ * selected, but preview the neighbour on the other side of it. This is what
+ * lets the user change direction without lifting the fingers. */
+static int touchpad_swipe_reverse(void) {
+  Monitor *m = touchpad_swipe_monitor;
+  int target;
+
+  if (!touchpad_swipe_active || !m || touchpad_swipe_base_index < 0 ||
+      LENGTH(tags) < 2)
+    return 0;
+  target =
+      (touchpad_swipe_base_index + touchpad_swipe_direction + LENGTH(tags)) %
+      LENGTH(tags);
+
+  set_touchpad_swipe_animation(0);
+  restore_touchpad_swipe_clients();
+  free_touchpad_swipe_clients();
+  touchpad_swipe_active = 0;
+  touchpad_swipe_direction = -touchpad_swipe_direction;
+  touchpad_swipe_target_index = target;
+  if (!begin_touchpad_swipe_state(m, touchpad_swipe_base_index, target,
+                                  touchpad_swipe_width_mm,
+                                  touchpad_swipe_direction)) {
+    touchpad_swipe_dx_mm = 0.0;
+    return 1;
+  }
+  return 1;
+}
+
+static int update_touchpad_swipe(int allow_chain) {
+  Monitor *m = touchpad_swipe_monitor;
+  double progress;
+  int px, guard;
+
+  if (!m || touchpad_swipe_width_mm <= 0.0)
+    return 0;
+  for (guard = 0; guard < (int)LENGTH(tags) + 2; guard++) {
+    if (!touchpad_swipe_active)
+      break;
+    progress = touchpad_swipe_direction * touchpad_swipe_dx_mm * m->ww *
+               TOUCHPAD_SWIPE_SPEED / touchpad_swipe_width_mm;
+    if (progress >= (double)m->ww) {
+      if (!allow_chain)
+        break;
+      /* Show the completed step before committing it so a large input delta
+       * cannot make the layout jump from a partially-open position. */
+      position_touchpad_swipe_clients(m->ww);
+      if (!touchpad_swipe_chain_forward())
+        break;
+      continue;
+    }
+    if (progress < -TOUCHPAD_SWIPE_EPSILON) {
+      if (!allow_chain)
+        break;
+      position_touchpad_swipe_clients(0);
+      if (!touchpad_swipe_reverse())
+        break;
+      continue;
+    }
+    break;
+  }
+  if (!touchpad_swipe_active)
+    return 0;
+
+  progress = touchpad_swipe_direction * touchpad_swipe_dx_mm * m->ww *
+             TOUCHPAD_SWIPE_SPEED / touchpad_swipe_width_mm;
+  progress = MAX(0.0, MIN(progress, (double)m->ww));
   px = (int)progress;
+  {
+    int marker_active = progress >= m->ww * 0.50;
+
+    if (touchpad_swipe_marker_active != marker_active) {
+      touchpad_swipe_marker_active = marker_active;
+      drawbars();
+    }
+  }
+  position_touchpad_swipe_clients(px);
+  return 1;
+}
+
+static void position_touchpad_swipe_clients(int px) {
+  size_t i;
 
   for (i = 0; i < touchpad_swipe_client_count; i++) {
     TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
@@ -14668,85 +15768,109 @@ static void update_touchpad_swipe(double dx_mm) {
       x = saved->target_x - touchpad_swipe_direction * touchpad_swipe_monitor->ww +
           touchpad_swipe_direction * px;
     XMoveResizeWindow(dpy, c->win, x,
-                      saved->is_current ? saved->y : saved->target_y,
+                       saved->is_current ? saved->y : saved->target_y,
                       MAX(1, saved->is_current ? saved->w : saved->target_w),
                       MAX(1, saved->is_current ? saved->h : saved->target_h));
   }
   XFlush(dpy);
-  (void)dx_mm;
+}
+
+static void return_touchpad_swipe_preview(void) {
+  struct timespec delay = {0, TOUCHPAD_SWIPE_RETURN_DELAY_NS};
+  double progress;
+  int start_px, step;
+
+  if (!touchpad_swipe_monitor || touchpad_swipe_width_mm <= 0.0)
+    return;
+  progress = touchpad_swipe_progress();
+  start_px = (int)progress;
+
+  /* Ease both tags back to their original positions. Keep the incoming
+   * preview at its off-screen entry edge for a frame before it is unmapped. */
+  for (step = 1; step <= TOUCHPAD_SWIPE_RETURN_STEPS; step++) {
+    double t = (double)step / TOUCHPAD_SWIPE_RETURN_STEPS;
+    double eased = t * t * (3.0 - 2.0 * t);
+    int px = (int)(start_px * (1.0 - eased) + 0.5);
+    position_touchpad_swipe_clients(px);
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &delay, NULL);
+  }
+}
+
+static void complete_touchpad_swipe_preview(void) {
+  struct timespec delay = {0, TOUCHPAD_SWIPE_RETURN_DELAY_NS};
+  double progress;
+  int start_px, step;
+
+  if (!touchpad_swipe_monitor || touchpad_swipe_width_mm <= 0.0)
+    return;
+  progress = touchpad_swipe_progress();
+  start_px = (int)progress;
+
+  /* Finish the committed slide: outgoing clients leave through the edge
+   * opposite the incoming clients' off-screen starting edge. */
+  for (step = 1; step <= TOUCHPAD_SWIPE_RETURN_STEPS; step++) {
+    double t = (double)step / TOUCHPAD_SWIPE_RETURN_STEPS;
+    double eased = t * t * (3.0 - 2.0 * t);
+    int px = start_px + (int)((touchpad_swipe_monitor->ww - start_px) * eased + 0.5);
+    position_touchpad_swipe_clients(px);
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &delay, NULL);
+  }
 }
 
 static void finish_touchpad_swipe(int cancelled) {
-  size_t i;
   int commit;
-  Monitor *m = touchpad_swipe_monitor;
-  double progress = 0.0;
+  Monitor *m;
+  double progress;
 
   if (!touchpad_swipe_active)
     return;
-  if (m && touchpad_swipe_width_mm > 0.0)
-    progress = fabs(touchpad_swipe_dx_mm) * m->ww * TOUCHPAD_SWIPE_SPEED /
-               touchpad_swipe_width_mm;
-  commit = !cancelled && m && m == selmon &&
-           progress >= m->ww * 0.50;
-
-  /* Publish the released desktop before restoring or unmapping preview clients. */
-  if (commit)
-    updatecurrentdesktop(touchpad_swipe_newtag);
-  else if (selmon)
-    updatecurrentdesktop(selmon->tagset[selmon->seltags]);
-  else if (m)
-    updatecurrentdesktop(touchpad_swipe_oldtag);
-  XFlush(dpy);
+  /* Resolve any boundary crossed by the final event before deciding whether
+   * this release commits the tag that is currently being previewed. A
+   * cancelled gesture never promotes newly crossed boundaries. */
+  update_touchpad_swipe(!cancelled);
+  if (!touchpad_swipe_active) {
+    touchpad_swipe_monitor = NULL;
+    touchpad_swipe_base_index = -1;
+    touchpad_swipe_target_index = -1;
+    touchpad_swipe_marker_active = 0;
+    drawbars();
+    return;
+  }
+  m = touchpad_swipe_monitor;
+  progress = touchpad_swipe_progress();
+  commit = !cancelled && m && m == selmon && progress >= m->ww * 0.50;
 
   if (!commit) {
     /* Restore the tag marker before unmapping preview clients. */
     touchpad_swipe_active = 0;
+    touchpad_swipe_marker_active = 0;
     drawbars();
     XFlush(dpy);
+    set_touchpad_swipe_animation(0);
+    return_touchpad_swipe_preview();
+  } else {
+    set_touchpad_swipe_animation(0);
+    complete_touchpad_swipe_preview();
   }
 
   /* A commit must keep the preview geometry until view() performs the normal
    * tag transition and layout. Rolling windows back here makes them visibly
    * jump before the old tag is unmapped. Cancellation still restores the exact
    * pre-gesture client and mapping state. */
-  if (!commit) {
-    for (i = 0; i < touchpad_swipe_client_count; i++) {
-      TouchpadSwipeClient *saved = &touchpad_swipe_clients[i];
-      Client *c = wintoclient(saved->win);
-      XWindowAttributes wa;
-      if (!c)
-        continue;
-      c->x = saved->x;
-      c->y = saved->y;
-      c->w = saved->w;
-      c->h = saved->h;
-      XMoveResizeWindow(dpy, c->win, c->x, c->y,
-                        MAX(1, c->w), MAX(1, c->h));
-      if (XGetWindowAttributes(dpy, c->win, &wa)) {
-        if (saved->was_mapped && wa.map_state == IsUnmapped)
-          XMapWindow(dpy, c->win);
-        else if (!saved->was_mapped && wa.map_state != IsUnmapped)
-          XUnmapWindow(dpy, c->win);
-      }
-      if (saved->preview_mapped && shouldminimize(c))
-        setclientstate(c, saved->was_iconic ? IconicState : NormalState);
-      c->isiconic = saved->was_iconic;
-      c->isautominimized = saved->was_autominimized;
-      c->wm_unmapped = saved->was_wm_unmapped;
-      c->lastvisible = saved->lastvisible;
-    }
-    XFlush(dpy);
-  }
+  if (!commit)
+    restore_touchpad_swipe_clients();
 
   touchpad_swipe_active = 0;
+  touchpad_swipe_marker_active = 0;
   touchpad_swipe_monitor = NULL;
-  free(touchpad_swipe_clients);
-  touchpad_swipe_clients = NULL;
-  touchpad_swipe_client_count = 0;
+  touchpad_swipe_base_index = -1;
+  touchpad_swipe_target_index = -1;
+  free_touchpad_swipe_clients();
   if (commit && m == selmon) {
     Arg arg = {.ui = touchpad_swipe_newtag};
+    touchpad_swipe_defer_ewmh = 1;
     view(&arg);
+    touchpad_swipe_defer_ewmh = 0;
   }
   /* The selected-tag marker previews the destination during the swipe.
    * Redraw after clearing the preview so cancellation restores the old tag. */
@@ -14787,6 +15911,9 @@ static void handle_touchpad_swipe(struct libinput_event *event) {
     touchpad_swipe_monitor = selmon;
     touchpad_swipe_dx_mm = touchpad_swipe_dy_mm = 0.0;
     touchpad_swipe_active = 0;
+    touchpad_swipe_marker_active = 0;
+    touchpad_swipe_base_index = -1;
+    touchpad_swipe_target_index = -1;
     if (libinput_device_get_size(device, &width, &height) == 0 && width > 1.0)
       touchpad_swipe_width_mm = width;
     else
@@ -14802,8 +15929,7 @@ static void handle_touchpad_swipe(struct libinput_event *event) {
     touchpad_swipe_dx_mm += dx;
     touchpad_swipe_dy_mm += dy;
     if (!touchpad_swipe_active) {
-      if (fabs(touchpad_swipe_dx_mm) < 8.0 ||
-          fabs(touchpad_swipe_dx_mm) <= fabs(touchpad_swipe_dy_mm) * 1.25)
+      if (fabs(touchpad_swipe_dx_mm) <= fabs(touchpad_swipe_dy_mm) * 1.25)
         return;
       touchpad_swipe_direction = touchpad_swipe_dx_mm > 0.0 ? 1 : -1;
       if (!touchpad_swipe_monitor ||
@@ -14812,18 +15938,23 @@ static void handle_touchpad_swipe(struct libinput_event *event) {
         return;
       {
         int current = (int)touchpad_swipe_monitor->pertag->curtag - 1;
-        int target = (current - touchpad_swipe_direction + LENGTH(tags)) % LENGTH(tags);
-        begin_touchpad_swipe(touchpad_swipe_monitor, 1U << target,
-                             touchpad_swipe_width_mm);
+        int target =
+            (current - touchpad_swipe_direction + LENGTH(tags)) % LENGTH(tags);
+        begin_touchpad_swipe_state(touchpad_swipe_monitor, current, target,
+                                   touchpad_swipe_width_mm,
+                                   touchpad_swipe_direction);
       }
     }
-    update_touchpad_swipe(dx);
+    if (touchpad_swipe_active)
+      update_touchpad_swipe(1);
   } else {
     int cancelled = libinput_event_gesture_get_cancelled(gesture);
     finish_touchpad_swipe(cancelled);
     libinput_device_unref(touchpad_swipe_device);
     touchpad_swipe_device = NULL;
     touchpad_swipe_monitor = NULL;
+    touchpad_swipe_base_index = -1;
+    touchpad_swipe_target_index = -1;
     touchpad_swipe_dx_mm = touchpad_swipe_dy_mm = 0.0;
   }
 }
@@ -14846,7 +15977,8 @@ void run(void) {
   const int history_scroll_timeout = 1000 / NOTIFY_HISTORY_FPS;
   const int finder_glow_timeout = 1000 / 30;
   time_t next_clock_update = 0;
-  struct pollfd pfd[6] = {{.fd = xfd, .events = POLLIN},
+  struct pollfd pfd[7] = {{.fd = xfd, .events = POLLIN},
+                          {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
                           {.fd = -1, .events = POLLIN},
@@ -14932,6 +16064,7 @@ void run(void) {
     pfd[3].fd = finder_translate_fd;
     pfd[4].fd = finder_ocr_fd;
     pfd[5].fd = touchpad_input ? libinput_get_fd(touchpad_input) : -1;
+    pfd[6].fd = discord_event_fd();
     poll(pfd, LENGTH(pfd), timeout);
     if (notify_fd >= 0 && (pfd[1].revents & POLLIN))
       notification_dispatch();
@@ -14945,6 +16078,8 @@ void run(void) {
       finder_ocr_read();
     if (touchpad_input && (pfd[5].revents & (POLLIN | POLLHUP | POLLERR)))
       dispatch_touchpad_swipes();
+    if (pfd[6].fd >= 0 && (pfd[6].revents & POLLIN))
+      discord_update_ui();
     {
       struct timespec now_mono;
       int urgent_redraw = 0;
@@ -17086,8 +18221,10 @@ void view(const Arg *arg) {
     return;
 
   newtagset = arg->ui & TAGMASK ? arg->ui & TAGMASK : selmon->pertag->prevtag;
-  updatecurrentdesktop(newtagset);
-   XFlush(dpy);
+  if (!touchpad_swipe_defer_ewmh) {
+    updatecurrentdesktop(newtagset);
+    XFlush(dpy);
+  }
   prepare_workspace_switch(selmon, selmon->tagset[selmon->seltags], newtagset);
   switchtag();
   selmon->seltags ^= 1; /* toggle sel tagset */
@@ -17122,6 +18259,12 @@ void view(const Arg *arg) {
 
   focus(NULL);
   arrange(selmon);
+  /* Three-finger swipes publish only after the outgoing workspace has been
+   * hidden/unmapped; keybind-driven views retain their original ordering. */
+  if (touchpad_swipe_defer_ewmh) {
+    updatecurrentdesktop(newtagset);
+    XFlush(dpy);
+  }
 }
 
 Client *wintoclient(Window w) {
@@ -17232,13 +18375,14 @@ int main(int argc, char *argv[]) {
   init_touchpad_swipes();
   finder_load_recent();
 #ifdef __OpenBSD__
-  if (pledge("stdio rpath proc exec", NULL) == -1)
+  if (pledge("stdio rpath wpath cpath fattr proc exec inet unix dns", NULL) == -1)
     die("pledge");
 #endif /* __OpenBSD__ */
   scan();
   status_start();
   if (CLOCK_ANIMATE)
     sound_monitor_start();
+  (void)discord_start();
   run();
   cleanup();
   XCloseDisplay(dpy);

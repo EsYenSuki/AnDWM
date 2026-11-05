@@ -229,6 +229,7 @@ static const Key keys[] = {
     { MODKEY,                           XK_space,   spawn,          {.v = togglekb } },
     { MODKEY|ControlMask,               XK_b,       togglebar,      {0} },
     { MODKEY|ControlMask,               XK_t,       togglegaps,     {0} },
+    { MODKEY|ControlMask,               XK_f,       togglediscord,  {0} },
     { MODKEY,                           XK_w,       togglefloating, {0} },
     { MODKEY,                           XK_f,       togglefullscr,  {0} },
     { MODKEY|ShiftMask,                 XK_b,       togglestickyclient,   {0} },
