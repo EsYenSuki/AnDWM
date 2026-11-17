@@ -35,6 +35,7 @@ static const char *finder_app_dirs[] = {
     NULL,
 };
 static const int notification_gl    = 1;   /* 1: use OpenGL GPU acceleration for notification and history, 0: use XRender fallback */
+static const int discord_fullscreen = 1;   /* 0: hide Discord avatars in fullscreen, 1: keep them visible */
 static const char *notification_ignore_apps[] = {
     NULL,
 };
@@ -77,7 +78,7 @@ static const char *fonts[] = {
     "Sarasa Gothic K:style:Regular:size=10",           // Korean
     "Noto Sans Thai:style:Regular:size=11.5",            // Thai
     "Noto Sans Arabic:style:Regular:size=11.5",          // Arabic
-    "Noto Sans Devanagari:style:Regular:size=11.5",       // Hindi/Indic
+    "Noto Sans Devanagari:style:Regular:size=11.5",       // hindi/Indic
 };
 
 static const char *togglekb[]  = { "setxkbmap", "-layout", "us,th", "-option", "grp:win_space_toggle", NULL };
@@ -205,14 +206,14 @@ static const Key keys[] = {
 	{0,				XF86XK_MonBrightnessDown,   spawn,	{.v = light_down}},
 
     // screenshot fullscreen and cropped
-    { MODKEY|ShiftMask,     		    XK_s,       spawn,          SHCMD("/home/Hi/.config/AnDWM/scripts/bin/znap") },
+    { MODKEY|ShiftMask,     		    XK_s,       spawn,          SHCMD("/home/hi/.config/AnDWM/scripts/bin/znap") },
     { MODKEY,                           XK_s,       finder_ocr,     {0} },
     { MODKEY,                           XK_a,       finder,         {0} },
     { MODKEY,                           XK_Return,  spawn,          SHCMD("kitty") },
     { MODKEY,                           XK_e,       spawn,          SHCMD("nemo") },
     { MODKEY,                           XK_b,       spawn,          SHCMD("MOZ_X11_EGL=1 MOZ_USE_XINPUT2=1 zen-browser") },
-    { MODKEY,                           XK_v,       spawn,          SHCMD("/home/Hi/.config/AnDWM/scripts/bin/clyp") },
-    { MODKEY,                           XK_period,  spawn,          SHCMD("rofi -modi \"emoji:rofimoji --action copy --hidden-descriptions\" -show emoji -theme /home/Hi/.config/AnDWM/rofi/moji.rasi") },
+    { MODKEY,                           XK_v,       spawn,          SHCMD("/home/hi/.config/AnDWM/scripts/bin/clyp") },
+    { MODKEY,                           XK_period,  spawn,          SHCMD("rofi -modi \"emoji:rofimoji --action copy --hidden-descriptions\" -show emoji -theme /home/hi/.config/AnDWM/rofi/moji.rasi") },
     { MODKEY|ShiftMask,                 XK_c,       spawn,          SHCMD("picom cursor toggle") },
     { MODKEY|ShiftMask,                 XK_d,       toggleoverlayed, {0} },
 

@@ -106,6 +106,7 @@ sendn(const char *msg)
 #define NOTIFY_MAX       5
 #define NOTIFY_TIMEOUT   5
 #define NOTIFY_TRANSITION_MS 500
+#define NOTIFY_HOVER_GRACE_MS 400
 #define NOTIFY_TWO_CONTENT_H 70
 #define NOTIFY_MAX_W     300
 #define NOTIFY_PADDING   15
@@ -314,6 +315,13 @@ static struct timespec notify_transition_started;
 static int notify_history_active;
 static int notify_image_y, notify_text_y;
 static int notify_clock_hovered;
+static uint64_t notify_hover_grace_until_ms;
+static int notify_hover_grace_x, notify_hover_grace_y;
+static int notify_hover_grace_has_pos;
+
+#define MAX_OVERRIDE_REDIRECT 64
+static Window override_redirect_windows[MAX_OVERRIDE_REDIRECT];
+static unsigned int override_redirect_count;
 static unsigned int notify_width, notify_height;
 static unsigned int notify_count;
 static unsigned int notify_history_count;
@@ -809,6 +817,9 @@ static void manage(Window w, XWindowAttributes *wa);
 static void mappingnotify(XEvent *e);
 static void maprequest(XEvent *e);
 static void mapnotify(XEvent *e);
+static void track_override_redirect(Window w);
+static void untrack_override_redirect(Window w);
+static void raise_override_redirects(void);
 static void monocle(Monitor *m);
 static void motionnotify(XEvent *e);
 static void movemouse(const Arg *arg);
@@ -924,6 +935,8 @@ static void finder_ocr(const Arg *arg);
 static void finder_ocr_read(void);
 static void finder_ocr_finish(void);
 static uint64_t finder_monotonic_ms(void);
+static int notification_hover_suppressed(int x, int y);
+static Monitor *finder_pointer_monitor(void);
 static float finder_translation_glow_pulse(uint64_t now);
 static void finder_translation_glow_stop(void);
 static void status_start(void);
@@ -1643,7 +1656,7 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
                         unsigned long long *last_total, unsigned long long *last_active) {
 	unsigned long long total = 0, active = 0, used, memtotal;
 	int mempercent, cpu = 0, cap, charging, strength, temp;
-	char memtext[32], ssid[128], player[768], fan[16], sav_icon[64], governor[32], tlp[32];
+	char memtext[32], ssid[128], player[768], fan[16], sav_icon[64], tlp[32];
 	const char *icon, *wicon, *bicon, *memcolor;
 	static int fan_st;
 	int wifi = status_wifi(ssid, sizeof ssid, &strength);
@@ -1672,11 +1685,9 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 	bicon = charging ? "󰂄" : (cap >= 90 ? "󰁹" : (cap >= 50 ? "󰁿" :
 	        (cap >= 20 ? "󰁼" : "󰁺")));
 	temp = status_temperature();
-	status_read_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
-	                 governor, sizeof governor);
 	status_read_line("/run/tlp/last_pwr", tlp, sizeof tlp);
 	status_fan(fan, sizeof fan);
-	if (!strcmp(tlp, "0 0") && !strcmp(governor, "ondemand") && temp > 79 && !fan_st) {
+	if (!strcmp(tlp, "0 0") && temp > 79 && !fan_st) {
 		/* Same fan policy as bar.cpp, but the worker writes only sysfs. */
 		glob_t matches;
 		if (glob("/sys/devices/platform/asus-nb-wmi/hwmon/*/pwm1_enable", 0, NULL, &matches) == 0) {
@@ -1684,7 +1695,7 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 			globfree(&matches);
 		}
 		fan_st = 1;
-	} else if ((strcmp(tlp, "0 0") || (!strcmp(governor, "ondemand") && temp <= 72)) && fan_st) {
+	} else if ((strcmp(tlp, "0 0") || temp <= 72) && fan_st) {
 		glob_t matches;
 		if (glob("/sys/devices/platform/asus-nb-wmi/hwmon/*/pwm1_enable", 0, NULL, &matches) == 0) {
 			if (matches.gl_pathc) { FILE *f = fopen(matches.gl_pathv[0], "w"); if (f) { fputs("2", f); fclose(f); } }
@@ -1706,10 +1717,8 @@ static void status_make(char *out, size_t outlen, char *mpris_out, size_t mpris_
 	                          mpris_playing_out);
 	if (mpris_present_out) *mpris_present_out = has_player;
 	sav_icon[0] = '\0';
-	if (fan[0] || !strcmp(governor, "performance")) {
-		snprintf(sav_icon, sizeof sav_icon, "  %s%s%s", fan,
-		         fan[0] && !strcmp(governor, "performance") ? " " : "",
-		         !strcmp(governor, "performance") ? "" : "");
+	if (fan[0]) {
+		snprintf(sav_icon, sizeof sav_icon, " %s", fan);
 	}
 	/* A paused player remains present for MPRIS interaction, but the
 	 * top-right bar should fall back to the regular status layout rather
@@ -2265,7 +2274,6 @@ static struct udev *touchpad_udev;
 static struct libinput_device *touchpad_swipe_device;
 static int touchpad_swipe_active;
 static int touchpad_swipe_marker_active;
-static int touchpad_swipe_defer_ewmh;
 static Monitor *touchpad_swipe_monitor;
 static unsigned int touchpad_swipe_oldtag;
 static unsigned int touchpad_swipe_newtag;
@@ -3318,6 +3326,10 @@ void configurenotify(XEvent *e) {
     if (updategeom() || dirty) {
       drw_resize(drw, sw, sh);
       updatebars();
+      /* A monitor added after startup does not have a tag preview window yet.
+       * Create only missing preview windows; existing ones are kept so their
+       * cached pixmaps and event state remain valid. */
+      updatepreview();
       for (m = mons; m; m = m->next) {
         for (c = m->clients; c; c = c->next)
           if (c->isfullscreen)
@@ -3448,6 +3460,8 @@ void cyclelayout(const Arg *arg) {
 void destroynotify(XEvent *e) {
   Client *c;
   XDestroyWindowEvent *ev = &e->xdestroywindow;
+
+  untrack_override_redirect(ev->window);
 
   if ((c = wintoclient(ev->window)))
     unmanage(c, 1);
@@ -5001,6 +5015,29 @@ static uint64_t finder_monotonic_ms(void) {
   return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
+/* Ignore EnterNotify/MotionNotify generated by resizing the center bar when
+ * Finder closes.  A real pointer movement cancels the grace period early. */
+static int notification_hover_suppressed(int x, int y) {
+  uint64_t now;
+
+  if (!notify_hover_grace_until_ms)
+    return 0;
+  now = finder_monotonic_ms();
+  if (now >= notify_hover_grace_until_ms) {
+    notify_hover_grace_until_ms = 0;
+    notify_hover_grace_has_pos = 0;
+    return 0;
+  }
+  if (notify_hover_grace_has_pos &&
+      (abs(x - notify_hover_grace_x) > 2 ||
+       abs(y - notify_hover_grace_y) > 2)) {
+    notify_hover_grace_until_ms = 0;
+    notify_hover_grace_has_pos = 0;
+    return 0;
+  }
+  return 1;
+}
+
 static void finder_cursor_reset(void) {
   finder_cursor_base_ms = finder_monotonic_ms();
   finder_cursor_visible = 1;
@@ -5723,6 +5760,12 @@ static void finder_close(void) {
   finder_translate_outgoing[0] = '\0';
   finder_translate_outgoing_started_ms = 0;
   finder_active = 0;
+  /* Do not let the center-bar resize below turn Finder's old hover position
+   * into an immediate notification-history open. */
+  notify_clock_hovered = 0;
+  notify_hover_grace_until_ms = finder_monotonic_ms() + NOTIFY_HOVER_GRACE_MS;
+  notify_hover_grace_has_pos = getrootptr(&notify_hover_grace_x,
+                                          &notify_hover_grace_y);
   finder_ocr_mode = 0;
   finder_loading = 0;
   finder_icons_pending = 0;
@@ -5797,6 +5840,21 @@ static void finder_focus_pointer(void) {
   }
 }
 
+/* Return the monitor currently under the pointer.  The selected monitor can
+ * lag behind the pointer when the pointer is moved over a monitor whose root
+ * window has not generated an EnterNotify yet (notably while opening Finder
+ * from a global keybinding). */
+static Monitor *finder_pointer_monitor(void) {
+  Window root_return, child;
+  int root_x, root_y, win_x, win_y;
+  unsigned int mask;
+
+  if (!XQueryPointer(dpy, root, &root_return, &child, &root_x, &root_y,
+                     &win_x, &win_y, &mask))
+    return selmon;
+  return recttomon(root_x, root_y, 1, 1);
+}
+
 static void finder_launch(void) {
   FinderApp *app = finder_selected_app();
   pid_t pid;
@@ -5845,7 +5903,17 @@ static void finder_launch(void) {
 }
 
 static void finder(const Arg *arg) {
+  Monitor *pointermon;
+
   (void)arg;
+  if (!finder_active) {
+    pointermon = finder_pointer_monitor();
+    if (pointermon && pointermon != selmon) {
+      unfocus(selmon->sel, 0);
+      selmon = pointermon;
+      focus(NULL);
+    }
+  }
   /* Keep the modal Finder off fullscreen clients.  It would otherwise raise
    * itself above the fullscreen window and steal keyboard focus.  Closing an
    * already-open Finder is still allowed. */
@@ -6864,7 +6932,9 @@ static void notification_history_layout(void) {
 }
 
 static void notification_history_show(void) {
-  if (!notify_history_count || notify_active || finder_active)
+  if (!notify_history_count || notify_active || finder_active ||
+      (notify_hover_grace_until_ms &&
+       finder_monotonic_ms() < notify_hover_grace_until_ms))
     return;
   notify_history_active = 1;
   notify_history_input = NULL;
@@ -8024,7 +8094,7 @@ static int discord_overlay_create(DiscordAvatarOverlay *overlay) {
   Colormap colormap = finder_argb_visual ? finder_argb_colormap
                                          : DefaultColormap(dpy, screen);
   XRenderPictFormat *format;
-  Atom type_atom, discord_atom;
+  Atom type_atom;
   if (!overlay)
     return 0;
   wa.override_redirect = True;
@@ -8045,10 +8115,19 @@ static int discord_overlay_create(DiscordAvatarOverlay *overlay) {
     return 0;
   }
   XStoreName(dpy, overlay->win, "AnDWM Discord speaker");
+  {
+    XClassHint ch = {"discord-overlay", "discord-overlay"};
+    XSetClassHint(dpy, overlay->win, &ch);
+  }
   type_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
-  discord_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DWM_DISCORD", False);
+  Atom splash_atom = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_SPLASH", False);
   XChangeProperty(dpy, overlay->win, type_atom, XA_ATOM, 32,
-                  PropModeReplace, (unsigned char *)&discord_atom, 1);
+                   PropModeReplace, (unsigned char *)&splash_atom, 1);
+  /* Keep the overlay out of taskbars and window switchers. */
+  Atom skip_taskbar = XInternAtom(dpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
+  XChangeProperty(dpy, overlay->win,
+                  XInternAtom(dpy, "_NET_WM_STATE", False), XA_ATOM, 32,
+                  PropModeReplace, (unsigned char *)&skip_taskbar, 1);
   return 1;
 }
 
@@ -8074,6 +8153,8 @@ static DiscordAvatarOverlay *discord_overlay_for(const char *id) {
 
 /* Keep speaking avatars above clients, then restore DWM-owned overlays. */
 static void discord_overlay_raise(void) {
+  if (!discord_fullscreen && fullscreen_st)
+    return;
   for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
     DiscordAvatarOverlay *overlay = &discord_overlays[i];
     if (overlay->win && overlay->visible && overlay->mapped)
@@ -8099,7 +8180,7 @@ static void discord_overlay_layout(int total_width, int *x, int *y) {
 
   *x = MAX(0, (sw - total_width) / 2);
   *y = fullscreen_st && selmon
-           ? selmon->by
+           ? MIN(MAX(selmon->by, 0), MAX(0, sh - DISCORD_AVATAR_WINDOW))
            : MIN(bh + DISCORD_TOP_PADDING,
                  MAX(0, sh - DISCORD_AVATAR_WINDOW));
 
@@ -8229,9 +8310,11 @@ static void discord_overlay_panel_place(void) {
     }
     x = MIN(MAX(x, 0), MAX(0, sw - DISCORD_AVATAR_WINDOW));
     y = MIN(MAX(y, 0), MAX(0, sh - DISCORD_AVATAR_WINDOW));
-    overlay->x = x;
-    overlay->y = y;
-    XMoveWindow(dpy, overlay->win, x, y);
+    if (overlay->x != x || overlay->y != y) {
+      overlay->x = x;
+      overlay->y = y;
+      XMoveWindow(dpy, overlay->win, x, y);
+    }
     index++;
   }
 }
@@ -8254,6 +8337,8 @@ static int discord_overlay_pointer_near(int x, int y) {
 }
 
 static void discord_overlay_hide_all(void) {
+  if (discord_overlay_hover_hidden)
+    return;
   discord_overlay_hover_hidden = 1;
   for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
     DiscordAvatarOverlay *overlay = &discord_overlays[i];
@@ -8262,7 +8347,9 @@ static void discord_overlay_hide_all(void) {
       overlay->mapped = 0;
     }
   }
-  XFlush(dpy);
+  /* Let Xlib batch the map/unmap requests instead of forcing an immediate
+   * full flush on every hover event; that avoids the tiny but visible jitter
+   * while the overlay transitions. */
 }
 
 /* Recompute positions when a panel opens, closes, or changes geometry. */
@@ -8292,9 +8379,13 @@ static void discord_overlay_relayout(void) {
     DiscordAvatarOverlay *overlay = &discord_overlays[i];
     if (!overlay->win || !overlay->visible)
       continue;
-    overlay->x = x + index * (DISCORD_AVATAR_WINDOW + 10);
-    overlay->y = y;
-    XMoveWindow(dpy, overlay->win, overlay->x, overlay->y);
+    int target_x = x + index * (DISCORD_AVATAR_WINDOW + 10);
+    int target_y = y;
+    if (overlay->x != target_x || overlay->y != target_y) {
+      overlay->x = target_x;
+      overlay->y = target_y;
+      XMoveWindow(dpy, overlay->win, overlay->x, overlay->y);
+    }
     index++;
   }
 }
@@ -8310,6 +8401,17 @@ static void discord_update_ui(void) {
   if (fd >= 0)
     while (read(fd, &value, sizeof value) == sizeof value)
       ;
+  if (!discord_fullscreen && fullscreen_st) {
+    for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+      DiscordAvatarOverlay *overlay = &discord_overlays[i];
+      if (overlay->win && overlay->mapped) {
+        XUnmapWindow(dpy, overlay->win);
+        overlay->mapped = 0;
+      }
+      overlay->visible = 0;
+    }
+    return;
+  }
   count = discord_speakers(current, LENGTH(current));
   for (size_t i = 0; i < LENGTH(discord_overlays); i++)
     discord_overlays[i].visible = 0;
@@ -8340,7 +8442,8 @@ static void discord_update_ui(void) {
                              &pointer_x, &pointer_y, &pointer_window_x,
                              &pointer_window_y, &pointer_mask) &&
       discord_overlay_pointer_near(pointer_x, pointer_y)) {
-    discord_overlay_hide_all();
+    if (!discord_overlay_hover_hidden)
+      discord_overlay_hide_all();
     return;
   }
   discord_overlay_hover_hidden = 0;
@@ -8359,7 +8462,6 @@ static void discord_update_ui(void) {
     }
   }
   discord_overlay_raise();
-  XFlush(dpy);
 }
 
 static int discord_overlay_enter(Window win) {
@@ -12933,6 +13035,8 @@ void enternotify(XEvent *e) {
   }
 
   if (ev->window == selmon->barcenterwin) {
+    if (notification_hover_suppressed(ev->x_root, ev->y_root))
+      return;
     if (!notification_center_active() &&
         !notification_clock_hit(ev->x,
                                 clockbar_dynw ? clockbar_dynw : clockbar_cw))
@@ -13046,6 +13150,18 @@ static void updatefullscreenstatus(Client *c) {
 		 * fullscreen content. */
 		notification_clear_queue();
 		notify_transition_pending = 0;
+		if (!discord_fullscreen) {
+			for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+				if (discord_overlays[i].win && discord_overlays[i].mapped) {
+					XUnmapWindow(dpy, discord_overlays[i].win);
+					discord_overlays[i].mapped = 0;
+				}
+				discord_overlays[i].visible = 0;
+			}
+		}
+	} else {
+		if (!discord_fullscreen)
+			discord_update_ui();
 	}
 	sound_monitor_pause(isfullscreen);
 }
@@ -13056,7 +13172,7 @@ void focus(Client *c) {
     return;
   if (!c || (!ISVISIBLE(c) || HIDDEN(c)))
     for (c = selmon->stack;
-         c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky || c->ispassive || c->isontop);
+         c && (!ISVISIBLE(c) || HIDDEN(c) || c->issticky || c->ispassive);
          c = c->snext)
       ;
   if (selmon->sel && selmon->sel != c)
@@ -13086,8 +13202,16 @@ void focus(Client *c) {
 
 /* there are some broken focus acquiring clients needing extra handling */
 void focusin(XEvent *e) {
-  /* Let applications, especially Java, manage focus within their window. */
-  (void)e;
+  XFocusChangeEvent *ev = &e->xfocus;
+
+  if (!selmon->sel)
+    return;
+
+  /* Restore focus only after it really fell back to the root.  Do not use the
+   * old unconditional correction here: application child windows and popup
+   * menus legitimately receive FocusIn, and stealing it breaks Java/AWT. */
+  if (ev->window == root)
+    setfocus(selmon->sel);
 }
 
 void focusmon(const Arg *arg) {
@@ -13915,16 +14039,63 @@ void maprequest(XEvent *e) {
     manage(ev->window, &wa);
 }
 
+static void track_override_redirect(Window w) {
+  unsigned int i;
+
+  if (!w || w == root)
+    return;
+  for (i = 0; i < override_redirect_count; i++)
+    if (override_redirect_windows[i] == w)
+      return;
+  if (override_redirect_count < MAX_OVERRIDE_REDIRECT)
+    override_redirect_windows[override_redirect_count++] = w;
+}
+
+static void untrack_override_redirect(Window w) {
+  unsigned int i;
+
+  for (i = 0; i < override_redirect_count; i++) {
+    if (override_redirect_windows[i] == w) {
+      override_redirect_windows[i] =
+          override_redirect_windows[--override_redirect_count];
+      return;
+    }
+  }
+}
+
+static void raise_override_redirects(void) {
+  unsigned int i;
+  XWindowAttributes wa;
+
+  for (i = 0; i < override_redirect_count;) {
+    Window w = override_redirect_windows[i];
+    if (!XGetWindowAttributes(dpy, w, &wa)) {
+      untrack_override_redirect(w);
+      continue;
+    }
+    if (wa.map_state == IsViewable)
+      XRaiseWindow(dpy, w);
+    i++;
+  }
+}
+
 void mapnotify(XEvent *e) {
   XMapEvent *ev = &e->xmap;
   XWindowAttributes wa;
+
+  for (size_t i = 0; i < LENGTH(discord_overlays); i++) {
+    if (discord_overlays[i].win == ev->window)
+      return;
+  }
 
   /* Override-redirect windows (menus, popovers and tooltips) bypass manage().
    * Raise them when they become visible so a floating client cannot cover
    * the popup. */
   if (ev->window != root && XGetWindowAttributes(dpy, ev->window, &wa) &&
-      wa.override_redirect)
+      wa.override_redirect) {
+    track_override_redirect(ev->window);
     XRaiseWindow(dpy, ev->window);
+  }
 }
 
 void monocle(Monitor *m) {
@@ -14000,6 +14171,8 @@ void motionnotify(XEvent *e) {
   }
 
   if (ev->window == selmon->barcenterwin) {
+    if (notification_hover_suppressed(ev->x_root, ev->y_root))
+      return;
     if (!notification_center_active() &&
         !notification_clock_hit(ev->x,
                                 clockbar_dynw ? clockbar_dynw : clockbar_cw))
@@ -14821,6 +14994,8 @@ void resize(Client *c, int x, int y, int w, int h, int interact) {
 void resizebarwin(Monitor *m) {
   unsigned int tw, tlw, cw, kw, rw, stw = 0, stgap = 0;
   int lx, rx, cx, kx, titlex, title_right, span;
+  int monitor_fullscreen = m && m->sel && m->sel->isfullscreen &&
+                           !m->sel->issticky;
 
   if (showsystray && m == systraytomon(m)) {
     stw = getsystraywidth();
@@ -14858,8 +15033,8 @@ void resizebarwin(Monitor *m) {
    unsigned int dcw = (finder_active && m == selmon) ? finder_popup_width() :
                                       ((notification_center_active() && m == selmon) ? notify_width
                                        : ((clockbar_dynw && !notify_clock_hovered &&
-                                          !fullscreen_st && m == selmon)
-                                            ? clockbar_dynw : cw));
+                                           !monitor_fullscreen && m == selmon)
+                                             ? clockbar_dynw : cw));
    unsigned int fcw = (finder_active && m == selmon) ? finder_popup_width() :
                       ((notification_center_active() && m == selmon) ? notify_width : clockbar_cw);
 	   if (!dcw) dcw = 1;
@@ -14898,39 +15073,48 @@ void resizebarwin(Monitor *m) {
          unsigned int center_h = (finder_active && m == selmon) ? finder_popup_height() :
                                ((notification_center_active() && m == selmon) ? notify_height : bh);
       if (m->barcenterwin) {
-        finder_window_x = cx + (int)(fcw + 2 * bargap) / 2 - (int)dcw / 2;
-        finder_window_y = center_y;
-        if (finder_active && m == selmon) {
+       {
+         int center_x = cx + (int)(fcw + 2 * bargap) / 2 - (int)dcw / 2;
+         /* Finder geometry is global because the animation renderer uses it,
+          * but only the selected monitor owns the Finder window.  Do not let
+          * laying out another monitor overwrite the active monitor's
+          * coordinates; that caused the popup to jump between monitors. */
+         if (m == selmon) {
+           finder_window_x = center_x;
+           finder_window_y = center_y;
+         }
+         if (finder_active && m == selmon) {
           if (finder_presented_w != dcw ||
               finder_presented_h != center_h ||
               finder_presented_x != finder_window_x ||
-              finder_presented_y != finder_window_y)
-            finder_dirty = 1;
-        } else {
-          XMoveResizeWindow(dpy, m->barcenterwin, finder_window_x,
-                            finder_window_y, dcw, center_h);
-        }
-        XMapWindow(dpy, m->barcenterwin);
-        /* Keep the center window above fullscreen clients as soon as the
-         * fullscreen transition lays it out.  The visualizer also needs to
-         * stay above the neighboring bar sections while it grows. */
-             if ((finder_active && m == selmon && finder_dirty) ||
-                (notification_center_active() &&
-                 !(m == selmon && mpris_hovered && mpris_active)) ||
-               (clockbar_dynw && !fullscreen_st &&
+                             finder_presented_y != finder_window_y)
+             finder_dirty = 1;
+         } else {
+           /* Normal clock/notification windows belong to every monitor.  Use
+            * this monitor's local center instead of the global Finder
+            * coordinates, which only describe the active Finder window. */
+           XMoveResizeWindow(dpy, m->barcenterwin, center_x, center_y, dcw,
+                             center_h);
+         }
+       }
+         /* A fullscreen client owns this monitor's entire surface.  Do not
+          * leave the normal clock/notification window mapped above it.  This
+          * must use m->sel rather than the global fullscreen_st flag because
+          * the pointer may currently select a different monitor. */
+         if (monitor_fullscreen) {
+           XUnmapWindow(dpy, m->barcenterwin);
+           if (m == selmon)
+             clockbar_win = 0;
+         } else {
+           XMapWindow(dpy, m->barcenterwin);
+           /* Finder and the notification center are intentional overlays.
+            * The animated clock itself must not be raised over applications,
+            * especially while the top-right MPRIS bar is being polled. */
+           if ((finder_active && m == selmon && finder_dirty) ||
+               (notification_center_active() &&
                 !(m == selmon && mpris_hovered && mpris_active)))
              XRaiseWindow(dpy, m->barcenterwin);
-           else if (fullscreen_st && m == selmon && m->sel &&
-                    m->sel->isfullscreen) {
-             /* The notification center uses this same X window and is raised
-              * above fullscreen.  Put it back below the fullscreen client
-              * when the notification times out and the clock is restored. */
-             XWindowChanges wc = {0};
-             wc.sibling = m->sel->win;
-             wc.stack_mode = Below;
-             XConfigureWindow(dpy, m->barcenterwin,
-                              CWSibling | CWStackMode, &wc);
-           }
+         }
       }
       if (m == selmon) {
         clockbar_win = m->barcenterwin;
@@ -14968,7 +15152,7 @@ void resizebarwin(Monitor *m) {
       m->finder_marker_stacked = 1;
     }
   }
-  if (m == selmon) {
+  if (m == selmon && (!fullscreen_st || discord_fullscreen)) {
     discord_overlay_relayout();
     discord_overlay_raise();
   }
@@ -15259,6 +15443,9 @@ void restack(Monitor *m) {
   if (m && m->sidebarvisible)
     XRaiseWindow(dpy, m->sidebarwin);
   discord_overlay_raise();
+  /* Override-redirect menus and popovers are unmanaged by dwm.  Restore
+   * their stacking after client- and bar-owned windows are raised. */
+  raise_override_redirects();
 }
 
 /* Fullscreen clients should cover normal windows, but not dialogs and
@@ -15272,7 +15459,8 @@ static void raisefullscreenoverlays(Monitor *m) {
     XRaiseWindow(dpy, m->sidebarwin);
   if (m == selmon && notification_center_active() && m->barcenterwin)
     XRaiseWindow(dpy, m->barcenterwin);
-  discord_overlay_raise();
+  if (discord_fullscreen)
+    discord_overlay_raise();
 }
 
 void checkminimize(void) {
@@ -15658,9 +15846,7 @@ static int touchpad_swipe_chain_forward(void) {
   touchpad_swipe_marker_active = 0;
 
   arg.ui = 1U << committed;
-  touchpad_swipe_defer_ewmh = 1;
   view(&arg);
-  touchpad_swipe_defer_ewmh = 0;
 
   touchpad_swipe_base_index = committed;
   touchpad_swipe_target_index = next;
@@ -15868,9 +16054,7 @@ static void finish_touchpad_swipe(int cancelled) {
   free_touchpad_swipe_clients();
   if (commit && m == selmon) {
     Arg arg = {.ui = touchpad_swipe_newtag};
-    touchpad_swipe_defer_ewmh = 1;
     view(&arg);
-    touchpad_swipe_defer_ewmh = 0;
   }
   /* The selected-tag marker previews the destination during the swipe.
    * Redraw after clearing the preview so cancellation restores the old tag. */
@@ -17304,7 +17488,7 @@ void switchtag(void) {
         XFreePixmap(dpy, selmon->tagmap[i]);
         selmon->tagmap[i] = 0;
       }
-      if (occ & 1 << i && tag_preview) {
+      if (occ & 1 << i && tag_preview && selmon->tagwin) {
         image = imlib_create_image(sw, sh);
         if (!image)
           continue;
@@ -17444,6 +17628,8 @@ void toggleview(const Arg *arg) {
   int i;
 
   if (newtagset) {
+    updatecurrentdesktop(newtagset);
+    XFlush(dpy);
     prepare_workspace_switch(selmon, selmon->tagset[selmon->seltags], newtagset);
     switchtag();
     selmon->tagset[selmon->seltags] = newtagset;
@@ -17473,7 +17659,6 @@ void toggleview(const Arg *arg) {
     if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag])
       togglebar(NULL);
 
-    updatecurrentdesktop(selmon->tagset[selmon->seltags]);
     focus(NULL);
     arrange(selmon);
   }
@@ -17624,6 +17809,8 @@ void unmapnotify(XEvent *e) {
   Client *c;
   XUnmapEvent *ev = &e->xunmap;
   XWindowAttributes wa;
+
+  untrack_override_redirect(ev->window);
 
   if ((c = wintoclient(ev->window))) {
     if (c->wm_unmapped) {
@@ -17810,6 +17997,8 @@ void updatepreview(void) {
                              .background_pixmap = ParentRelative,
                              .event_mask = ButtonPressMask | ExposureMask};
   for (m = mons; m; m = m->next) {
+    if (m->tagwin)
+      continue;
     m->tagwin = XCreateWindow(
         dpy, root, m->wx, m->by + bh, m->mw / scalepreview, m->mh / scalepreview, 0,
         DefaultDepth(dpy, screen), CopyFromParent, DefaultVisual(dpy, screen),
@@ -18221,10 +18410,8 @@ void view(const Arg *arg) {
     return;
 
   newtagset = arg->ui & TAGMASK ? arg->ui & TAGMASK : selmon->pertag->prevtag;
-  if (!touchpad_swipe_defer_ewmh) {
-    updatecurrentdesktop(newtagset);
-    XFlush(dpy);
-  }
+  updatecurrentdesktop(newtagset);
+  XFlush(dpy);
   prepare_workspace_switch(selmon, selmon->tagset[selmon->seltags], newtagset);
   switchtag();
   selmon->seltags ^= 1; /* toggle sel tagset */
@@ -18259,12 +18446,6 @@ void view(const Arg *arg) {
 
   focus(NULL);
   arrange(selmon);
-  /* Three-finger swipes publish only after the outgoing workspace has been
-   * hidden/unmapped; keybind-driven views retain their original ordering. */
-  if (touchpad_swipe_defer_ewmh) {
-    updatecurrentdesktop(newtagset);
-    XFlush(dpy);
-  }
 }
 
 Client *wintoclient(Window w) {
